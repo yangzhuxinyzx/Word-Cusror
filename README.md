@@ -276,6 +276,7 @@ npm run build:electron
 
 ### Key 获取地址（官方入口）
 
+- **主模型 API Key（推荐）**：[https://linapi.net/register?aff=FGJ7](https://linapi.net/register?aff=FGJ7)
 - **Brave Search API**：`https://brave.com/search/api/`
 - **OpenRouter**：`https://openrouter.ai/`
 - **DashScope（阿里云百炼）**：`https://dashscope.console.aliyun.com/`
