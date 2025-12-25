@@ -1,0 +1,1703 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-background text-text font-sans antialiased overflow-hidden;
+}
+
+/* 自定义滚动条 - 极简风格 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-surface-hover rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-text-dim;
+}
+
+/* 基础样式重置与增强 */
+input, textarea, select, button {
+  @apply outline-none font-sans;
+}
+
+/* 工具类：毛玻璃效果 */
+.glass {
+  @apply bg-surface/80 backdrop-blur-md border border-white/5;
+}
+
+/* 工具类：渐变文字 */
+.text-gradient {
+  @apply bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-violet-400;
+}
+
+/* Word 预览样式覆盖 */
+.word-preview h1 { @apply text-2xl font-bold mb-6 text-gray-900 border-b border-gray-200 pb-2; }
+.word-preview h2 { @apply text-xl font-bold mb-4 mt-8 text-gray-800; }
+.word-preview h3 { @apply text-lg font-semibold mb-3 mt-6 text-gray-800; }
+.word-preview p { @apply mb-4 leading-7 text-gray-700 text-justify; }
+.word-preview ul { @apply list-disc pl-6 mb-4 space-y-1 text-gray-700; }
+.word-preview ol { @apply list-decimal pl-6 mb-4 space-y-1 text-gray-700; }
+.word-preview li { @apply pl-1; }
+.word-preview blockquote { @apply border-l-4 border-indigo-500 pl-4 py-1 my-4 bg-gray-50 text-gray-600 italic; }
+.word-preview code { @apply bg-gray-100 text-indigo-600 px-1.5 py-0.5 rounded font-mono text-sm; }
+.word-preview pre { @apply bg-gray-900 text-gray-100 p-4 rounded-lg mb-4 overflow-x-auto; }
+.word-preview table { @apply w-full border-collapse mb-4; }
+.word-preview th { @apply border border-gray-300 px-4 py-2 bg-gray-50 font-semibold text-left text-gray-900; }
+.word-preview td { @apply border border-gray-300 px-4 py-2 text-gray-700; }
+
+/* 动画工具 */
+.animate-enter {
+  animation: enter 0.2s ease-out;
+}
+
+@keyframes enter {
+  from { opacity: 0; transform: scale(0.98); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+/* 平滑吐字光标动画 - 更自然的闪烁 */
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.cursor-blink {
+  animation: cursor-blink 0.8s ease-in-out infinite;
+}
+
+/* ========================================
+   流式文字动画系统 - 按块浮现（类似 ChatGPT/Claude）
+   ======================================== */
+
+/* 
+ * 核心思路：不是逐字符动画，而是按"块"做动画
+ * 一个块 = 一个词/一个短语/一行内容
+ * 每个块整体浮现，动画时长 200-250ms
+ */
+
+/* 块级浮现动画 - 只用 translateY + opacity，不用 scale 避免变形 */
+@keyframes chunk-float-up {
+  0% {
+    opacity: 0;
+    transform: translateY(4px);
+    filter: blur(1.5px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0);
+  }
+}
+
+/* 应用于新增的文字块 */
+.char-enter-active {
+  display: inline;
+  animation: chunk-float-up 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  /* cubic-bezier(0.16, 1, 0.3, 1) = "快出慢停"，非常丝滑 */
+}
+
+/* 块级动画 - 用于段落/列表项等 Markdown 块 */
+@keyframes block-slide-in {
+  0% {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.block-enter {
+  animation: block-slide-in 0.22s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* 流式内容容器 */
+.streaming-chunk {
+  display: contents;
+}
+
+/* 稳定文本 - 无动画 */
+.stable-text {
+  /* 空样式，保持原样 */
+}
+
+/* 消息气泡淡入 + 上浮 */
+@keyframes message-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.message-enter {
+  animation: message-enter 0.25s ease-out;
+}
+
+/* AI 建议高亮背景 - 浅蓝色脉冲 */
+@keyframes suggestion-pulse {
+  0%, 100% {
+    background-color: rgba(59, 130, 246, 0.08);
+  }
+  50% {
+    background-color: rgba(59, 130, 246, 0.15);
+  }
+}
+
+.ai-suggestion {
+  background-color: rgba(59, 130, 246, 0.1);
+  border-left: 2px solid rgba(59, 130, 246, 0.5);
+  animation: suggestion-pulse 2s ease-in-out infinite;
+}
+
+/* Accept 后的淡出效果 */
+@keyframes suggestion-accept {
+  from {
+    background-color: rgba(59, 130, 246, 0.1);
+    border-left-color: rgba(59, 130, 246, 0.5);
+  }
+  to {
+    background-color: transparent;
+    border-left-color: transparent;
+  }
+}
+
+.ai-suggestion-accepted {
+  animation: suggestion-accept 0.3s ease-out forwards;
+}
+
+/* 控制条淡入 */
+@keyframes control-bar-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.control-bar-enter {
+  animation: control-bar-enter 0.2s ease-out;
+}
+
+/* 控制条淡出 */
+@keyframes control-bar-exit {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.95);
+  }
+}
+
+.control-bar-exit {
+  animation: control-bar-exit 0.15s ease-in forwards;
+}
+
+/* 打字机光标 - 精致的呼吸效果 */
+@keyframes cursor-breathe {
+  0%, 100% { 
+    opacity: 1; 
+    transform: scaleY(1);
+    box-shadow: 0 0 8px rgba(139, 92, 246, 0.6), 0 0 2px rgba(139, 92, 246, 0.8);
+  }
+  50% { 
+    opacity: 0.4; 
+    transform: scaleY(0.9);
+    box-shadow: 0 0 4px rgba(139, 92, 246, 0.3);
+  }
+}
+
+.typing-cursor {
+  display: inline-block;
+  width: 2.5px;
+  height: 1.15em;
+  background: linear-gradient(180deg, #c4b5fd 0%, #a78bfa 50%, #8b5cf6 100%);
+  border-radius: 2px;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: cursor-breathe 1s ease-in-out infinite;
+  transform-origin: center bottom;
+}
+
+/* 流式内容容器 - 平滑高度变化 */
+.streaming-container {
+  transition: height 0.2s cubic-bezier(0.25, 0.1, 0.25, 1);
+  overflow: visible; /* 允许动画溢出 */
+}
+
+/* ========================================
+   Cinematic Typer（光学模糊打字机）
+   ======================================== */
+@keyframes cinematic-focus {
+  0% {
+    filter: blur(4px);
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  100% {
+    filter: blur(0);
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.cinematic-typer {
+  font-family: 'Merriweather', 'Geist Mono', 'SFMono-Regular', 'Microsoft YaHei', serif;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  letter-spacing: 0.01em;
+  color: #dcdcdc;
+}
+
+.cinematic-thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 4px;
+  opacity: 0.85;
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+.cinematic-thinking span {
+  display: inline-block;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #a78bfa, #7c3aed);
+  animation: cinematic-thinking-pulse 1s ease-in-out infinite;
+}
+
+.cinematic-thinking span:nth-child(2) { animation-delay: 0.1s; }
+.cinematic-thinking span:nth-child(3) { animation-delay: 0.2s; }
+
+.cinematic-thinking-text {
+  margin-left: 4px;
+}
+
+@keyframes cinematic-thinking-pulse {
+  0%, 100% { opacity: 0.3; transform: scale(0.8); }
+  50%      { opacity: 1;   transform: scale(1);   }
+}
+
+.cinematic-char {
+  display: inline;
+  animation: cinematic-focus 0.3s ease-out forwards;
+  will-change: filter, transform;
+}
+
+/* Word 风格的文字选中效果 - 浅灰色半透明背景，白色文字 */
+.word-editor-content ::selection {
+  background-color: rgba(0, 0, 0, 0.15);
+  color: inherit;
+}
+
+.word-editor-content ::-moz-selection {
+  background-color: rgba(0, 0, 0, 0.15);
+  color: inherit;
+}
+
+/* ========== 专业排版格式支持 ========== */
+
+/* 段落格式 - 支持首行缩进、行距、段前段后 */
+.word-editor-content p,
+.word-editor-content h1,
+.word-editor-content h2,
+.word-editor-content h3,
+.word-editor-content h4,
+.word-editor-content h5,
+.word-editor-content h6 {
+  /* 允许内联样式覆盖 */
+  margin: 0;
+  padding: 0;
+}
+
+/* 默认段落样式 */
+.word-editor-content p {
+  text-indent: 2em;
+  line-height: 1.8;
+  margin-bottom: 0.5em;
+}
+
+/* 标题默认不缩进 */
+.word-editor-content h1,
+.word-editor-content h2,
+.word-editor-content h3 {
+  text-indent: 0 !important;
+  font-weight: bold;
+}
+
+.word-editor-content h1 {
+  font-size: 22pt;
+  line-height: 1.5;
+  margin: 24pt 0 12pt 0;
+}
+
+.word-editor-content h2 {
+  font-size: 16pt;
+  line-height: 1.5;
+  margin: 18pt 0 9pt 0;
+}
+
+.word-editor-content h3 {
+  font-size: 14pt;
+  line-height: 1.5;
+  margin: 12pt 0 6pt 0;
+}
+
+/* 删除线 */
+.word-editor-content s,
+.word-editor-content del,
+.word-editor-content strike {
+  text-decoration: line-through;
+  color: inherit;
+}
+
+/* 上标下标 */
+.word-editor-content sup {
+  vertical-align: super;
+  font-size: 0.75em;
+  line-height: 0;
+}
+
+.word-editor-content sub {
+  vertical-align: sub;
+  font-size: 0.75em;
+  line-height: 0;
+}
+
+/* 字符间距 - 通过 style 属性设置 letter-spacing */
+
+/* 引用块样式 */
+.word-editor-content blockquote {
+  margin: 1em 2em;
+  padding: 0.5em 1em;
+  border-left: 4px solid #ddd;
+  background: #f9f9f9;
+  font-style: italic;
+  color: #666;
+}
+
+/* 分栏布局 */
+.word-editor-content .column-layout {
+  column-gap: 2em;
+}
+
+.word-editor-content .column-layout p {
+  break-inside: avoid;
+}
+
+/* 目录样式 */
+.word-editor-content .table-of-contents {
+  margin: 1.5em 0;
+  padding: 1em 1.5em;
+  border: 1px solid #e0e0e0;
+  background: #fafafa;
+  border-radius: 4px;
+}
+
+.word-editor-content .table-of-contents h2 {
+  font-size: 16pt;
+  margin: 0 0 0.5em 0;
+  padding-bottom: 0.5em;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.word-editor-content .table-of-contents ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.word-editor-content .table-of-contents li {
+  margin: 0.3em 0;
+  line-height: 1.6;
+}
+
+.word-editor-content .table-of-contents a {
+  color: #1976d2;
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+.word-editor-content .table-of-contents a:hover {
+  color: #1565c0;
+  text-decoration: underline;
+}
+
+/* 水印样式 */
+.word-editor-content .document-watermark {
+  position: fixed !important;
+  pointer-events: none;
+  user-select: none;
+  z-index: 1000;
+}
+
+/* 分页符样式 */
+.word-editor-content .page-break {
+  page-break-before: always;
+  border-top: 2px dashed #ccc;
+  margin: 24px 0;
+  padding: 12px 0;
+  text-align: center;
+  color: #999;
+  font-size: 12px;
+  background: linear-gradient(to bottom, #f5f5f5, transparent);
+}
+
+/* 表格样式增强 */
+.word-editor-content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1em 0;
+}
+
+.word-editor-content th,
+.word-editor-content td {
+  border: 1px solid #ddd;
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.word-editor-content th {
+  background: #f5f5f5;
+  font-weight: bold;
+}
+
+.word-editor-content tr:nth-child(even) {
+  background: #fafafa;
+}
+
+/* 图片样式 */
+.word-editor-content img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 1em auto;
+}
+
+.word-editor-content img[style*="text-align: center"],
+.word-editor-content p[style*="text-align: center"] img {
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* 列表样式 */
+.word-editor-content ul,
+.word-editor-content ol {
+  margin: 0.5em 0;
+  padding-left: 2em;
+}
+
+.word-editor-content li {
+  margin: 0.25em 0;
+  line-height: 1.6;
+}
+
+/* 嵌套列表 */
+.word-editor-content ul ul,
+.word-editor-content ol ol,
+.word-editor-content ul ol,
+.word-editor-content ol ul {
+  margin: 0.25em 0;
+}
+
+/* Word 页面选中效果 - 浅灰色半透明（类似 Word 的选中效果） */
+.word-page ::selection {
+  background-color: rgba(0, 0, 0, 0.12);
+  color: inherit;
+}
+
+.word-page ::-moz-selection {
+  background-color: rgba(0, 0, 0, 0.12);
+  color: inherit;
+}
+
+/* Tiptap 编辑器选中效果 */
+.ProseMirror ::selection {
+  background-color: rgba(0, 0, 0, 0.12);
+  color: inherit;
+}
+
+.ProseMirror ::-moz-selection {
+  background-color: rgba(0, 0, 0, 0.12);
+  color: inherit;
+}
+
+/* Diff 高亮样式 - Cursor 风格 */
+
+/* Diff 块容器 - 包含删除和新增两行 */
+.diff-block {
+  display: inline-block;
+  margin: 2px 0;
+  border-radius: 4px;
+  overflow: hidden;
+  vertical-align: middle;
+}
+
+/* Diff 行 - 每行单独显示 */
+.diff-line {
+  display: block;
+  padding: 2px 8px;
+  font-size: inherit;
+  line-height: 1.6;
+}
+
+@keyframes diff-block-float {
+  0% {
+    transform: translateY(18px) scale(0.97);
+    filter: blur(6px);
+    opacity: 0;
+  }
+  60% {
+    transform: translateY(-2px) scale(1.01);
+    filter: blur(1px);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+    opacity: 1;
+  }
+}
+
+.diff-block-enter {
+  animation: diff-block-float 0.45s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  will-change: transform, filter, opacity;
+  transform-origin: top left;
+}
+
+@keyframes diff-mark-focus {
+  0% {
+    background-color: rgba(59, 130, 246, 0.28);
+    box-shadow: 0 6px 18px rgba(59, 130, 246, 0.25);
+  }
+  100% {
+    background-color: rgba(59, 130, 246, 0.12);
+    box-shadow: none;
+  }
+}
+
+.diff-mark-enter {
+  animation: diff-mark-focus 0.4s ease-out forwards;
+}
+
+/* 删除内容 - 红色背景 + 删除线 + 平滑动画 */
+.diff-line.diff-remove,
+.diff-old {
+  background-color: rgba(239, 68, 68, 0.15) !important;
+  color: #dc2626 !important;
+  text-decoration: line-through !important;
+  text-decoration-color: rgba(239, 68, 68, 0.6) !important;
+  padding: 1px 4px !important;
+  border-radius: 4px !important;
+  display: inline !important;
+  animation: diff-old-enter 0.3s ease-out;
+}
+
+@keyframes diff-old-enter {
+  from {
+    background-color: rgba(239, 68, 68, 0);
+    opacity: 0.5;
+  }
+  to {
+    background-color: rgba(239, 68, 68, 0.15);
+    opacity: 1;
+  }
+}
+
+/* 新增内容 - 浅蓝色背景（类似 Notion AI / Cursor 风格） + 脉冲动画 */
+.diff-line.diff-add,
+.diff-new {
+  background-color: rgba(59, 130, 246, 0.12) !important;
+  color: inherit !important;
+  padding: 1px 4px !important;
+  border-radius: 4px !important;
+  display: inline !important;
+  border-left: 2px solid rgba(59, 130, 246, 0.5) !important;
+  animation: diff-new-enter 0.3s ease-out, diff-new-pulse 2s ease-in-out 0.3s infinite;
+}
+
+@keyframes diff-new-enter {
+  from {
+    background-color: rgba(59, 130, 246, 0);
+    transform: translateX(-2px);
+    opacity: 0;
+  }
+  to {
+    background-color: rgba(59, 130, 246, 0.12);
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes diff-new-pulse {
+  0%, 100% {
+    background-color: rgba(59, 130, 246, 0.08);
+  }
+  50% {
+    background-color: rgba(59, 130, 246, 0.15);
+  }
+}
+
+.diff-accept-new {
+  animation: diff-accept-new 0.32s ease forwards;
+}
+
+@keyframes diff-accept-new {
+  0% {
+    background-color: rgba(59, 130, 246, 0.2);
+    color: #0f6ad8;
+  }
+  100% {
+    background-color: transparent;
+    color: inherit;
+  }
+}
+
+.diff-accept-old {
+  animation: diff-accept-old 0.28s ease forwards;
+}
+
+@keyframes diff-accept-old {
+  0% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+}
+
+/* 待确认状态的 Diff 块 - 蓝色脉冲边框 */
+.diff-block[data-diff="pending"] {
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.4);
+  animation: pending-pulse 2s ease-in-out infinite;
+}
+
+@keyframes pending-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3); }
+  50% { box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.5); }
+}
+
+@keyframes doc-block-appear {
+  0% {
+    opacity: 0;
+    transform: translateY(26px) scale(0.97);
+    filter: blur(8px);
+  }
+  70% {
+    opacity: 1;
+    transform: translateY(-4px) scale(1.01);
+    filter: blur(1px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
+}
+
+.doc-block-enter {
+  animation: doc-block-appear 0.48s cubic-bezier(0.22, 1, 0.36, 1) var(--doc-enter-delay, 0ms) forwards;
+  will-change: transform, filter, opacity;
+}
+
+/* 跳转高亮效果 */
+.diff-highlight {
+  animation: highlight-flash 0.5s ease-out;
+}
+
+@keyframes highlight-flash {
+  0% { 
+    transform: scale(1.02);
+    box-shadow: 0 0 0 4px rgba(251, 191, 36, 0.8);
+  }
+  100% { 
+    transform: scale(1);
+    box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.3);
+  }
+}
+
+/* ONLYOFFICE 编辑器样式 */
+#onlyoffice-editor-container {
+  background: #fff;
+}
+
+#onlyoffice-editor-container iframe {
+  width: 100% !important;
+  height: 100% !important;
+  border: none !important;
+  display: block !important;
+}
+
+/* 拖拽调节条样式 */
+.resize-handle {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  transition: background-color 0.2s;
+  z-index: 10;
+}
+
+.resize-handle:hover,
+.resize-handle:active {
+  background-color: rgba(14, 99, 156, 0.5);
+}
+
+.resize-handle::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 40px;
+  background-color: #3c3c3c;
+  border-radius: 2px;
+  transition: background-color 0.2s;
+}
+
+.resize-handle:hover::after {
+  background-color: #0e639c;
+}
+
+/* 聊天面板滚动条 - 更细更隐蔽 */
+.chat-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+
+.chat-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.chat-scrollbar::-webkit-scrollbar-thumb {
+  background: #3c3c3c;
+  border-radius: 2px;
+}
+
+.chat-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #5a5a5a;
+}
+
+/* 代码块样式 - Cursor 风格 */
+.chat-code-block {
+  background: #1e1e1e;
+  border: 1px solid #2d2d2d;
+  border-radius: 6px;
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-x: auto;
+}
+
+.chat-code-block pre {
+  margin: 0;
+  padding: 12px;
+}
+
+/* Markdown 样式 - 聊天面板 */
+.chat-markdown h1,
+.chat-markdown h2,
+.chat-markdown h3 {
+  font-weight: 600;
+  margin-top: 1em;
+  margin-bottom: 0.5em;
+  color: #cccccc;
+}
+
+.chat-markdown h1 { font-size: 1.25em; }
+.chat-markdown h2 { font-size: 1.1em; }
+.chat-markdown h3 { font-size: 1em; }
+
+.chat-markdown p {
+  margin-bottom: 0.75em;
+  line-height: 1.6;
+}
+
+.chat-markdown ul,
+.chat-markdown ol {
+  padding-left: 1.5em;
+  margin-bottom: 0.75em;
+}
+
+.chat-markdown li {
+  margin-bottom: 0.25em;
+}
+
+.chat-markdown code {
+  background: #2d2d2d;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'Consolas', monospace;
+  font-size: 0.9em;
+  color: #ce9178;
+}
+
+.chat-markdown a {
+  color: #75beff;
+  text-decoration: none;
+}
+
+.chat-markdown a:hover {
+  text-decoration: underline;
+}
+
+/* AI 消息 Markdown 渲染样式 */
+.ai-markdown {
+  word-break: break-word;
+}
+
+.ai-markdown > *:first-child {
+  margin-top: 0 !important;
+}
+
+.ai-markdown > *:last-child {
+  margin-bottom: 0 !important;
+}
+
+/* 列表样式优化 */
+.ai-markdown ul {
+  padding-left: 0;
+}
+
+.ai-markdown ol {
+  padding-left: 1.25rem;
+}
+
+.ai-markdown li > ul,
+.ai-markdown li > ol {
+  margin-top: 0.25rem;
+  margin-bottom: 0.25rem;
+}
+
+/* 嵌套列表缩进 */
+.ai-markdown li li {
+  padding-left: 0.5rem;
+}
+
+/* 代码块样式 */
+.ai-markdown pre code {
+  display: block;
+  padding: 0.75rem;
+  background: transparent;
+}
+
+/* 表格样式 */
+.ai-markdown table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.5rem 0;
+  font-size: 12px;
+}
+
+.ai-markdown th,
+.ai-markdown td {
+  border: 1px solid #3c3c3c;
+  padding: 0.5rem;
+  text-align: left;
+}
+
+.ai-markdown th {
+  background: #2d2d2d;
+  font-weight: 600;
+}
+
+/* 任务列表样式 */
+.ai-markdown input[type="checkbox"] {
+  margin-right: 0.5rem;
+  accent-color: #0e639c;
+}
+
+/* Word Editor 容器（用于 Excel 预览等） */
+.word-editor {
+  width: 100%;
+  height: 100%;
+  min-height: 0; /* 允许 flex 子项收缩 */
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Excel 预览 */
+.excel-preview {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0; /* 重要：允许子元素收缩 */
+  background: #fff;
+  font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  user-select: none;
+}
+
+/* 顶部 Ribbon 模拟 */
+.excel-ribbon {
+  background: #2b2b2b;
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid #1f1f1f;
+  flex-shrink: 0; /* 防止 Ribbon 被压缩 */
+}
+
+.excel-ribbon-tabs {
+  display: flex;
+  padding: 0 12px;
+  gap: 14px;
+  height: 30px;
+  align-items: center;
+  font-size: 12px;
+}
+
+.excel-ribbon-tab {
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: default;
+}
+
+.excel-ribbon-tab:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.excel-ribbon-tools {
+  display: flex;
+  gap: 8px;
+  padding: 4px 10px 4px;
+  background: #2f2f2f;
+  border-top: 1px solid #1f1f1f;
+  border-bottom: 1px solid #1f1f1f;
+  align-items: flex-start;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+
+.excel-tool-group {
+  min-width: 120px;
+  max-width: 170px;
+  color: #ddd;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  padding-right: 8px;
+  gap: 2px;
+}
+
+.tool-title {
+  font-size: 11px;
+  margin-top: 0;
+  color: #aaa;
+  text-align: center;
+}
+
+.ribbon-group-layout {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: flex-start;
+  flex-wrap: nowrap;
+}
+
+.ribbon-group-layout.font-group {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.ribbon-group-layout.single-col {
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ribbon-row {
+  display: flex;
+  gap: 3px;
+}
+
+.ribbon-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 5px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.04);
+  color: #f3f3f3;
+  font-size: 11px;
+  cursor: default;
+}
+
+.ribbon-btn.icon-only {
+  width: 26px;
+  justify-content: center;
+  padding: 3px;
+}
+
+.ribbon-btn.big {
+  min-width: 44px;
+  height: 32px;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.ribbon-btn.pill {
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.08);
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+.ribbon-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.ribbon-divider {
+  position: absolute;
+  right: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* 顶部工具栏 */
+.excel-toolbar {
+  display: flex;
+  align-items: center;
+  height: 28px;
+  border-bottom: 1px solid #e1e1e1;
+  background: #fff;
+  padding: 0 4px;
+  flex-shrink: 0; /* 防止工具栏被压缩 */
+}
+
+.excel-name-box {
+  width: 40px;
+  height: 20px;
+  line-height: 20px;
+  font-size: 12px;
+  color: #333;
+  border: 1px solid #fff;
+  text-align: center;
+  margin-right: 4px;
+}
+
+.excel-formula-bar {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  height: 20px;
+  border: 1px solid #fff;
+}
+
+.fx-icon {
+  font-size: 12px;
+  color: #999;
+  padding: 0 8px;
+  border-right: 1px solid #e1e1e1;
+  font-style: italic;
+  font-family: serif;
+}
+
+.formula-input {
+  flex: 1;
+  height: 100%;
+  padding-left: 8px;
+  font-size: 12px;
+  color: #333;
+}
+
+/* 表格区域 */
+.excel-table-wrapper {
+  flex: 1;
+  min-height: 0; /* 重要：允许 flex 子项收缩并启用滚动 */
+  overflow: auto;
+  background: #fff;
+  position: relative;
+}
+
+.excel-table-scaler {
+  width: fit-content;
+  min-width: 100%;
+}
+
+.excel-table {
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: fixed;
+  width: max-content;
+  cursor: cell;
+}
+
+/* 表头样式 */
+.excel-col-header {
+  background: #f8f9fa;
+  border-right: 1px solid #d4d4d4;
+  border-bottom: 1px solid #d4d4d4;
+  color: #666;
+  font-weight: normal;
+  font-size: 12px;
+  text-align: center;
+  height: 24px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.excel-col-header:hover {
+  background: #e1e1e1;
+}
+
+.excel-row-header {
+  background: #f8f9fa;
+  border-right: 1px solid #d4d4d4;
+  border-bottom: 1px solid #d4d4d4;
+  color: #666;
+  font-size: 12px;
+  text-align: center;
+  position: sticky;
+  left: 0;
+  z-index: 10;
+}
+
+.excel-row-header:hover {
+  background: #e1e1e1;
+}
+
+.excel-col-header.active,
+.excel-row-header.active {
+  background: #dbe9f9;
+  color: #0f4fa8;
+  font-weight: 600;
+}
+.excel-corner-header {
+  background: #f8f9fa;
+  border-right: 1px solid #d4d4d4;
+  border-bottom: 1px solid #d4d4d4;
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 20;
+  width: 40px;
+  height: 24px;
+}
+
+.excel-corner-header::after {
+  content: '◢';
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  font-size: 8px;
+  color: #ccc;
+  line-height: 1;
+}
+
+/* 单元格样式 */
+.excel-cell {
+  border-right: 1px solid #d4d4d4;
+  border-bottom: 1px solid #d4d4d4;
+  overflow: hidden;
+  padding: 2px 4px;
+  vertical-align: middle;
+}
+
+/* 选区内的单元格 - 浅蓝色背景 */
+.excel-cell-in-selection {
+  background: rgba(0, 120, 215, 0.1) !important;
+}
+
+/* 活动单元格（选区起始点）- 白色背景 */
+.excel-cell-active {
+  background: #fff !important;
+}
+
+/* 选区边框 - 使用伪元素绘制，模拟 Excel 的选区框 */
+.excel-cell.selection-top {
+  box-shadow: inset 0 2px 0 0 #217346;
+}
+.excel-cell.selection-bottom {
+  box-shadow: inset 0 -2px 0 0 #217346;
+}
+.excel-cell.selection-left {
+  box-shadow: inset 2px 0 0 0 #217346;
+}
+.excel-cell.selection-right {
+  box-shadow: inset -2px 0 0 0 #217346;
+}
+
+/* 组合边框 */
+.excel-cell.selection-top.selection-left {
+  box-shadow: inset 2px 2px 0 0 #217346;
+}
+.excel-cell.selection-top.selection-right {
+  box-shadow: inset -2px 2px 0 0 #217346;
+}
+.excel-cell.selection-bottom.selection-left {
+  box-shadow: inset 2px -2px 0 0 #217346;
+}
+.excel-cell.selection-bottom.selection-right {
+  box-shadow: inset -2px -2px 0 0 #217346;
+}
+.excel-cell.selection-top.selection-bottom {
+  box-shadow: inset 0 2px 0 0 #217346, inset 0 -2px 0 0 #217346;
+}
+.excel-cell.selection-left.selection-right {
+  box-shadow: inset 2px 0 0 0 #217346, inset -2px 0 0 0 #217346;
+}
+.excel-cell.selection-top.selection-left.selection-bottom {
+  box-shadow: inset 2px 2px 0 0 #217346, inset 2px -2px 0 0 #217346;
+}
+.excel-cell.selection-top.selection-right.selection-bottom {
+  box-shadow: inset -2px 2px 0 0 #217346, inset -2px -2px 0 0 #217346;
+}
+.excel-cell.selection-left.selection-top.selection-right {
+  box-shadow: inset 2px 2px 0 0 #217346, inset -2px 2px 0 0 #217346;
+}
+.excel-cell.selection-left.selection-bottom.selection-right {
+  box-shadow: inset 2px -2px 0 0 #217346, inset -2px -2px 0 0 #217346;
+}
+.excel-cell.selection-top.selection-bottom.selection-left.selection-right {
+  box-shadow: inset 0 0 0 2px #217346;
+}
+
+/* 单个单元格选中 - 粗边框 */
+.excel-cell-active.selection-top.selection-bottom.selection-left.selection-right {
+  box-shadow: inset 0 0 0 2px #217346;
+}
+
+/* 选区右下角的小方块（调整手柄） */
+.excel-cell.selection-bottom.selection-right::after {
+  content: '';
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  width: 6px;
+  height: 6px;
+  background: #217346;
+  cursor: crosshair;
+}
+
+/* 被选中时的行列头高亮 */
+.excel-col-header.active,
+.excel-row-header.active {
+  background: #d4e6f1 !important;
+  color: #217346;
+  font-weight: 600;
+}
+
+/* 禁止选择文字（拖选时） */
+.excel-table {
+  user-select: none;
+}
+
+/* 左上角全选按钮 */
+.excel-corner-header {
+  cursor: pointer;
+}
+.excel-corner-header:hover {
+  background: #e0e0e0;
+}
+
+/* 列头和行头可点击 */
+.excel-col-header,
+.excel-row-header {
+  cursor: pointer;
+}
+.excel-col-header:hover,
+.excel-row-header:hover {
+  background: #e8e8e8;
+}
+
+/* 底部标签栏 */
+.excel-footer {
+  display: flex;
+  align-items: center;
+  height: 32px;
+  background: #f8f9fa;
+  border-top: 1px solid #e1e1e1;
+  padding-left: 4px;
+  flex-shrink: 0; /* 防止底部栏被压缩 */
+}
+
+.excel-sheet-area {
+  display: flex;
+  align-items: center;
+}
+
+.excel-sheet-scroll-btn {
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #999;
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.excel-sheet-scroll-btn:hover {
+  color: #666;
+}
+
+.excel-tabs {
+  display: flex;
+  align-items: flex-end;
+  height: 100%;
+  margin-left: 8px;
+  overflow-x: auto;
+}
+
+.excel-tab {
+  height: 26px;
+  padding: 0 16px;
+  border: none;
+  background: transparent;
+  font-size: 13px;
+  color: #444;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  border-radius: 0;
+  margin-right: 1px;
+  position: relative;
+}
+
+.excel-tab:hover {
+  background: #e1e1e1;
+}
+
+.excel-tab.active {
+  background: #fff;
+  color: #107c41; /* Excel Green */
+  border-bottom: 2px solid #107c41;
+  font-weight: 600;
+}
+
+.excel-new-sheet {
+  width: 28px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  color: #666;
+  cursor: pointer;
+  background: transparent;
+  border: none;
+}
+
+.excel-new-sheet:hover {
+  background: #e1e1e1;
+  border-radius: 50%;
+  height: 20px;
+  width: 20px;
+  margin: 3px 4px;
+}
+
+.excel-footer-spacer {
+  flex: 1;
+  background: #f8f9fa;
+}
+
+.excel-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+  padding-right: 12px;
+  font-size: 12px;
+  color: #444;
+}
+
+.excel-zoom {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.zoom-btn {
+  color: #666;
+  font-size: 14px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 3px;
+  line-height: 1;
+}
+
+.zoom-btn:hover {
+  background: #e5e5e5;
+  color: #107c41;
+}
+
+.zoom-track {
+  width: 80px;
+  height: 6px;
+  background: #e1e1e1;
+  border-radius: 999px;
+  position: relative;
+  cursor: pointer;
+}
+
+.zoom-thumb {
+  position: absolute;
+  top: -4px;
+  width: 12px;
+  height: 12px;
+  background: #107c41;
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px #fff;
+  margin-left: -6px;
+  pointer-events: none;
+}
+
+.zoom-label {
+  font-size: 11px;
+  color: #444;
+  min-width: 35px;
+  text-align: right;
+}
+
+/* Excel 编辑功能样式 */
+.excel-preview:focus {
+  outline: none;
+}
+
+.cell-edit-input {
+  width: 100%;
+  height: 100%;
+  border: none;
+  outline: none;
+  padding: 2px 4px;
+  font-size: inherit;
+  font-family: inherit;
+  background: #fff;
+  box-sizing: border-box;
+}
+
+.excel-cell.has-local-change {
+  background-color: #fff3cd !important;
+}
+
+.excel-formula-bar .formula-input {
+  flex: 1;
+  height: 100%;
+  padding: 0 8px;
+  font-size: 12px;
+  color: #333;
+  border: none;
+  outline: none;
+  background: transparent;
+}
+
+.excel-formula-bar .formula-input:focus {
+  background: #fff;
+}
+
+.excel-save-status {
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  font-size: 11px;
+}
+
+.excel-save-status .saving {
+  color: #f59e0b;
+}
+
+.excel-save-status .saved {
+  color: #10b981;
+}
+
+.excel-save-status .unsaved {
+  color: #ef4444;
+}
+
+.ribbon-btn.disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.ribbon-btn.disabled:hover {
+  background: transparent;
+}
+
+/* 列宽调整手柄 */
+.excel-col-header {
+  position: relative;
+}
+
+.col-resize-handle {
+  position: absolute;
+  top: 0;
+  right: -2px;
+  width: 5px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 10;
+}
+
+.col-resize-handle:hover,
+.excel-col-header.resizing .col-resize-handle {
+  background: #107c41;
+}
+
+/* 行高调整手柄 */
+.excel-row-header {
+  position: relative;
+}
+
+.row-resize-handle {
+  position: absolute;
+  left: 0;
+  bottom: -2px;
+  width: 100%;
+  height: 5px;
+  cursor: row-resize;
+  z-index: 10;
+}
+
+.row-resize-handle:hover,
+.excel-row-header.resizing .row-resize-handle {
+  background: #107c41;
+}
+
+/* 调整时的光标样式 */
+.excel-preview.resizing-col,
+.excel-preview.resizing-col * {
+  cursor: col-resize !important;
+}
+
+.excel-preview.resizing-row,
+.excel-preview.resizing-row * {
+  cursor: row-resize !important;
+}
+
+/* Excel 编辑模式样式 */
+.excel-cell-editing {
+  padding: 0 !important;
+  background: #fff !important;
+}
+
+.cell-edit-input {
+  width: 100%;
+  height: 100%;
+  min-height: 20px;
+  padding: 2px 4px;
+  border: 2px solid #217346 !important;
+  outline: none;
+  font-family: inherit;
+  font-size: inherit;
+  background: #fff;
+  box-sizing: border-box;
+}
+
+/* 公式栏编辑 */
+.formula-input-wrapper {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-right: 4px;
+}
+
+.formula-input-edit {
+  flex: 1;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid #217346;
+  border-radius: 2px;
+  font-size: 12px;
+  outline: none;
+}
+
+.formula-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.formula-btn.confirm {
+  background: #217346;
+  color: white;
+}
+
+.formula-btn.confirm:hover {
+  background: #1a5c38;
+}
+
+.formula-btn.cancel {
+  background: #e5e5e5;
+  color: #333;
+}
+
+.formula-btn.cancel:hover {
+  background: #d4d4d4;
+}
+
+/* 剪贴板高亮 */
+.excel-cell.clipboard-source {
+  animation: clipboard-dash 1s infinite linear;
+  background-image: repeating-linear-gradient(
+    -45deg,
+    transparent,
+    transparent 3px,
+    rgba(33, 115, 70, 0.1) 3px,
+    rgba(33, 115, 70, 0.1) 6px
+  );
+}
+
+@keyframes clipboard-dash {
+  0% {
+    background-position: 0 0;
+  }
+  100% {
+    background-position: 12px 12px;
+  }
+}
+
+/* Excel 预览容器焦点样式 */
+.excel-preview:focus {
+  outline: none;
+}
+
+/* 禁用按钮样式增强 */
+.ribbon-btn.disabled,
+.ribbon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+

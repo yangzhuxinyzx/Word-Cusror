@@ -1,0 +1,97 @@
+{
+  "name": "word-cursor",
+  "version": "1.0.0",
+  "description": "AI驱动的Word文档编辑器 - Cursor的Word版本",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:electron": "concurrently \"vite\" \"wait-on http://localhost:3000 && electron .\"",
+    "build": "tsc && vite build",
+    "build:electron": "npm run build && electron-builder",
+    "preview": "vite preview",
+    "electron": "electron ."
+  },
+  "build": {
+    "appId": "com.wordcursor.app",
+    "productName": "Word-Cursor",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "public/favicon.svg"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "public/favicon.svg"
+    }
+  },
+  "dependencies": {
+    "@brave/brave-search-mcp-server": "^2.0.62",
+    "@modelcontextprotocol/sdk": "^1.24.0",
+    "@tiptap/extension-color": "^3.11.1",
+    "@tiptap/extension-font-family": "^3.11.1",
+    "@tiptap/extension-highlight": "^3.11.1",
+    "@tiptap/extension-image": "^3.11.1",
+    "@tiptap/extension-link": "^3.11.1",
+    "@tiptap/extension-placeholder": "^3.11.1",
+    "@tiptap/extension-subscript": "^3.14.0",
+    "@tiptap/extension-superscript": "^3.14.0",
+    "@tiptap/extension-table": "^3.11.1",
+    "@tiptap/extension-table-cell": "^3.11.1",
+    "@tiptap/extension-table-header": "^3.11.1",
+    "@tiptap/extension-table-row": "^3.11.1",
+    "@tiptap/extension-text-align": "^3.11.1",
+    "@tiptap/extension-text-style": "^3.11.1",
+    "@tiptap/extension-underline": "^3.11.1",
+    "@tiptap/pm": "^3.11.1",
+    "@tiptap/react": "^3.11.1",
+    "@tiptap/starter-kit": "^3.11.1",
+    "docx": "^8.5.0",
+    "docx-preview": "^0.3.7",
+    "docxtemplater": "^3.67.5",
+    "dotenv": "^17.2.3",
+    "exceljs": "^4.4.0",
+    "file-saver": "^2.0.5",
+    "framer-motion": "^12.23.25",
+    "highlight.js": "^11.9.0",
+    "html2canvas": "^1.4.1",
+    "jszip": "^3.10.1",
+    "lucide-react": "^0.294.0",
+    "mammoth": "^1.11.0",
+    "p-limit": "^6.2.0",
+    "pizzip": "^3.2.0",
+    "pptx-preview": "^1.0.7",
+    "pptx2html": "^0.3.4",
+    "pptxgenjs": "^4.0.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-markdown": "^9.1.0",
+    "sharp": "^0.34.3",
+    "tiptap-markdown": "^0.9.0",
+    "word-extractor": "^1.0.4",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/d3": "^7.4.3",
+    "@types/file-saver": "^2.0.7",
+    "@types/jquery": "^3.5.33",
+    "@types/react": "^18.2.43",
+    "@types/react-dom": "^18.2.17",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.16",
+    "concurrently": "^9.1.2",
+    "electron": "^33.4.0",
+    "electron-builder": "^25.1.8",
+    "postcss": "^8.4.32",
+    "tailwindcss": "^3.3.6",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.8",
+    "wait-on": "^8.0.3"
+  }
+}

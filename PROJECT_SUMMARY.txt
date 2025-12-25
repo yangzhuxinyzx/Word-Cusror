@@ -1,0 +1,182 @@
+Word-Cursor 项目总结（用于后续制作 PPT）
+================================================
+
+一、项目定位
+----------------
+Word-Cursor 是一款“AI 驱动的智能文档编辑器”（桌面端优先），将传统文档编辑 + 对话式 AI 工作流结合在同一个应用里：
+- 左侧：工作区/文件树（打开本地文件夹、浏览文件）
+- 中间：编辑器与预览（Word/Excel/PPT）
+- 右侧：AI 对话面板（指令驱动、工具调用、PPT 生成/编辑）
+
+核心理念：
+1) 用户用自然语言提出需求；
+2) AI 通过工具调用执行操作（修改文档、生成 PPT、编辑 PPT）；
+3) UI 以“可审阅、可回溯”的方式反馈进度与结果。
+
+
+二、核心功能（产品侧）
+----------------
+1) 文档编辑（Word 风格）
+- 基于 Tiptap（ProseMirror）实现富文本编辑：标题、列表、表格、引用、链接、图片、字体/字号/颜色等。
+- AI 编辑：支持 replace/insert/delete 等“可控的小步修改”，并显示 diff（新增/删除高亮）。
+- AI 补全：Tab 触发本地模型补全（低延迟）。
+- 右键/浮窗：选区 AI 快改（润色、精简、正式化等）。
+
+2) 文件工作区（Electron 桌面端）
+- 打开本地文件夹并读取文件树（支持刷新）。
+- 空文件夹处理：打开了但没有文件时显示“文件夹为空”，不再误提示“未打开文件夹”。
+- 文件拖拽：支持拖文件到对话框用于分析/上下文补充。
+
+3) Excel 预览（桌面端）
+- 读取 xlsx/xls，展示工作表、区域选择、基础编辑类工具（excel_*）。
+- xls 转 xlsx 的转换链路与提醒（可选依赖 LibreOffice/Excel）。
+
+4) PPT：生成、预览、编辑（重点能力）
+- 生成：将“大纲 → 视觉提示词 → 生图 → 打包 PPTX”流水线整合到一次操作。
+- 预览：缩略图总览 + 页码 + 上一页/下一页 + 缩放 + 全屏。
+- 编辑（高级交互）：
+  - 拖拽缩略图到对话框：指定要改的页（支持多页）。
+  - Ctrl+拖拽框选：在 PPT 预览中选择局部区域作为编辑参考。
+  - 整页重做：根据该页大纲 + 用户反馈，重写提示词并重新生成整页图片替换。
+  - 局部编辑：生成给 qwen-image-edit-plus 的编辑提示词，仅修改指定区域/元素并替换原图。
+
+
+三、PPT 生成工作流（端到端）
+----------------
+阶段 1：大纲（Qwen/Agent 负责）
+- Qwen 先输出“结构化 JSON 大纲”，用户确认后才进入生成。
+- 页数规则：
+  - 用户指定页数 N → 必须输出正好 N 页；
+  - 用户未指定 → 默认推荐 10~15 页（复杂主题可到 15~20 页）。
+
+阶段 2：视觉提示词（Gemini via OpenRouter 负责）
+- 根据大纲与风格偏好，为每页产出 prompt/negativePrompt。
+- 强调：每页是一张“成片海报”，文字与排版必须在图里（非纯背景）。
+- 美学策略：高级审美、杂志/品牌 KV 质感、电影级光影、低饱和配色、层次丰富但有秩序。
+- 强约束：禁止品牌/水印/软件 UI（避免出现 Microsoft、C4D 等）。
+
+阶段 3：生图（DashScope）
+- qwen-image-plus：文生图生成每页海报图。
+- sharp：后处理（letterbox 等）确保导出一致尺寸（1920x1200）。
+
+阶段 4：打包与持久化
+- 生成 PPTX（图片入页）并写入工作区。
+- 保存元数据到 *_assets：
+  - deck_context.json（整体风格/调色板）
+  - slides_prompts.json（每页 prompt/negativePrompt + 原始中文内容）
+  - outline.json（大纲）
+用于后续编辑/重做时“找回上下文”。
+
+
+四、PPT 编辑工作流（整页重做 / 局部编辑）
+----------------
+触发方式：
+- 拖拽：将某页缩略图拖到对话框输入区；
+- 框选：在 PPT 预览中 Ctrl+拖拽选区域，自动把区域截图作为编辑上下文。
+
+意图识别：
+- 整页重做：重做/换一个/风格不对/太丑/重生成…
+- 局部编辑：改背景/换颜色/调整文字/移动位置/只改这块…
+
+整页重做（regenerate）：
+- Gemini：结合 deck_context + 该页 outline 中文内容 + 用户反馈，生成全新 prompt（必须包含该页所有中文文案）。
+- DashScope：重新生成整页图并替换。
+
+局部编辑（partial_edit）：
+- Gemini：生成给 qwen-image-edit-plus 的 editPrompt + negativePrompt（强调“只改指定内容，其他保持”）。
+- DashScope：对原图进行局部编辑并替换。
+
+用户体验优化：
+- 编辑开始会显示“处理中…”反馈；
+- 编辑完成自动跳转到被修改的页（ppt-jump-to-page 事件）。
+
+
+五、提示词与审美体系（关键策略）
+----------------
+1) 反“AI 味 / 廉价感”
+- 禁止：过饱和、廉价霓虹蓝绿、HUD/科幻 UI、模板化等距城市、塑料高光、乱码/随机英文。
+- negativePrompt 基线兜底：watermark/logo/UI/HUD/neon cyan/teal/cheap turquoise/isometric city 等。
+
+2) 高级设计词汇库（用于提升质感）
+- 排版：Swiss/International Typographic Style、typographic grid、baseline grid、microtypography（tracking/leading/optical alignment）。
+- 印刷工艺：spot UV、hot foil stamping、emboss/deboss、letterpress、duotone/spot color。
+- 光影与调色：three-point lighting、rim/kicker、volumetric、filmic tone mapping、split toning、fine grain。
+规则：每页精选少量（6~12 个）用词，避免堆砌。
+
+3) 国风高级预设（Neo-Chinese Heritage Editorial）
+- 宣纸/绢布/古籍纸张纹理、水墨晕染、古地图线、金线压纹、朱印点睛。
+- 明确禁止：HUD/霓虹电路/科幻界面叠加。
+
+
+六、技术架构（工程侧）
+----------------
+1) 前端：React + TypeScript
+- 主要组件：
+  - src/components/WordEditor.tsx：Tiptap 编辑器 + Word 打印布局预览（分页/页边距/页间距）
+  - src/components/ChatPanel.tsx：对话、工具编排、PPT 创建/编辑入口、拖拽与框选上下文
+  - src/components/PptPreviewHtml.tsx：PPTX 预览、缩略图导航、Ctrl+框选、拖拽页到对话框
+  - src/components/Sidebar.tsx：工作区文件树、打开文件夹、空文件夹提示、新建文档/PPT
+  - src/context/AIContext.tsx：Agent 提示词、工具调用解析、流式响应、工具循环执行
+  - src/context/DocumentContext.tsx：文件/工作区状态、打开文件夹、打开文件、保存等
+
+2) 桌面端：Electron
+- electron/main.cjs：
+  - IPC：openrouter-gemini-ppt-prompts、ppt-generate-deck、ppt-edit-slides 等
+  - PPTX 读写：JSZip
+  - 图像处理：sharp
+  - 生图/编辑：DashScope（qwen-image-plus / qwen-image-edit-plus）
+  - 提示词修复：遇到审核失败/错误时，Gemini 单页重写 prompt 并重试
+  - 网络健壮性：加入重试与空响应检查（避免 tokens=0 导致解析失败）
+
+
+七、运行与配置（给演示/交付用）
+----------------
+启动方式：
+- 桌面端开发：npm run dev:electron
+
+需要配置的 Key（设置页/配置项）：
+- OpenRouter API Key：用于调用 Gemini（生成提示词/修复/编辑提示词）
+- DashScope API Key：用于 qwen-image-plus 生图、qwen-image-edit-plus 图像编辑
+
+
+八、近期关键修复与优化（里程碑）
+----------------
+1) PPT 大纲解析更鲁棒：
+- 支持 slides/pages/outlines 等多种字段名与中英文别名，避免“有大纲但没有确认按钮”。
+
+2) PPT 浏览体验：
+- 缩略图总览、总页数、上一页/下一页、页码展示、全屏、缩放。
+
+3) PPT 编辑交互：
+- 拖拽页缩略图到对话框；
+- Ctrl+拖拽框选区域并截取截图作为编辑参考；
+- 编辑完成自动跳转到目标页；增加处理中反馈与总结反馈。
+
+4) 反品牌/反软件水印：
+- 提示词中去掉 Microsoft/C4D 等，并在 negativePrompt 强制禁止。
+
+5) 文档预览（Word 打印布局）：
+- 修复“长文只显示一页/背景消失”；
+- 增加分页占位块：更接近 Word/OnlyOffice 的页间距与每页顶端留白。
+
+6) 空文件夹显示修复：
+- 打开空文件夹时显示“文件夹为空”，并提供“新建文档/切换文件夹”入口。
+
+
+九、当前已知限制/后续可优化方向（可做 PPT 展望）
+----------------
+1) Word 分页渲染：
+- 当前是“编辑态分页视觉 + 占位块”方案，复杂内容（大表格/图片）可能出现页分割不完美；可进一步做更精确分页或提供“打印预览模式”。
+
+2) PPT 生图一致性：
+- 进一步提升跨页一致性：统一网格、字号体系、图形语法、章节页/过渡页模板。
+
+3) 可靠性与成本：
+- 更细粒度缓存（prompt/图片/元数据）与失败恢复；
+- 更明确的错误提示与一键重试/降级策略。
+
+
+（End）
+
+
+

@@ -1,0 +1,30 @@
+# dependencies
+node_modules/
+
+# builds
+dist/
+release/
+
+# env / secrets
+.env
+.env.*.local
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.cursor/
+.vscode/
+
+# docs outputs (generated binaries / assets)
+docs/*.docx
+docs/*.pptx
+docs/*_assets/
+
+
