@@ -84,3 +84,10 @@ moltbot/
 
 # Claude / AI skills（开发工具配置）
 .claude/
+
+# 私密 / 个人文件（不推送到公开仓库）
+word材料/
+test/
+word/
+电气学院*/
+主界面word.png
