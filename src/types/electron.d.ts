@@ -264,6 +264,63 @@ export interface ExcelCreateResult {
   error?: string
 }
 
+export interface MemorySearchOptions {
+  query: string
+  topK?: number
+  textWeight?: number
+  vectorWeight?: number
+  workspaceKey?: string
+  sources?: string[] | string
+}
+
+export interface MemorySearchResult {
+  path: string
+  source: 'daily' | 'long' | 'chat' | string
+  workspaceKey?: string
+  sessionId?: string
+  startLine?: number
+  endLine?: number
+  score: number
+  snippet: string
+}
+
+export interface MemorySearchResponse {
+  success: boolean
+  results: MemorySearchResult[]
+  error?: string
+}
+
+export interface MemoryAppendResponse {
+  success: boolean
+  filePath?: string
+  error?: string
+}
+
+export interface MemoryStatusResponse {
+  success: boolean
+  memoryDir?: string
+  fileCount?: number
+  chunkCount?: number
+  lastIndexedAt?: string | null
+  message?: string
+  error?: string
+}
+
+export interface MemoryStatusDetailResponse {
+  success: boolean
+  memoryDir?: string
+  lastIndexedAt?: string | null
+  chunkSources?: Array<{ source: string; count: number }>
+  fileSources?: Array<{ source: string; count: number }>
+  message?: string
+  error?: string
+}
+
+export interface MemoryClearResponse {
+  success: boolean
+  error?: string
+}
+
 export interface ElectronAPI {
   // 文件夹操作
   selectFolder: () => Promise<string | null>
@@ -412,6 +469,42 @@ export interface ElectronAPI {
     num?: number
     braveApiKey?: string
   }) => Promise<WebSearchResponse>
+
+  // 环境变量配置读写（.env 文件）
+  getEnvSettings: () => Promise<Record<string, any>>
+  saveEnvSettings: (settings: Record<string, any>) => Promise<{ success: boolean; error?: string }>
+
+  // 记忆系统
+  memorySearch: (options: MemorySearchOptions) => Promise<MemorySearchResponse>
+  memoryAppend: (options: { text: string; source?: string; tags?: string[] }) => Promise<MemoryAppendResponse>
+  memoryAppendSession: (options: { sessionId: string; text: string; meta?: Record<string, unknown> }) => Promise<MemoryAppendResponse>
+  memoryStatus: () => Promise<MemoryStatusResponse>
+  memoryStatusDetail: () => Promise<MemoryStatusDetailResponse>
+  memoryClear: (options?: { scope?: 'all' | 'daily' | 'long' | 'sessions' }) => Promise<MemoryClearResponse>
+  memoryRebuildIndex: () => Promise<MemoryStatusDetailResponse>
+
+  // AI 请求代理（主进程 Node fetch，绕开渲染进程 HTTP/2）
+  aiChatCompletions: (options: {
+    requestId: string
+    baseUrl: string
+    apiKey?: string
+    model: string
+    messages: Array<{ role: string; content: string }>
+    temperature?: number
+    maxTokens?: number
+  }) => Promise<{ success: boolean; content?: string; error?: string }>
+
+  aiCancel: (requestId: string) => Promise<{ success: boolean; error?: string }>
+
+  onAIStreamDelta: (
+    callback: (payload: { 
+      requestId: string
+      delta: string
+      fullContent?: string
+      reasoningDelta?: string  // 思考增量（kimi-k2.5 等思考模型）
+      fullReasoning?: string   // 完整思考内容
+    }) => void
+  ) => () => void
 
   // OpenRouter Gemini：大纲转文生图提示词
   openrouterGeminiPptPrompts: (options: {

@@ -55,42 +55,42 @@ export default function ContextMenu({
       label: '润色', 
       icon: Sparkles, 
       instruction: '优化这段文字的表达，使其更加流畅、专业，但保持原意和风格不变。注意：不要改变原文的核心观点和信息',
-      color: 'text-violet-400'
+      color: 'text-accent'
     },
     { 
       id: 'simplify', 
       label: '精简', 
       icon: Scissors, 
       instruction: '精简这段文字，删除冗余和重复的内容，保留核心信息。目标：字数减少30%-50%，但不丢失关键信息',
-      color: 'text-blue-400'
+      color: 'text-system-gray'
     },
     { 
       id: 'expand', 
       label: '扩写', 
       icon: FileText, 
       instruction: '扩展这段文字，补充更多细节、论据和例子，使内容更加丰富完整。目标：字数增加50%-100%',
-      color: 'text-green-400'
+      color: 'text-success'
     },
     { 
       id: 'formal', 
       label: '正式化', 
       icon: MessageSquare, 
       instruction: '将这段文字改成正式的书面语风格，适合公文、商务报告或学术场合。去除口语化表达，使用规范用语',
-      color: 'text-amber-400'
+      color: 'text-warning'
     },
     { 
       id: 'translate', 
       label: '翻译成英文', 
       icon: Languages, 
       instruction: '将这段中文准确翻译成英文，保持原文的语义、语气和风格。使用地道的英语表达',
-      color: 'text-cyan-400'
+      color: 'text-system-teal'
     },
     { 
       id: 'translate_cn', 
       label: '翻译成中文', 
       icon: Languages, 
       instruction: '将这段英文准确翻译成中文，保持原文的语义、语气和风格。使用地道的中文表达',
-      color: 'text-cyan-400'
+      color: 'text-system-teal'
     },
   ]
 
@@ -110,12 +110,12 @@ export default function ContextMenu({
 
   return (
     <div ref={menuRef} style={menuStyle}>
-      <div className="w-52 bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl overflow-hidden">
+      <div className="w-52 glass-card border border-border rounded-xl shadow-2xl overflow-hidden">
         {/* AI 编辑标题 */}
-        <div className="px-3 py-2 bg-zinc-800 border-b border-zinc-700">
+        <div className="px-3 py-2 bg-black/10 dark:bg-white/10 backdrop-blur-md border-b border-border">
           <div className="flex items-center gap-2">
-            <Wand2 className="w-4 h-4 text-violet-400" />
-            <span className="text-xs font-medium text-zinc-300">AI 编辑</span>
+            <Wand2 className="w-4 h-4 text-accent" />
+            <span className="text-xs font-medium text-text-secondary">AI 编辑</span>
           </div>
         </div>
 
@@ -125,31 +125,31 @@ export default function ContextMenu({
             <button
               key={action.id}
               onClick={() => onAction('ai', action.instruction)}
-              className="w-full flex items-center gap-3 px-3 py-2 hover:bg-zinc-800 transition-colors text-left"
+              className="w-full flex items-center gap-3 px-3 py-2 hover:bg-black/5 dark:hover:bg-white/5 transition-colors text-left"
             >
               <action.icon className={`w-4 h-4 ${action.color}`} />
-              <span className="text-sm text-zinc-300">{action.label}</span>
+              <span className="text-sm text-text-secondary">{action.label}</span>
             </button>
           ))}
         </div>
 
         {/* 分隔线 */}
-        <div className="border-t border-zinc-700" />
+        <div className="border-t border-border" />
 
         {/* 自定义编辑 */}
         <div className="py-1">
           <button
             onClick={() => onAction('custom')}
-            className="w-full flex items-center gap-3 px-3 py-2 hover:bg-zinc-800 transition-colors text-left"
+            className="w-full flex items-center gap-3 px-3 py-2 hover:bg-black/5 dark:hover:bg-white/5 transition-colors text-left"
           >
-            <Sparkles className="w-4 h-4 text-violet-400" />
-            <span className="text-sm text-zinc-300">自定义编辑...</span>
-            <span className="ml-auto text-[10px] text-zinc-600 bg-zinc-800 px-1.5 py-0.5 rounded">Ctrl+K</span>
+            <Sparkles className="w-4 h-4 text-accent" />
+            <span className="text-sm text-text-secondary">自定义编辑...</span>
+            <span className="ml-auto text-[10px] text-text-dim bg-black/10 dark:bg-white/10 border border-black/10 dark:border-white/10 px-1.5 py-0.5 rounded">Ctrl+K</span>
           </button>
         </div>
 
         {/* 分隔线 */}
-        <div className="border-t border-zinc-700" />
+        <div className="border-t border-border" />
 
         {/* 基础操作 */}
         <div className="py-1">
@@ -157,10 +157,10 @@ export default function ContextMenu({
             <button
               key={action.id}
               onClick={() => onAction(action.id)}
-              className="w-full flex items-center gap-3 px-3 py-2 hover:bg-zinc-800 transition-colors text-left"
+              className="w-full flex items-center gap-3 px-3 py-2 hover:bg-black/5 dark:hover:bg-white/5 transition-colors text-left"
             >
-              <action.icon className="w-4 h-4 text-zinc-500" />
-              <span className="text-sm text-zinc-400">{action.label}</span>
+              <action.icon className="w-4 h-4 text-text-dim" />
+              <span className="text-sm text-text-muted">{action.label}</span>
             </button>
           ))}
         </div>

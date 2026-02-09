@@ -239,35 +239,35 @@ ${contentToProcess}
       
       {/* 弹窗 */}
       <div style={popupStyle} className="w-[400px]">
-        <div className="bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl overflow-hidden">
+        <div className="glass-card border border-border rounded-xl shadow-2xl overflow-hidden">
           {/* 标题栏 */}
-          <div className="flex items-center justify-between px-3 py-2 bg-zinc-800 border-b border-zinc-700">
+          <div className="flex items-center justify-between px-3 py-2 bg-black/10 dark:bg-white/10 backdrop-blur-md border-b border-border">
             <div className="flex items-center gap-2">
-              <Wand2 className="w-4 h-4 text-violet-400" />
-              <span className="text-sm text-zinc-200">AI 编辑</span>
+              <Wand2 className="w-4 h-4 text-accent" />
+              <span className="text-sm text-text">AI 编辑</span>
             </div>
             <button 
               onClick={onClose}
-              className="p-1 hover:bg-zinc-700 rounded transition-colors"
+              className="p-1 hover:bg-black/10 dark:hover:bg-white/10 rounded transition-colors"
             >
-              <X className="w-4 h-4 text-zinc-400" />
+              <X className="w-4 h-4 text-text-muted" />
             </button>
           </div>
 
           {/* 选中的文本预览 */}
-          <div className="px-3 py-2 bg-zinc-800/50 border-b border-zinc-700">
-            <p className="text-xs text-zinc-500 mb-1">选中的文本：</p>
-            <p className="text-sm text-zinc-300 line-clamp-2">{selectedText}</p>
+          <div className="px-3 py-2 bg-black/5 dark:bg-white/5 border-b border-border">
+            <p className="text-xs text-text-dim mb-1">选中的文本：</p>
+            <p className="text-sm text-text-secondary line-clamp-2">{selectedText}</p>
           </div>
 
           {/* 快捷操作按钮 */}
-          <div className="flex flex-wrap gap-1.5 px-3 py-2 border-b border-zinc-700">
+          <div className="flex flex-wrap gap-1.5 px-3 py-2 border-b border-border">
             {quickActions.map((action) => (
               <button
                 key={action.label}
                 onClick={() => handleQuickAction(action.instruction)}
                 disabled={isProcessing}
-                className="flex items-center gap-1 px-2.5 py-1 bg-zinc-800 hover:bg-zinc-700 border border-zinc-600 rounded-lg text-xs text-zinc-300 transition-colors disabled:opacity-50"
+                className="flex items-center gap-1 px-2.5 py-1 bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 border border-black/10 dark:border-white/10 rounded-lg text-xs text-text-secondary transition-colors disabled:opacity-50"
               >
                 <span>{action.icon}</span>
                 <span>{action.label}</span>
@@ -293,13 +293,13 @@ ${contentToProcess}
                   }
                 }}
                 placeholder="输入修改指令，如：改成正式语气..."
-                className="flex-1 px-3 py-2 bg-zinc-800 border border-zinc-600 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-violet-500"
+                className="flex-1 px-3 py-2 bg-black/10 dark:bg-white/10 border border-black/10 dark:border-white/10 rounded-lg text-sm text-text placeholder-text-dim focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/10"
                 disabled={isProcessing}
               />
               <button
                 onClick={handleSubmit}
                 disabled={isProcessing || !instruction.trim()}
-                className="px-3 py-2 bg-violet-600 hover:bg-violet-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-white rounded-lg transition-colors"
+                className="px-3 py-2 btn-sage rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isProcessing ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
@@ -319,29 +319,29 @@ ${contentToProcess}
 
           {/* 结果预览 */}
           {result && (
-            <div className="border-t border-zinc-700">
-              <div className="px-3 py-2 bg-zinc-800/30">
-                <p className="text-xs text-zinc-500 mb-1">修改结果：</p>
-                <p className="text-sm text-green-400 whitespace-pre-wrap leading-relaxed">
+            <div className="border-t border-border">
+              <div className="px-3 py-2 bg-black/5 dark:bg-white/5">
+                <p className="text-xs text-text-dim mb-1">修改结果：</p>
+                <p className="text-sm text-success whitespace-pre-wrap leading-relaxed">
                   {result}
                 </p>
               </div>
               
               {/* 操作按钮 */}
-              <div className="flex items-center gap-2 px-3 py-2 bg-zinc-800/50 border-t border-zinc-700">
+              <div className="flex items-center gap-2 px-3 py-2 bg-black/10 dark:bg-white/10 border-t border-border">
                 <button
                   onClick={() => {
-                    onApply(result, hasHtmlFormat)
+                    onApply(result, hasHtmlFormat ? true : undefined)
                     onClose()
                   }}
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-green-600 hover:bg-green-500 text-white text-sm rounded-lg transition-colors"
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-success/16 text-success border border-success/25 hover:bg-success/22 text-sm rounded-lg transition-colors"
                 >
                   <Check className="w-4 h-4" />
                   <span>应用修改</span>
                 </button>
                 <button
                   onClick={() => setResult(null)}
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-700 hover:bg-zinc-600 text-zinc-300 text-sm rounded-lg transition-colors"
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-black/10 dark:bg-white/10 hover:bg-black/15 dark:hover:bg-white/15 text-text-secondary text-sm rounded-lg transition-colors border border-black/10 dark:border-white/10"
                 >
                   <X className="w-4 h-4" />
                   <span>取消</span>
@@ -351,10 +351,10 @@ ${contentToProcess}
           )}
 
           {/* 快捷键提示 */}
-          <div className="px-3 py-1.5 bg-zinc-800/30 border-t border-zinc-700">
-            <p className="text-[10px] text-zinc-600 text-center">
-              <kbd className="px-1 py-0.5 bg-zinc-700 rounded">Enter</kbd> 提交 · 
-              <kbd className="px-1 py-0.5 bg-zinc-700 rounded ml-1">Esc</kbd> 关闭
+          <div className="px-3 py-1.5 bg-black/10 dark:bg-white/10 border-t border-border">
+            <p className="text-[10px] text-text-dim text-center">
+              <kbd className="px-1 py-0.5 bg-black/10 dark:bg-white/10 border border-black/10 dark:border-white/10 rounded">Enter</kbd> 提交 · 
+              <kbd className="px-1 py-0.5 bg-black/10 dark:bg-white/10 border border-black/10 dark:border-white/10 rounded ml-1">Esc</kbd> 关闭
             </p>
           </div>
         </div>

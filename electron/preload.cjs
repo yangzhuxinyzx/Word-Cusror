@@ -78,6 +78,28 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Web 搜索（Scrapeless MCP）
   webSearch: (options) => ipcRenderer.invoke('web-search', options),
 
+  // 记忆系统
+  memorySearch: (options) => ipcRenderer.invoke('memory-search', options),
+  memoryAppend: (options) => ipcRenderer.invoke('memory-append', options),
+  memoryAppendSession: (options) => ipcRenderer.invoke('memory-append-session', options),
+  memoryStatus: () => ipcRenderer.invoke('memory-status'),
+  memoryStatusDetail: () => ipcRenderer.invoke('memory-status-detail'),
+  memoryClear: (options) => ipcRenderer.invoke('memory-clear', options),
+  memoryRebuildIndex: () => ipcRenderer.invoke('memory-rebuild-index'),
+
+  // 环境变量配置读写（.env 文件）
+  getEnvSettings: () => ipcRenderer.invoke('get-env-settings'),
+  saveEnvSettings: (settings) => ipcRenderer.invoke('save-env-settings', settings),
+
+  // AI 请求代理（主进程 Node fetch，绕开渲染进程 HTTP/2）
+  aiChatCompletions: (options) => ipcRenderer.invoke('ai-chat-completions', options),
+  aiCancel: (requestId) => ipcRenderer.invoke('ai-cancel', requestId),
+  onAIStreamDelta: (callback) => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('ai-stream-delta', listener)
+    return () => ipcRenderer.removeListener('ai-stream-delta', listener)
+  },
+
   // PPT 生成：DashScope 生图（并发=2）→ 后处理 1920x1200 → 打包 16:10 .pptx
   pptGenerateDeck: (options) => ipcRenderer.invoke('ppt-generate-deck', options),
   
@@ -89,6 +111,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // PPTX 预览：LibreOffice 渲染为 PNG（只读预览）
   pptxRenderPreview: (filePath) => ipcRenderer.invoke('pptx-render-preview', filePath),
+  
+  // 字体服务：列出/读取 Fonts/ 目录下的字体
+  fontsList: () => ipcRenderer.invoke('fonts-list'),
+  fontsRead: (fileName) => ipcRenderer.invoke('fonts-read', fileName),
   
   // 平台信息
   platform: process.platform,

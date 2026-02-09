@@ -3,6 +3,15 @@ import { DocumentContent, DocumentStyles, FileItem, PageSetup, HeaderFooterSetup
 import type { ExcelOpenResponse } from '../types/electron'
 import { saveAs } from 'file-saver'
 import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, Table, TableRow, TableCell, WidthType, BorderStyle, UnderlineType } from 'docx'
+import { extractTypographyProfileFromArrayBuffer } from '../utils/docxTypography'
+import type { DocxTypographyProfile } from '../utils/docxTypography'
+import { toChineseDefaultFallbackStack } from '../fonts/fontManifest'
+import { useComments } from './CommentContext'
+import { postProcessDocxWithAnnotations } from '../utils/docxExportWithTracking'
+// DSL 支持
+import type { DocDsl } from '../types/docDsl'
+import { validateDocDsl, dslToHtml } from '../utils/docDsl'
+import { dslToDocxBlob } from '../utils/docDslToDocx'
 
 // 将 ArrayBuffer 转换为 Base64（分块处理，避免大文件导致栈溢出）
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -10,22 +19,26 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   const chunkSize = 8192 // 每次处理 8KB
   let binary = ''
   
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/65f1d8ba-6206-43cb-9f6f-22f7361d7de4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentContext.tsx:arrayBufferToBase64:entry',message:'base64 编码开始',data:{bufferSize:buffer.byteLength,bytesLength:bytes.length},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H1'})}).catch(()=>{});
-  // #endregion agent log
-  
   for (let i = 0; i < bytes.length; i += chunkSize) {
     const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length))
     binary += String.fromCharCode.apply(null, Array.from(chunk))
   }
   
   const base64 = btoa(binary)
-  
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/65f1d8ba-6206-43cb-9f6f-22f7361d7de4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentContext.tsx:arrayBufferToBase64:exit',message:'base64 编码完成',data:{binaryLength:binary.length,base64Length:base64.length,base64Preview:base64.slice(0,100)},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H1'})}).catch(()=>{});
-  // #endregion agent log
-  
   return base64
+}
+
+function b64uEncodeUtf8(input: string): string {
+  try {
+    const b64 = btoa(unescape(encodeURIComponent(input)))
+    return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+  } catch {
+    return ''
+  }
+}
+
+function stripQuotes(s: string): string {
+  return s.replace(/['"]/g, '').trim()
 }
 
 interface ReplaceResult {
@@ -44,6 +57,9 @@ interface SingleReplacement {
   replaceText: string
   count: number
   timestamp: number
+  // 审查专属字段（review 工具使用）
+  reviewReason?: string
+  reviewType?: string
 }
 
 // 操作类型
@@ -67,6 +83,9 @@ type WordEditOpType =
   | 'toc'             // 目录
   | 'define_style'    // 定义样式
   | 'modify_style'    // 修改样式
+  | 'outline_summary' // 大纲/摘要生成
+  | 'template_fill'   // 模板智能填充
+  | 'citation_footnote' // 引用/脚注管理
 
 // 统一的待审阅变更（M1：先由替换记录映射；M3 起会扩展为格式/样式变更）
 export interface PendingChange {
@@ -79,6 +98,9 @@ export interface PendingChange {
   stats?: { matches: number }
   timestamp: number
   meta?: Record<string, unknown>
+  // 审查专属字段（review 工具使用）
+  reviewReason?: string   // 修改原因（如 "语病修正"、"用词不当"）
+  reviewType?: string     // 问题类型（grammar/logic/style/typo/format）
 }
 
 export type WordEditOp = {
@@ -91,6 +113,18 @@ export type WordEditOp = {
   }
   params?: Record<string, unknown>
   dryRun?: boolean
+}
+
+type TemplateFieldCandidate = {
+  id: string
+  label: string
+  kind: 'colon' | 'blank' | 'table'
+  context: string
+  path?: string
+  currentValue?: string
+  fieldType?: string
+  groupKey?: string
+  meta?: Record<string, unknown>
 }
 
 // 最近的替换记录（支持多个）
@@ -121,6 +155,8 @@ interface DocumentContextType {
   docxData: string | null
   excelData: ExcelOpenResponse | null
   pptData: { pptxBase64: string } | null
+  /** 当前打开 docx 的排版/字体配置（从 docx 解析得到；用于显示与导出保持一致） */
+  typographyProfile: DocxTypographyProfile | null
   refreshExcelData: () => Promise<boolean>  // 刷新 Excel 数据
   lastReplacement: ReplacementRecord | null  // 最近的替换记录
   pendingChanges: PendingChange[] // 待审阅修改（逐条）
@@ -133,11 +169,13 @@ interface DocumentContextType {
   updateStyles: (styles: Partial<DocumentStyles>) => void
   setCurrentFile: (file: FileItem | null) => void
   addFile: (file: FileItem) => void
-  createNewDocument: (title: string, content: string, elements?: FormattedElement[]) => void
+  createNewDocument: (title: string, content: string, elements?: FormattedElement[], styleRefPath?: string) => void
+  /** DSL 方式创建文档 */
+  createDocumentFromDsl: (title: string, dsl: DocDsl) => Promise<{ success: boolean; message: string; filePath?: string }>
   uploadDocxFile: (file: File) => Promise<void>
   saveDocument: () => Promise<void>
   applyAIEdit: (newContent: string) => void
-  replaceInDocument: (search: string, replace: string) => ReplaceResult
+  replaceInDocument: (search: string, replace: string, reviewMeta?: { reason?: string; type?: string }) => ReplaceResult
   insertInDocument: (position: string, content: string) => { success: boolean; message: string }
   deleteInDocument: (target: string) => { success: boolean; count: number; message: string }
   scrollToText: (text: string) => void  // 滚动到指定文本
@@ -150,6 +188,8 @@ interface DocumentContextType {
   openFolder: () => Promise<void>
   openFile: (file: FileItem) => Promise<void>
   saveCurrentFile: () => Promise<void>
+  /** Agent 静默保存：将编辑器内容写回当前 .docx 文件，无弹窗确认 */
+  silentSaveToFile: () => Promise<{ success: boolean; error?: string }>
   refreshFiles: () => Promise<void>
   // ONLYOFFICE 专用操作
   onlyOfficeReplace: (search: string, replace: string) => Promise<ReplaceResult>
@@ -183,7 +223,8 @@ interface DocumentContextType {
     color?: string
     backgroundColor?: string
     fontSize?: string
-  }) => ReplaceResult
+    fontFamily?: string
+  }, reviewMeta?: { reason?: string; type?: string }) => ReplaceResult
   // 动画控制
   docEntryAnimationKey: number
   triggerDocEntryAnimation: () => void
@@ -205,8 +246,8 @@ interface DocumentContextType {
 
 const defaultStyles: DocumentStyles = {
   fontSize: 14,
-  fontFamily: '仿宋',
-  lineHeight: 1.5,
+  fontFamily: '等线',
+  lineHeight: 1.15,
   textAlign: 'left',
 }
 
@@ -227,45 +268,45 @@ const defaultHeaderFooterSetup: HeaderFooterSetup = {}
 const defaultCustomStyles: Record<string, CustomStyle> = {
   'Normal': {
     name: 'Normal',
-    fontFamily: '仿宋',
-    fontSize: '12pt',
-    lineHeight: '1.5',
-    textIndent: '2em',
+    fontFamily: '等线',
+    fontSize: '10.5pt',
+    lineHeight: '1.15',
+    textIndent: '0',
   },
   'Heading1': {
     name: 'Heading1',
     fontFamily: '黑体',
-    fontSize: '22pt',
+    fontSize: '20pt',
     bold: true,
-    alignment: 'center',
-    spaceBefore: '12pt',
-    spaceAfter: '6pt',
+    alignment: 'left',
+    spaceBefore: '18pt',
+    spaceAfter: '4pt',
   },
   'Heading2': {
     name: 'Heading2',
     fontFamily: '黑体',
     fontSize: '16pt',
     bold: true,
-    spaceBefore: '12pt',
-    spaceAfter: '6pt',
+    spaceBefore: '8pt',
+    spaceAfter: '4pt',
   },
   'Heading3': {
     name: 'Heading3',
     fontFamily: '黑体',
     fontSize: '14pt',
     bold: true,
-    spaceBefore: '6pt',
-    spaceAfter: '3pt',
+    spaceBefore: '8pt',
+    spaceAfter: '4pt',
   },
   'Quote': {
     name: 'Quote',
     fontFamily: '楷体',
-    fontSize: '12pt',
+    fontSize: '10.5pt',
     italic: true,
     color: '#666666',
     marginLeft: '2em',
     marginRight: '2em',
-    border: '1px solid #ddd',
+    border: '1px solid var(--word-rule)',
     backgroundColor: '#f9f9f9',
   },
 }
@@ -277,13 +318,54 @@ const defaultDocument: DocumentContent = {
   lastModified: new Date(),
 }
 
-const DocumentContext = createContext<DocumentContextType | undefined>(undefined)
+// Vite HMR: keep a stable context identity across hot updates.
+// Otherwise, provider/consumer can mismatch and throw "useDocument must be used within a DocumentProvider".
+const DocumentContext: React.Context<DocumentContextType | undefined> = (() => {
+  try {
+    const hot = (import.meta as any)?.hot
+    const existing = hot?.data?.DocumentContext as React.Context<DocumentContextType | undefined> | undefined
+    if (existing) return existing
+    const ctx = createContext<DocumentContextType | undefined>(undefined)
+    if (hot) hot.data.DocumentContext = ctx
+    return ctx
+  } catch {
+    return createContext<DocumentContextType | undefined>(undefined)
+  }
+})()
 
 // 检测是否在 Electron 环境
 const isElectron = typeof window !== 'undefined' && !!window.electronAPI
 
+async function fetchArrayBufferFromLocalFile(filePath: string): Promise<ArrayBuffer> {
+  if (!window.electronAPI?.getLocalFileUrl) {
+    throw new Error('getLocalFileUrl 不可用')
+  }
+  const url = await window.electronAPI.getLocalFileUrl(filePath)
+  const resp = await fetch(url)
+  if (!resp.ok) throw new Error(`读取文件失败（HTTP ${resp.status}）`)
+  return await resp.arrayBuffer()
+}
+
+function cssLengthToTwips(value: string | undefined, baseFontPt = 10.5): number | undefined {
+  const v = (value || '').trim().toLowerCase()
+  if (!v) return undefined
+  // pt
+  const mPt = v.match(/^(\d+(?:\.\d+)?)\s*pt$/)
+  if (mPt) return Math.round(Number(mPt[1]) * 20)
+  // px (approx 1px = 0.75pt)
+  const mPx = v.match(/^(\d+(?:\.\d+)?)\s*px$/)
+  if (mPx) return Math.round(Number(mPx[1]) * 0.75 * 20)
+  // cm (1in=2.54cm, 1in=1440 twips)
+  const mCm = v.match(/^(\d+(?:\.\d+)?)\s*cm$/)
+  if (mCm) return Math.round((Number(mCm[1]) / 2.54) * 1440)
+  // em (relative to base font)
+  const mEm = v.match(/^(\d+(?:\.\d+)?)\s*em$/)
+  if (mEm) return Math.round(Number(mEm[1]) * baseFontPt * 20)
+  return undefined
+}
+
 // Markdown 转换为 docx 段落
-function markdownToDocxParagraphs(content: string): Paragraph[] {
+function markdownToDocxParagraphs(content: string, profile?: DocxTypographyProfile): Paragraph[] {
   const paragraphs: Paragraph[] = []
   const lines = content.split('\n')
   let inList = false
@@ -319,7 +401,7 @@ function markdownToDocxParagraphs(content: string): Paragraph[] {
     if (trimmedLine.startsWith('### ')) {
       flushList()
       paragraphs.push(new Paragraph({
-        children: parseInlineFormatting(trimmedLine.slice(4), true),
+        children: parseInlineFormatting(trimmedLine.slice(4), true, profile),
         heading: HeadingLevel.HEADING_3,
         spacing: { before: 200, after: 100 },
       }))
@@ -328,7 +410,7 @@ function markdownToDocxParagraphs(content: string): Paragraph[] {
     if (trimmedLine.startsWith('## ')) {
       flushList()
       paragraphs.push(new Paragraph({
-        children: parseInlineFormatting(trimmedLine.slice(3), true),
+        children: parseInlineFormatting(trimmedLine.slice(3), true, profile),
         heading: HeadingLevel.HEADING_2,
         spacing: { before: 260, after: 130 },
       }))
@@ -337,7 +419,7 @@ function markdownToDocxParagraphs(content: string): Paragraph[] {
     if (trimmedLine.startsWith('# ')) {
       flushList()
       paragraphs.push(new Paragraph({
-        children: parseInlineFormatting(trimmedLine.slice(2), true),
+        children: parseInlineFormatting(trimmedLine.slice(2), true, profile),
         heading: HeadingLevel.HEADING_1,
         alignment: AlignmentType.CENTER,
         spacing: { before: 300, after: 200 },
@@ -350,7 +432,7 @@ function markdownToDocxParagraphs(content: string): Paragraph[] {
       inList = true
       listType = 'bullet'
       paragraphs.push(new Paragraph({
-        children: parseInlineFormatting(trimmedLine.slice(2)),
+        children: parseInlineFormatting(trimmedLine.slice(2), false, profile),
         bullet: { level: 0 },
         spacing: { after: 60 },
       }))
@@ -363,7 +445,7 @@ function markdownToDocxParagraphs(content: string): Paragraph[] {
       listType = 'number'
       const text = trimmedLine.replace(/^\d+\. /, '')
       paragraphs.push(new Paragraph({
-        children: parseInlineFormatting(text),
+        children: parseInlineFormatting(text, false, profile),
         numbering: { reference: 'default-numbering', level: 0 },
         spacing: { after: 60 },
       }))
@@ -374,7 +456,7 @@ function markdownToDocxParagraphs(content: string): Paragraph[] {
     if (trimmedLine.startsWith('> ')) {
       flushList()
       paragraphs.push(new Paragraph({
-        children: parseInlineFormatting(trimmedLine.slice(2)),
+        children: parseInlineFormatting(trimmedLine.slice(2), false, profile),
         indent: { left: 720 },
         border: { left: { style: 'single' as any, size: 12, space: 10, color: 'CCCCCC' } },
         spacing: { after: 100 },
@@ -384,11 +466,22 @@ function markdownToDocxParagraphs(content: string): Paragraph[] {
 
     // 处理普通段落
     flushList()
+    const firstLine = profile?.normal?.indent?.firstLineTwips ?? 480
+    const after = profile?.normal?.spacing?.afterTwips ?? 120
+    const lineTwips = profile?.normal?.spacing?.lineTwips ?? 360
+    const align =
+      profile?.normal?.alignment === 'justify'
+        ? AlignmentType.JUSTIFIED
+        : profile?.normal?.alignment === 'center'
+          ? AlignmentType.CENTER
+          : profile?.normal?.alignment === 'right'
+            ? AlignmentType.RIGHT
+            : AlignmentType.LEFT
     paragraphs.push(new Paragraph({
-      children: parseInlineFormatting(trimmedLine),
-      indent: { firstLine: 480 }, // 首行缩进 2 字符
-      spacing: { after: 120, line: 360 }, // 行距 1.5 倍
-      alignment: AlignmentType.JUSTIFIED,
+      children: parseInlineFormatting(trimmedLine, false, profile),
+      indent: { firstLine }, // 默认首行缩进（可由参考样式覆盖）
+      spacing: { after, line: lineTwips }, // 默认段后/行距（可由参考样式覆盖）
+      alignment: align,
     }))
   }
 
@@ -396,10 +489,18 @@ function markdownToDocxParagraphs(content: string): Paragraph[] {
 }
 
 // 解析行内格式（粗体、斜体等）
-function parseInlineFormatting(text: string, isHeading: boolean = false): TextRun[] {
+function parseInlineFormatting(text: string, isHeading: boolean = false, profile?: DocxTypographyProfile): TextRun[] {
   const runs: TextRun[] = []
-  const fontSize = isHeading ? 28 : 28 // 四号字体 = 14pt = 28 half-points
-  const fontName = isHeading ? '黑体' : '仿宋'
+  const defaultSize = profile?.normal?.fontSizeHalfPoints ?? 21 // 10.5pt
+  const fontSize = isHeading ? 28 : defaultSize
+  const normalAscii = profile?.normal?.fontAscii || profile?.normal?.fontHAnsi
+  const normalEastAsia = profile?.normal?.fontEastAsia
+  const fallbackFont = normalEastAsia || normalAscii || '等线'
+  const headingFont = '黑体'
+  const font =
+    isHeading
+      ? { ascii: headingFont, hAnsi: headingFont, eastAsia: headingFont }
+      : { ascii: normalAscii || fallbackFont, hAnsi: profile?.normal?.fontHAnsi || normalAscii || fallbackFont, eastAsia: normalEastAsia || fallbackFont }
   
   // 简化处理：用正则分割文本
   const regex = /(\*\*\*.+?\*\*\*|\*\*.+?\*\*|\*.+?\*|__.+?__|_.+?_)/g
@@ -411,7 +512,7 @@ function parseInlineFormatting(text: string, isHeading: boolean = false): TextRu
     if (match.index > lastIndex) {
       runs.push(new TextRun({
         text: text.slice(lastIndex, match.index),
-        font: fontName,
+        font,
         size: fontSize,
       }))
     }
@@ -442,7 +543,7 @@ function parseInlineFormatting(text: string, isHeading: boolean = false): TextRu
 
     runs.push(new TextRun({
       text: content,
-      font: fontName,
+      font,
       size: fontSize,
       bold,
       italics: italic,
@@ -455,12 +556,12 @@ function parseInlineFormatting(text: string, isHeading: boolean = false): TextRu
   if (lastIndex < text.length) {
     runs.push(new TextRun({
       text: text.slice(lastIndex),
-      font: fontName,
+      font,
       size: fontSize,
     }))
   }
 
-  return runs.length > 0 ? runs : [new TextRun({ text, font: fontName, size: fontSize })]
+  return runs.length > 0 ? runs : [new TextRun({ text, font, size: fontSize })]
 }
 
 // 将 HTML 转换为保留结构的格式化文本
@@ -541,11 +642,7 @@ function htmlToStructuredText(html: string): string {
 }
 
 // 创建 docx 文档
-async function createDocxBlob(content: string, title: string): Promise<Blob> {
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/65f1d8ba-6206-43cb-9f6f-22f7361d7de4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentContext.tsx:createDocxBlob:entry',message:'createDocxBlob 开始',data:{title,contentLength:content.length,contentPreview:content.slice(0,100)},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H2'})}).catch(()=>{});
-  // #endregion agent log
-  
+async function createDocxBlob(content: string, title: string, typographyProfile?: DocxTypographyProfile | null): Promise<Blob> {
   // 判断是 HTML 还是 Markdown
   const isHtml = content.trim().startsWith('<')
 
@@ -604,7 +701,7 @@ async function createDocxBlob(content: string, title: string): Promise<Blob> {
     return AlignmentType.LEFT
   }
 
-  const htmlToDocxChildren = (html: string): (Paragraph | Table)[] => {
+  const htmlToDocxChildren = (html: string, profile?: DocxTypographyProfile): (Paragraph | Table)[] => {
     const parser = new DOMParser()
     const doc = parser.parseFromString(html, 'text/html')
 
@@ -615,7 +712,7 @@ async function createDocxBlob(content: string, title: string): Promise<Blob> {
         italics?: boolean
         underline?: boolean
         color?: string
-        font?: string
+        font?: { ascii?: string; hAnsi?: string; eastAsia?: string }
         size?: number
       }
     ): TextRun[] => {
@@ -647,6 +744,36 @@ async function createDocxBlob(content: string, title: string): Promise<Blob> {
       const el = node as HTMLElement
       const tag = el.tagName.toLowerCase()
 
+      // === Word 原生修订标记（导出时转为 w:ins/w:del） ===
+      if (tag === 'span' && (el.classList.contains('docx-track') || !!el.getAttribute('data-track-type'))) {
+        const tRaw = (el.getAttribute('data-track-type') || 'insert').toLowerCase()
+        const t = tRaw === 'delete' ? 'del' : 'ins'
+        const id = stripQuotes(el.getAttribute('data-track-id') || '') || '0'
+        const a = b64uEncodeUtf8(el.getAttribute('data-track-author') || '')
+        const d = b64uEncodeUtf8(el.getAttribute('data-track-date') || '')
+        const start = `[[[WC_TC_START|t=${t}|id=${id}|a=${a}|d=${d}]]]`
+        const end = `[[[WC_TC_END]]]`
+        const inner: TextRun[] = []
+        el.childNodes.forEach((c) => inner.push(...walkInline(c, inherited)))
+        return [new TextRun({ text: start }), ...inner, new TextRun({ text: end })]
+      }
+
+      // === Word 批注范围（导出时转为 commentRangeStart/End + comments.xml） ===
+      if (tag === 'span' && (el.classList.contains('docx-comment') || !!el.getAttribute('data-comment-ids') || !!el.getAttribute('data-comment-id'))) {
+        const raw = el.getAttribute('data-comment-ids') || el.getAttribute('data-comment-id') || ''
+        const ids = raw.split(',').map(s => s.trim()).filter(Boolean)
+        if (ids.length === 0) {
+          const inner: TextRun[] = []
+          el.childNodes.forEach((c) => inner.push(...walkInline(c, inherited)))
+          return inner
+        }
+        const runs: TextRun[] = []
+        for (const cid of ids) runs.push(new TextRun({ text: `[[[WC_CM_START|id=${stripQuotes(cid)}]]]` }))
+        el.childNodes.forEach((c) => runs.push(...walkInline(c, inherited)))
+        for (const cid of [...ids].reverse()) runs.push(new TextRun({ text: `[[[WC_CM_END|id=${stripQuotes(cid)}]]]` }))
+        return runs
+      }
+
       // diff-new：直接解析其子内容（相当于接受）
       const classList = Array.from(el.classList || [])
       const isDiffNew = classList.includes('diff-new') || el.getAttribute('data-diff-role') === 'new'
@@ -667,7 +794,7 @@ async function createDocxBlob(content: string, title: string): Promise<Blob> {
         const fontFamily = parsed.fontFamily
           ? parsed.fontFamily.split(',')[0].replace(/['"]/g, '').trim()
           : ''
-        if (fontFamily) next.font = fontFamily
+        if (fontFamily) next.font = { ascii: fontFamily, hAnsi: fontFamily, eastAsia: fontFamily }
         const pt = parseCssFontSizePt(parsed.fontSize || '')
         if (pt) next.size = Math.round(pt * 2)
       }
@@ -684,6 +811,58 @@ async function createDocxBlob(content: string, title: string): Promise<Blob> {
 
     const children: (Paragraph | Table)[] = []
 
+    const parseBlockStyle = (style: string) => {
+      const s = style || ''
+      const get = (name: string) => {
+        const m = s.match(new RegExp(`${name}\\s*:\\s*([^;]+)`, 'i'))
+        return m?.[1]?.trim()
+      }
+      return {
+        textAlign: get('text-align'),
+        textIndent: get('text-indent'),
+        lineHeight: get('line-height'),
+        marginTop: get('margin-top'),
+        marginBottom: get('margin-bottom'),
+        marginLeft: get('margin-left'),
+      }
+    }
+
+    const toSpacing = (style: ReturnType<typeof parseBlockStyle>) => {
+      const basePt = (profile?.normal?.fontSizeHalfPoints ? profile.normal.fontSizeHalfPoints / 2 : 10.5)
+      const before = cssLengthToTwips(style.marginTop, basePt)
+      const after = cssLengthToTwips(style.marginBottom, basePt)
+
+      // line-height: number(倍数) | px/pt
+      let lineTwips: number | undefined
+      const lh = (style.lineHeight || '').trim().toLowerCase()
+      if (lh) {
+        const mult = lh.match(/^(\d+(?:\.\d+)?)$/)
+        if (mult) {
+          const m = Number(mult[1])
+          const baseLine = profile?.normal?.spacing?.lineTwips || Math.round(basePt * 20 * 1.15)
+          lineTwips = Math.round(baseLine * m)
+        } else {
+          lineTwips = cssLengthToTwips(lh, basePt)
+        }
+      }
+
+      return {
+        before: before ?? profile?.normal?.spacing?.beforeTwips,
+        after: after ?? profile?.normal?.spacing?.afterTwips,
+        line: lineTwips ?? profile?.normal?.spacing?.lineTwips,
+      }
+    }
+
+    const toIndent = (style: ReturnType<typeof parseBlockStyle>) => {
+      const basePt = (profile?.normal?.fontSizeHalfPoints ? profile.normal.fontSizeHalfPoints / 2 : 10.5)
+      const firstLine = cssLengthToTwips(style.textIndent, basePt)
+      const left = cssLengthToTwips(style.marginLeft, basePt)
+      return {
+        firstLine: firstLine ?? profile?.normal?.indent?.firstLineTwips,
+        left: left ?? profile?.normal?.indent?.leftTwips,
+      }
+    }
+
     const processBlock = (el: HTMLElement) => {
       const tag = el.tagName.toLowerCase()
 
@@ -691,24 +870,51 @@ async function createDocxBlob(content: string, title: string): Promise<Blob> {
       if (el.getAttribute('data-diff-role') === 'old') return
       if (tag === 'span' && el.classList.contains('diff-old')) return
 
-      const style = el.getAttribute('style') || ''
-      const { textAlign } = parseStyle(style)
+      const styleStr = el.getAttribute('style') || ''
+      const { textAlign } = parseStyle(styleStr)
+      const block = parseBlockStyle(styleStr)
 
       if (tag === 'h1' || tag === 'h2' || tag === 'h3') {
         const level =
           tag === 'h1' ? HeadingLevel.HEADING_1 : tag === 'h2' ? HeadingLevel.HEADING_2 : HeadingLevel.HEADING_3
+        const headingProfile = tag === 'h1' ? profile?.heading1 : tag === 'h2' ? profile?.heading2 : profile?.heading3
+        const headingAscii = headingProfile?.fontAscii || headingProfile?.fontHAnsi || profile?.normal?.fontAscii || profile?.normal?.fontHAnsi
+        const headingEast = headingProfile?.fontEastAsia || profile?.normal?.fontEastAsia
+        const headingFont = headingEast || headingAscii || '黑体'
+        const headingRunFont = { ascii: headingAscii || headingFont, hAnsi: headingProfile?.fontHAnsi || headingAscii || headingFont, eastAsia: headingEast || headingFont }
         children.push(new Paragraph({
           heading: level,
           alignment: toAlignment(textAlign),
-          children: walkInline(el, {}),
+          children: walkInline(el, {
+            font: headingRunFont,
+            size: headingProfile?.fontSizeHalfPoints || profile?.normal?.fontSizeHalfPoints,
+          }),
         }))
         return
       }
 
       if (tag === 'p') {
+        const spacing = toSpacing(block)
+        const indent = toIndent(block)
+        const normalAscii = profile?.normal?.fontAscii || profile?.normal?.fontHAnsi
+        const normalEast = profile?.normal?.fontEastAsia
+        const normalFont = normalEast || normalAscii || '等线'
+        const normalRunFont = { ascii: normalAscii || normalFont, hAnsi: profile?.normal?.fontHAnsi || normalAscii || normalFont, eastAsia: normalEast || normalFont }
         children.push(new Paragraph({
-          alignment: toAlignment(textAlign),
-          children: walkInline(el, {}),
+          alignment: toAlignment(textAlign || profile?.normal?.alignment),
+          indent: {
+            firstLine: indent.firstLine,
+            left: indent.left,
+          },
+          spacing: {
+            before: spacing.before,
+            after: spacing.after,
+            line: spacing.line,
+          },
+          children: walkInline(el, {
+            font: normalRunFont,
+            size: profile?.normal?.fontSizeHalfPoints,
+          }),
         }))
         return
       }
@@ -771,24 +977,100 @@ async function createDocxBlob(content: string, title: string): Promise<Blob> {
     return children
   }
 
-  const paragraphsOrTables = isHtml ? htmlToDocxChildren(content) : markdownToDocxParagraphs(content)
+  const paragraphsOrTables = isHtml ? htmlToDocxChildren(content, typographyProfile || undefined) : markdownToDocxParagraphs(content, typographyProfile || undefined)
   
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/65f1d8ba-6206-43cb-9f6f-22f7361d7de4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentContext.tsx:createDocxBlob:paragraphs',message:'段落解析完成',data:{paragraphCount:paragraphsOrTables.length,isHtml},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H2'})}).catch(()=>{});
-  // #endregion agent log
-  
+  const margin = typographyProfile?.page?.margin
+  const normalAscii = typographyProfile?.normal?.fontAscii || typographyProfile?.normal?.fontHAnsi
+  const normalEastAsia = typographyProfile?.normal?.fontEastAsia
+  // 默认字体：仿宋（中文正文）、Times New Roman（西文），更专业的公文/报告风格
+  const normalFallbackEA = normalEastAsia || '仿宋'
+  const normalFallbackLatin = normalAscii || 'Times New Roman'
+  const normalRunFont = { ascii: normalFallbackLatin, hAnsi: typographyProfile?.normal?.fontHAnsi || normalFallbackLatin, eastAsia: normalFallbackEA }
+  const normalRunSize = typographyProfile?.normal?.fontSizeHalfPoints ?? 24 // 默认小四(12pt=24半点)
+  const normalParaIndent = typographyProfile?.normal?.indent
+  const normalParaSpacing = typographyProfile?.normal?.spacing
+
+  const h1 = typographyProfile?.heading1
+  const h2 = typographyProfile?.heading2
+  const h3 = typographyProfile?.heading3
+  // 标题默认字体：黑体（中文）、Arial（西文）
+  const headingFallbackEA = '黑体'
+  const headingFallbackLatin = 'Arial'
+  const headingRunFont = (h?: DocxTypographyProfile['normal']) => {
+    const a = h?.fontAscii || h?.fontHAnsi || normalAscii || headingFallbackLatin
+    const e = h?.fontEastAsia || normalEastAsia || headingFallbackEA
+    return { ascii: a, hAnsi: h?.fontHAnsi || a, eastAsia: e }
+  }
+
   const doc = new Document({
     creator: 'Word-Cursor',
     title: title,
     description: 'Created by Word-Cursor',
+    styles: {
+      default: {
+        document: {
+          run: {
+            font: normalRunFont,
+            size: normalRunSize,
+          },
+          paragraph: {
+            indent: normalParaIndent
+              ? { firstLine: normalParaIndent.firstLineTwips, left: normalParaIndent.leftTwips, right: normalParaIndent.rightTwips }
+              : { firstLine: 480 }, // 默认首行缩进2字符（480twips ≈ 24pt ≈ 2em at 12pt）
+            spacing: normalParaSpacing
+              ? { before: normalParaSpacing.beforeTwips, after: normalParaSpacing.afterTwips, line: normalParaSpacing.lineTwips }
+              : { before: 0, after: 0, line: 360 }, // 默认行距 18pt（固定值）
+          },
+        },
+        heading1: {
+          run: {
+            font: headingRunFont(h1),
+            size: h1?.fontSizeHalfPoints ?? 32, // 默认小二(16pt=32半点)
+            bold: true,
+            color: '000000', // 黑色，避免蓝色主题色
+          },
+          paragraph: {
+            spacing: h1?.spacing
+              ? { before: h1.spacing.beforeTwips, after: h1.spacing.afterTwips, line: h1.spacing.lineTwips }
+              : { before: 240, after: 120, line: 360 }, // 段前12pt 段后6pt 行距18pt
+          },
+        },
+        heading2: {
+          run: {
+            font: headingRunFont(h2),
+            size: h2?.fontSizeHalfPoints ?? 28, // 默认三号(14pt=28半点)
+            bold: true,
+            color: '000000',
+          },
+          paragraph: {
+            spacing: h2?.spacing
+              ? { before: h2.spacing.beforeTwips, after: h2.spacing.afterTwips, line: h2.spacing.lineTwips }
+              : { before: 200, after: 100, line: 360 },
+          },
+        },
+        heading3: {
+          run: {
+            font: headingRunFont(h3),
+            size: h3?.fontSizeHalfPoints ?? 26, // 默认小三(13pt=26半点)
+            bold: true,
+            color: '000000',
+          },
+          paragraph: {
+            spacing: h3?.spacing
+              ? { before: h3.spacing.beforeTwips, after: h3.spacing.afterTwips, line: h3.spacing.lineTwips }
+              : { before: 160, after: 80, line: 340 },
+          },
+        },
+      },
+    },
     sections: [{
       properties: {
         page: {
           margin: {
-            top: 1440,
-            right: 1440,
-            bottom: 1440,
-            left: 1440,
+            top: margin?.topTwips ?? 1440,
+            right: margin?.rightTwips ?? 1440,
+            bottom: margin?.bottomTwips ?? 1440,
+            left: margin?.leftTwips ?? 1440,
           },
         },
       },
@@ -797,11 +1079,6 @@ async function createDocxBlob(content: string, title: string): Promise<Blob> {
   })
   
   const blob = await Packer.toBlob(doc)
-  
-  // #region agent log
-  fetch('http://127.0.0.1:7242/ingest/65f1d8ba-6206-43cb-9f6f-22f7361d7de4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentContext.tsx:createDocxBlob:exit',message:'Packer.toBlob 完成',data:{blobSize:blob.size,blobType:blob.type},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H3'})}).catch(()=>{});
-  // #endregion agent log
-  
   return blob
 }
 
@@ -820,8 +1097,18 @@ interface FormattedElement {
 }
 
 // 创建带格式的 docx 文档
-async function createFormattedDocxBlob(elements: FormattedElement[], title: string): Promise<Blob> {
+async function createFormattedDocxBlob(elements: FormattedElement[], title: string, typographyProfile?: DocxTypographyProfile | null): Promise<Blob> {
   const children: (Paragraph | Table)[] = []
+  const normalAscii = typographyProfile?.normal?.fontAscii || typographyProfile?.normal?.fontHAnsi
+  const normalEastAsia = typographyProfile?.normal?.fontEastAsia
+  const defaultFont = normalEastAsia || normalAscii || '宋体'
+  const defaultRunFont = { ascii: normalAscii || defaultFont, hAnsi: typographyProfile?.normal?.fontHAnsi || normalAscii || defaultFont, eastAsia: normalEastAsia || defaultFont }
+  const defaultSize = typographyProfile?.normal?.fontSizeHalfPoints ?? 24 // default 12pt
+  const normalIndent = typographyProfile?.normal?.indent
+  const defaultIndent = normalIndent?.firstLineTwips
+  const defaultIndentLeft = normalIndent?.leftTwips
+  const defaultIndentRight = normalIndent?.rightTwips
+  const defaultSpacing = typographyProfile?.normal?.spacing
   
   for (const elem of elements) {
     if (elem.type === 'heading' && elem.content) {
@@ -842,11 +1129,34 @@ async function createFormattedDocxBlob(elements: FormattedElement[], title: stri
         'right': AlignmentType.RIGHT,
         'justify': AlignmentType.JUSTIFIED,
       }
-      
+
+      const headingStyle =
+        (level === 1 ? typographyProfile?.heading1 : undefined) ||
+        (level === 2 ? typographyProfile?.heading2 : undefined) ||
+        (level === 3 ? typographyProfile?.heading3 : undefined) ||
+        typographyProfile?.normal
+      const headingAscii = headingStyle?.fontAscii || headingStyle?.fontHAnsi || normalAscii || defaultFont
+      const headingEastAsia = headingStyle?.fontEastAsia || normalEastAsia || defaultFont
+      const headingFont = { ascii: headingAscii, hAnsi: headingStyle?.fontHAnsi || headingAscii, eastAsia: headingEastAsia }
+      const headingSize = headingStyle?.fontSizeHalfPoints ?? defaultSize
+      const headingSpacing = headingStyle?.spacing
+      const headingIndent = headingStyle?.indent
+
       children.push(new Paragraph({
-        text: elem.content,
         heading: headingLevelMap[level] || HeadingLevel.HEADING_1,
-        alignment: elem.alignment ? alignmentMap[elem.alignment] : AlignmentType.LEFT,
+        children: [
+          new TextRun({
+            text: elem.content,
+            size: headingSize,
+            font: headingFont,
+          }),
+        ],
+        alignment: elem.alignment ? alignmentMap[elem.alignment] : (headingStyle?.alignment ? alignmentMap[headingStyle.alignment] : AlignmentType.LEFT),
+        // 标题通常不首行缩进；但如果模板设置了左右缩进，则继承
+        indent: (headingIndent?.leftTwips || headingIndent?.rightTwips)
+          ? { left: headingIndent.leftTwips, right: headingIndent.rightTwips, firstLine: 0 }
+          : undefined,
+        spacing: headingSpacing ? { before: headingSpacing.beforeTwips, after: headingSpacing.afterTwips, line: headingSpacing.lineTwips } : undefined,
       }))
     } else if (elem.type === 'paragraph' && elem.content) {
       // 段落
@@ -862,11 +1172,17 @@ async function createFormattedDocxBlob(elements: FormattedElement[], title: stri
           new TextRun({
             text: elem.content,
             bold: elem.bold || false,
-            size: (elem.fontSize || 12) * 2, // docx 使用半点
-            font: elem.fontFamily || '宋体',
+            size: elem.fontSize ? elem.fontSize * 2 : defaultSize, // docx 使用半点
+            font: elem.fontFamily ? { ascii: elem.fontFamily, hAnsi: elem.fontFamily, eastAsia: elem.fontFamily } : defaultRunFont,
           }),
         ],
-        alignment: elem.alignment ? alignmentMap[elem.alignment] : AlignmentType.LEFT,
+        alignment: elem.alignment
+          ? alignmentMap[elem.alignment]
+          : (typographyProfile?.normal?.alignment ? alignmentMap[typographyProfile.normal.alignment] : AlignmentType.LEFT),
+        indent: (defaultIndent || defaultIndentLeft || defaultIndentRight)
+          ? { firstLine: defaultIndent, left: defaultIndentLeft, right: defaultIndentRight }
+          : undefined,
+        spacing: defaultSpacing ? { before: defaultSpacing.beforeTwips, after: defaultSpacing.afterTwips, line: defaultSpacing.lineTwips } : undefined,
       }))
     } else if (elem.type === 'table' && elem.rows && elem.cols) {
       // 表格
@@ -882,8 +1198,8 @@ async function createFormattedDocxBlob(elements: FormattedElement[], title: stri
               children: [new TextRun({
                 text: cellText,
                 bold: r === 0, // 第一行加粗（表头）
-                size: 24, // 12pt
-                font: '宋体',
+                size: defaultSize,
+                font: defaultRunFont,
               })],
             })],
             width: { size: 100 / elem.cols, type: WidthType.PERCENTAGE },
@@ -907,15 +1223,68 @@ async function createFormattedDocxBlob(elements: FormattedElement[], title: stri
     children.push(new Paragraph({ text: '' }))
   }
   
+  const margin = typographyProfile?.page?.margin
+  const h1 = typographyProfile?.heading1
+  const h2 = typographyProfile?.heading2
+  const h3 = typographyProfile?.heading3
+  const headingRunFont = (h?: DocxTypographyProfile['normal']) => {
+    const a = h?.fontAscii || h?.fontHAnsi || normalAscii
+    const e = h?.fontEastAsia || normalEastAsia
+    const fb = e || a || defaultFont
+    return { ascii: a || fb, hAnsi: h?.fontHAnsi || a || fb, eastAsia: e || fb }
+  }
+
   const doc = new Document({
+    creator: 'Word-Cursor',
+    title,
+    description: 'Created by Word-Cursor',
+    // 关键：设置 Document 级默认样式，保证 Word 打开时字体/行距/缩进继承稳定
+    styles: {
+      default: {
+        document: {
+          run: {
+            font: defaultRunFont,
+            size: typographyProfile?.normal?.fontSizeHalfPoints ?? defaultSize,
+          },
+          paragraph: {
+            indent: typographyProfile?.normal?.indent
+              ? {
+                  firstLine: typographyProfile.normal.indent.firstLineTwips,
+                  left: typographyProfile.normal.indent.leftTwips,
+                  right: typographyProfile.normal.indent.rightTwips,
+                }
+              : undefined,
+            spacing: typographyProfile?.normal?.spacing
+              ? {
+                  before: typographyProfile.normal.spacing.beforeTwips,
+                  after: typographyProfile.normal.spacing.afterTwips,
+                  line: typographyProfile.normal.spacing.lineTwips,
+                }
+              : undefined,
+          },
+        },
+        heading1: {
+          run: { font: headingRunFont(h1), size: h1?.fontSizeHalfPoints },
+          paragraph: { spacing: h1?.spacing ? { before: h1.spacing.beforeTwips, after: h1.spacing.afterTwips, line: h1.spacing.lineTwips } : undefined },
+        },
+        heading2: {
+          run: { font: headingRunFont(h2), size: h2?.fontSizeHalfPoints },
+          paragraph: { spacing: h2?.spacing ? { before: h2.spacing.beforeTwips, after: h2.spacing.afterTwips, line: h2.spacing.lineTwips } : undefined },
+        },
+        heading3: {
+          run: { font: headingRunFont(h3), size: h3?.fontSizeHalfPoints },
+          paragraph: { spacing: h3?.spacing ? { before: h3.spacing.beforeTwips, after: h3.spacing.afterTwips, line: h3.spacing.lineTwips } : undefined },
+        },
+      },
+    },
     sections: [{
       properties: {
         page: {
           margin: {
-            top: 1440,
-            right: 1440,
-            bottom: 1440,
-            left: 1440,
+            top: margin?.topTwips ?? 1440,
+            right: margin?.rightTwips ?? 1440,
+            bottom: margin?.bottomTwips ?? 1440,
+            left: margin?.leftTwips ?? 1440,
           },
         },
       },
@@ -927,6 +1296,7 @@ async function createFormattedDocxBlob(elements: FormattedElement[], title: stri
 }
 
 export function DocumentProvider({ children }: { children: ReactNode }) {
+  const { comments: commentsForExport } = useComments()
   const [document, setDocument] = useState<DocumentContent>(defaultDocument)
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false)
   const [workspacePath, setWorkspacePath] = useState<string | null>(null)
@@ -951,6 +1321,50 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
   const [pageSetup, setPageSetupState] = useState<PageSetup>(defaultPageSetup)
   const [headerFooterSetup, setHeaderFooterSetupState] = useState<HeaderFooterSetup>(defaultHeaderFooterSetup)
   const [customStyles, setCustomStyles] = useState<Record<string, CustomStyle>>(defaultCustomStyles)
+  const [typographyProfile, setTypographyProfile] = useState<DocxTypographyProfile | null>(null)
+
+  // 将 docx 提取的默认字体同步到 CSS 变量（让预览/编辑默认字体尽量贴近原文）
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const root = window.document?.documentElement
+    if (!root) return
+
+    const normal = typographyProfile?.normal
+    const eastAsia =
+      normal?.fontEastAsia ||
+      normal?.fontAscii ||
+      normal?.fontHAnsi ||
+      ''
+
+    if (eastAsia) {
+      root.style.setProperty('--word-font-family-cn', toChineseDefaultFallbackStack(eastAsia))
+    } else {
+      // 清空覆盖，让 index.css 的默认值接管
+      root.style.removeProperty('--word-font-family-cn')
+    }
+
+    const fontSizeHalfPoints = normal?.fontSizeHalfPoints
+    if (typeof fontSizeHalfPoints === 'number' && Number.isFinite(fontSizeHalfPoints) && fontSizeHalfPoints > 0) {
+      const px = (fontSizeHalfPoints * 2) / 3
+      root.style.setProperty('--word-font-size', `${px.toFixed(2).replace(/\.?0+$/, '')}px`)
+    } else {
+      root.style.removeProperty('--word-font-size')
+    }
+
+    const spacing = normal?.spacing
+    const lineTwips = spacing?.lineTwips
+    if (typeof lineTwips === 'number' && Number.isFinite(lineTwips) && lineTwips > 0) {
+      if (spacing?.lineRule === 'exact' || spacing?.lineRule === 'atLeast') {
+        const pt = lineTwips / 20
+        root.style.setProperty('--word-line-height', `${pt.toFixed(2).replace(/\.?0+$/, '')}pt`)
+      } else {
+        const multiplier = lineTwips / 240
+        root.style.setProperty('--word-line-height', multiplier.toFixed(2).replace(/\.?0+$/, ''))
+      }
+    } else {
+      root.style.removeProperty('--word-line-height')
+    }
+  }, [typographyProfile])
 
   const triggerDocEntryAnimation = useCallback(() => {
     setDocEntryAnimationKey(Date.now())
@@ -1012,7 +1426,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     setCurrentFileState(file)
   }, [])
 
-  const createNewDocument = useCallback(async (title: string, content: string, elements?: FormattedElement[]) => {
+  const createNewDocument = useCallback(async (title: string, content: string, elements?: FormattedElement[], styleRefPath?: string) => {
     console.log('createNewDocument 被调用:', { title, contentLength: content.length, elementsCount: elements?.length })
     setExcelData(null)
     
@@ -1030,32 +1444,52 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         console.log('准备创建文件:', filePath)
         
         let success = false
+        let nextProfile: DocxTypographyProfile | null = null
+
+        // 如果指定了“样式参考 docx”，抽取 TypographyProfile（用于导出时继承字体/缩进/行距/页边距）
+        if (styleRefPath) {
+          try {
+            const ab = await fetchArrayBufferFromLocalFile(styleRefPath)
+            const { profile } = await extractTypographyProfileFromArrayBuffer(ab)
+            nextProfile = profile
+            setTypographyProfile(profile)
+          } catch (e) {
+            console.warn('样式参考解析失败，继续使用默认样式:', e)
+            setTypographyProfile(null)
+          }
+        } else {
+          setTypographyProfile(null)
+        }
         
-        // 如果有 elements，优先尝试使用 ONLYOFFICE Document Builder API
+        // 如果有 elements，优先尝试使用 ONLYOFFICE Document Builder API（但在指定样式参考时，优先走 docx 库以应用 profile）
         if (elements && elements.length > 0) {
           console.log('尝试使用 ONLYOFFICE Document Builder API 创建文档，元素:', elements)
           
-          try {
-            const builderResult = await window.electronAPI.createFormattedDocument({
-              filePath,
-              elements,
-              title: safeTitle
-            })
-            
-            if (builderResult.success) {
-              console.log('ONLYOFFICE Document Builder 创建成功', builderResult.fallback ? '(使用回退方案)' : '')
-              success = true
-            } else {
-              console.log('ONLYOFFICE Document Builder 失败，回退到 docx 库:', builderResult.error)
+          if (!styleRefPath) {
+            try {
+              const builderResult = await window.electronAPI.createFormattedDocument({
+                filePath,
+                elements,
+                title: safeTitle
+              })
+              
+              if (builderResult.success) {
+                console.log('ONLYOFFICE Document Builder 创建成功', builderResult.fallback ? '(使用回退方案)' : '')
+                success = true
+              } else {
+                console.log('ONLYOFFICE Document Builder 失败，回退到 docx 库:', builderResult.error)
+              }
+            } catch (e) {
+              console.log('ONLYOFFICE Document Builder 调用失败，回退到 docx 库:', e)
             }
-          } catch (e) {
-            console.log('ONLYOFFICE Document Builder 调用失败，回退到 docx 库:', e)
+          } else {
+            console.log('指定了样式参考，跳过 Document Builder，直接使用 docx 库以应用 TypographyProfile')
           }
           
           // 如果 Document Builder 失败，回退到 docx 库
           if (!success) {
             console.log('使用 docx 库创建格式化文档')
-            const blob = await createFormattedDocxBlob(elements, safeTitle)
+            const blob = await createFormattedDocxBlob(elements, safeTitle, nextProfile)
             const arrayBuffer = await blob.arrayBuffer()
             // 使用分块方式将 ArrayBuffer 转换为 base64，避免大文件导致的栈溢出
             const base64 = arrayBufferToBase64(arrayBuffer)
@@ -1065,21 +1499,11 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         } else {
           // 纯文本文档，使用 docx 库
           console.log('使用纯文本方式创建文档')
-          const blob = await createDocxBlob(content, safeTitle)
+          const blob = await createDocxBlob(content, safeTitle, nextProfile)
           const arrayBuffer = await blob.arrayBuffer()
           // 使用分块方式将 ArrayBuffer 转换为 base64，避免大文件导致的栈溢出
           const base64 = arrayBufferToBase64(arrayBuffer)
-          
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/65f1d8ba-6206-43cb-9f6f-22f7361d7de4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentContext.tsx:createNewDocument:beforeWrite',message:'准备写入文件',data:{filePath,base64Length:base64.length,arrayBufferSize:arrayBuffer.byteLength},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H4'})}).catch(()=>{});
-          // #endregion agent log
-          
           const result = await window.electronAPI.writeBinaryFile(filePath, base64)
-          
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/65f1d8ba-6206-43cb-9f6f-22f7361d7de4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'DocumentContext.tsx:createNewDocument:afterWrite',message:'写入结果',data:{success:result.success,error:result.error,filePath},timestamp:Date.now(),sessionId:'debug-session',hypothesisId:'H4'})}).catch(()=>{});
-          // #endregion agent log
-          
           success = result.success
         }
         
@@ -1144,6 +1568,107 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       setHasUnsavedChanges(true)
     }
   }, [workspacePath, triggerDocEntryAnimation])
+
+  // DSL 方式创建文档
+  const createDocumentFromDsl = useCallback(async (title: string, dsl: DocDsl): Promise<{ success: boolean; message: string; filePath?: string }> => {
+    // 校验 DSL
+    const validation = validateDocDsl(dsl)
+    if (!validation.valid) {
+      const errorMessages = validation.errors.map(e => `${e.path}: ${e.message}`).join('\n')
+      return { success: false, message: `DSL 校验失败:\n${errorMessages}` }
+    }
+
+    // 清理文件名
+    let safeTitle = title.replace(/[<>:"/\\|?*]/g, '_').slice(0, 50)
+    if (safeTitle.toLowerCase().endsWith('.docx')) {
+      safeTitle = safeTitle.slice(0, -5)
+    }
+
+    // 在 Electron 环境创建真实文件
+    if (isElectron && window.electronAPI && workspacePath) {
+      try {
+        const fileName = `${safeTitle}.docx`
+        const filePath = `${workspacePath}\\${fileName}`
+        console.log('DSL 创建文件:', filePath)
+
+        // 使用 DSL 渲染器生成 DOCX
+        const blob = await dslToDocxBlob(dsl)
+        const arrayBuffer = await blob.arrayBuffer()
+        const base64 = arrayBufferToBase64(arrayBuffer)
+        
+        const result = await window.electronAPI.writeBinaryFile(filePath, base64)
+        
+        if (result.success) {
+          console.log('DSL 文件已创建:', filePath)
+          
+          // 刷新文件列表
+          const folderResult = await window.electronAPI.readFolder(workspacePath)
+          if (folderResult.success && folderResult.data) {
+            const convertFiles = (items: any[]): FileItem[] => {
+              return items.map(item => ({
+                name: item.name,
+                path: item.path,
+                type: item.type,
+                children: item.children ? convertFiles(item.children) : undefined,
+              }))
+            }
+            setFiles(convertFiles(folderResult.data))
+          }
+
+          // 生成 HTML 预览用于编辑器
+          const htmlContent = dslToHtml(dsl)
+
+          // 创建文件项并设置为当前文件
+          const newFile: FileItem = {
+            name: fileName,
+            path: filePath,
+            type: 'file',
+          }
+
+          setCurrentFileState(newFile)
+          setDocument({
+            title: safeTitle,
+            content: htmlContent,
+            styles: defaultStyles,
+            lastModified: new Date(),
+          })
+          triggerDocEntryAnimation()
+          setDocxData(null)
+          setExcelData(null)
+          setHasUnsavedChanges(false)
+
+          return { success: true, message: `已创建文档: ${fileName}`, filePath }
+        } else {
+          return { success: false, message: '文件写入失败' }
+        }
+      } catch (error) {
+        console.error('DSL 创建文档失败:', error)
+        return { success: false, message: `创建失败: ${(error as Error).message}` }
+      }
+    } else {
+      // Web 模式：只在内存中创建
+      const htmlContent = dslToHtml(dsl)
+      const newFile: FileItem = {
+        name: `${safeTitle}.docx`,
+        path: `/${safeTitle}.docx`,
+        type: 'file',
+        content: htmlContent,
+      }
+      setFiles(prev => [...prev, newFile])
+      setCurrentFileState(newFile)
+      setDocument({
+        title: safeTitle,
+        content: htmlContent,
+        styles: defaultStyles,
+        lastModified: new Date(),
+      })
+      triggerDocEntryAnimation()
+      setDocxData(null)
+      setHasUnsavedChanges(true)
+
+      return { success: true, message: `已创建文档: ${safeTitle}.docx` }
+    }
+  }, [workspacePath, isElectron, triggerDocEntryAnimation])
 
   // 打开本地文件夹 (Electron)
   const openFolder = useCallback(async () => {
@@ -1253,6 +1778,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         if (result.success && result.sheets) {
           setExcelData(result)
           setDocxData(null)
+          setTypographyProfile(null)
           setDocument({
             title: file.name.replace(/\.[^.]+$/, ''),
             content: '',
@@ -1302,6 +1828,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           // .pptx 文件 - 使用纯 JS 预览
           setExcelData(null)
           setDocxData(null)
+          setTypographyProfile(null)
           setPptData({ pptxBase64: result.data })
           setDocument({
             title: file.name.replace(/\.[^.]+$/, ''),
@@ -1313,6 +1840,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           // .docx 文件 - 使用前端解析器（保留样式）
           setExcelData(null)
           setDocxData(result.data)
+          setTypographyProfile(null)
           setPptData(null)
           setDocument({
             title: file.name.replace(/\.[^.]+$/, ''),
@@ -1320,10 +1848,23 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
             styles: defaultStyles,
             lastModified: new Date(),
           })
+          // 尽量从 docx 提取默认字体/样式（用于 UI 字体显示与导出一致性）
+          // 不阻塞打开流程：失败则忽略，保留默认值
+          void (async () => {
+            try {
+              const ab = await fetchArrayBufferFromLocalFile(file.path)
+              const { profile } = await extractTypographyProfileFromArrayBuffer(ab)
+              setTypographyProfile(profile)
+            } catch (e) {
+              console.warn('[DOCX Typography] 提取失败，使用默认字体回退:', e)
+              setTypographyProfile(null)
+            }
+          })()
         } else if (result.type === 'doc-html') {
           // .doc 文件 - 已经转换为 HTML
           setExcelData(null)
           setDocxData(null)
+          setTypographyProfile(null)
           setPptData(null)
           setDocument({
             title: file.name.replace(/\.[^.]+$/, ''),
@@ -1335,6 +1876,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           // 文本文件
           setExcelData(null)
           setDocxData(null)
+          setTypographyProfile(null)
           setPptData(null)
           setDocument({
             title: file.name.replace(/\.[^.]+$/, ''),
@@ -1393,8 +1935,32 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       const ext = currentFile.name.split('.').pop()?.toLowerCase()
       
       if (ext === 'docx') {
-        const blob = await createDocxBlob(documentContentRef.current || document.content, document.title)
-        const arrayBuffer = await blob.arrayBuffer()
+        const sourceHtml = documentContentRef.current || document.content
+        const blob = await createDocxBlob(sourceHtml, document.title, typographyProfile)
+        let arrayBuffer = await blob.arrayBuffer()
+
+        const hasTrackOrComments =
+          typeof sourceHtml === 'string' &&
+          (sourceHtml.includes('data-track-type=') ||
+            sourceHtml.includes('class="docx-track"') ||
+            sourceHtml.includes('data-comment-ids=') ||
+            sourceHtml.includes('class="docx-comment"'))
+
+        if (hasTrackOrComments) {
+          try {
+            arrayBuffer = await postProcessDocxWithAnnotations(arrayBuffer, {
+              comments: (commentsForExport || []).map((c) => ({
+                id: c.id,
+                author: c.author,
+                date: c.date,
+                text: c.text,
+              })),
+            })
+          } catch (e) {
+            console.warn('[docxExportWithTracking] postProcess failed, fallback to plain export:', e)
+          }
+        }
+
         const base64 = arrayBufferToBase64(arrayBuffer)
         await window.electronAPI.writeBinaryFile(currentFile.path, base64)
       } else {
@@ -1405,15 +1971,40 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       fileContentCacheRef.current.delete(currentFile.path)
       setHasUnsavedChanges(false)
     } else {
-      const blob = await createDocxBlob(documentContentRef.current || document.content, document.title)
-      saveAs(blob, `${document.title}.docx`)
+      const sourceHtml = documentContentRef.current || document.content
+      const blob = await createDocxBlob(sourceHtml, document.title, typographyProfile)
+      let arrayBuffer = await blob.arrayBuffer()
+
+      const hasTrackOrComments =
+        typeof sourceHtml === 'string' &&
+        (sourceHtml.includes('data-track-type=') ||
+          sourceHtml.includes('class="docx-track"') ||
+          sourceHtml.includes('data-comment-ids=') ||
+          sourceHtml.includes('class="docx-comment"'))
+
+      if (hasTrackOrComments) {
+        try {
+          arrayBuffer = await postProcessDocxWithAnnotations(arrayBuffer, {
+            comments: (commentsForExport || []).map((c) => ({
+              id: c.id,
+              author: c.author,
+              date: c.date,
+              text: c.text,
+            })),
+          })
+        } catch (e) {
+          console.warn('[docxExportWithTracking] postProcess failed, fallback to plain export:', e)
+        }
+      }
+
+      saveAs(new Blob([arrayBuffer], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }), `${document.title}.docx`)
       // 保存成功后清除该文件的缓存
       if (currentFile) {
         fileContentCacheRef.current.delete(currentFile.path)
       }
       setHasUnsavedChanges(false)
     }
-  }, [currentFile, document, pendingReplacements.total, extraPendingChanges])
+  }, [currentFile, document, pendingReplacements.total, extraPendingChanges, typographyProfile, commentsForExport])
 
   // 刷新文件列表
   const refreshFiles = useCallback(async () => {
@@ -1491,11 +2082,61 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         setLastReplacement(null)
         setHasUnsavedChanges(true)
       }
-      const blob = await createDocxBlob(documentContentRef.current || document.content, document.title)
-      saveAs(blob, `${document.title}.docx`)
+      const sourceHtml = documentContentRef.current || document.content
+      const blob = await createDocxBlob(sourceHtml, document.title, typographyProfile)
+      let arrayBuffer = await blob.arrayBuffer()
+
+      const hasTrackOrComments =
+        typeof sourceHtml === 'string' &&
+        (sourceHtml.includes('data-track-type=') ||
+          sourceHtml.includes('class="docx-track"') ||
+          sourceHtml.includes('data-comment-ids=') ||
+          sourceHtml.includes('class="docx-comment"'))
+
+      if (hasTrackOrComments) {
+        try {
+          arrayBuffer = await postProcessDocxWithAnnotations(arrayBuffer, {
+            comments: (commentsForExport || []).map((c) => ({
+              id: c.id,
+              author: c.author,
+              date: c.date,
+              text: c.text,
+            })),
+          })
+        } catch (e) {
+          console.warn('[docxExportWithTracking] postProcess failed, fallback to plain export:', e)
+        }
+      }
+
+      saveAs(new Blob([arrayBuffer], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }), `${document.title}.docx`)
       setHasUnsavedChanges(false)
     }
-  }, [currentFile, document, saveCurrentFile, pendingReplacements.total, extraPendingChanges])
+  }, [currentFile, document, saveCurrentFile, pendingReplacements.total, extraPendingChanges, typographyProfile, commentsForExport])
+
+  // Agent 静默保存：将当前编辑器内容写回 .docx 文件（无弹窗）
+  const silentSaveToFile = useCallback(async (): Promise<{ success: boolean; error?: string }> => {
+    if (!currentFile || !isElectron || !window.electronAPI?.writeBinaryFile) {
+      return { success: false, error: '无当前文件或非 Electron 环境' }
+    }
+    const ext = currentFile.name.split('.').pop()?.toLowerCase()
+    if (ext !== 'docx') {
+      return { success: false, error: `不支持的文件类型: ${ext}` }
+    }
+    try {
+      const sourceHtml = documentContentRef.current || document.content
+      const blob = await createDocxBlob(sourceHtml, document.title, typographyProfile)
+      const arrayBuffer = await blob.arrayBuffer()
+      const base64 = arrayBufferToBase64(arrayBuffer)
+      const result = await window.electronAPI.writeBinaryFile(currentFile.path, base64)
+      if (result.success) {
+        setHasUnsavedChanges(false)
+        return { success: true }
+      }
+      return { success: false, error: result.error || '写入失败' }
+    } catch (e) {
+      return { success: false, error: (e as Error).message }
+    }
+  }, [currentFile, document, isElectron, typographyProfile])
 
   // AI 编辑应用
   const applyAIEdit = useCallback((newContent: string) => {
@@ -1648,7 +2289,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
 
   // 精准替换文档内容（支持格式保留，支持多个修改共存）
   // 使用 ref 来获取最新内容，解决连续调用时的闭包问题
-  const replaceInDocument = useCallback((search: string, replace: string): ReplaceResult => {
+  const replaceInDocument = useCallback((search: string, replace: string, reviewMeta?: { reason?: string; type?: string }): ReplaceResult => {
     if (!search) {
       return { success: false, count: 0, message: '搜索内容不能为空' }
     }
@@ -1878,7 +2519,9 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       searchText: search,
       replaceText: replace,
       count,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      ...(reviewMeta?.reason ? { reviewReason: reviewMeta.reason } : {}),
+      ...(reviewMeta?.type ? { reviewType: reviewMeta.type } : {}),
     }
     
     setPendingReplacements(prev => ({
@@ -1932,22 +2575,12 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       color?: string
       backgroundColor?: string
       fontSize?: string
-    }
+      fontFamily?: string
+    },
+    reviewMeta?: { reason?: string; type?: string }
   ): ReplaceResult => {
     if (!search) {
       return { success: false, count: 0, message: '搜索内容不能为空' }
-    }
-
-    const content = document.content
-    const escapeRegex = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const regex = new RegExp(escapeRegex(search), 'g')
-    
-    // 统计匹配
-    const matches = content.match(regex)
-    const count = matches ? matches.length : 0
-    
-    if (count === 0) {
-      return { success: false, count: 0, message: `未找到「${search}」` }
     }
 
     // 构建带格式的替换文本
@@ -1961,29 +2594,22 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     if (format?.color) styles.push(`color: ${format.color}`)
     if (format?.backgroundColor) styles.push(`background-color: ${format.backgroundColor}`)
     if (format?.fontSize) styles.push(`font-size: ${format.fontSize}`)
+    if (format?.fontFamily) styles.push(`font-family: ${format.fontFamily}`)
     
     if (styles.length > 0) {
       formattedReplace = `<span style="${styles.join('; ')}">${formattedReplace}</span>`
     }
 
-    const newContent = content.replace(regex, formattedReplace)
-    
-    setDocument(prev => ({
-      ...prev,
-      content: newContent,
-      lastModified: new Date(),
-    }))
-    setDocxData(null)
-    setHasUnsavedChanges(true)
-
-    return { 
-      success: true, 
-      count, 
-      message: `成功格式化替换 ${count} 处`,
-      searchText: search,
-      replaceText: replace
+    // 统一走带 diff 的替换逻辑：避免“内容变了但没有修订标记”
+    // formattedReplace 允许包含少量 HTML（如 <strong>/<span style>）
+    const result = replaceInDocument(search, formattedReplace, reviewMeta)
+    return {
+      ...result,
+      // 给 UI/日志展示时，replaceText 用纯文本版本更友好
+      replaceText: replace,
+      message: result.success ? `成功格式化替换 ${result.count} 处（已生成修订）` : result.message,
     }
-  }, [document.content])
+  }, [replaceInDocument])
   
   
   const cleanDiffStyles = (html: string) => {
@@ -2103,7 +2729,10 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     setPendingReplacements({ items: [], total: 0 })
     setExtraPendingChanges([])
     setLastReplacement(null)
-  }, [pendingReplacements, lastReplacement, extraPendingChanges])
+    
+    // 接受修改后自动保存到磁盘
+    setTimeout(() => { silentSaveToFile().catch(() => {}) }, 200)
+  }, [pendingReplacements, lastReplacement, extraPendingChanges, silentSaveToFile])
   
   
   // 拒绝替换 - 移除绿色部分，恢复红色部分（处理所有待确认的修改）
@@ -2126,7 +2755,10 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     setPendingReplacements({ items: [], total: 0 })
     setExtraPendingChanges([])
     setLastReplacement(null)
-  }, [pendingReplacements, lastReplacement, extraPendingChanges])
+    
+    // 拒绝修改后也自动保存到磁盘
+    setTimeout(() => { silentSaveToFile().catch(() => {}) }, 200)
+  }, [pendingReplacements, lastReplacement, extraPendingChanges, silentSaveToFile])
 
   const acceptChange = useCallback((id: string) => {
     if (!id) return
@@ -2168,7 +2800,10 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     if (existsExtra) {
       setExtraPendingChanges(prev => prev.filter(c => c.id !== id))
     }
-  }, [pendingReplacements, extraPendingChanges])
+    
+    // 接受单条修改后自动保存到磁盘
+    setTimeout(() => { silentSaveToFile().catch(() => {}) }, 200)
+  }, [pendingReplacements, extraPendingChanges, silentSaveToFile])
 
   const rejectChange = useCallback((id: string) => {
     if (!id) return
@@ -2210,7 +2845,10 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     if (existsExtra) {
       setExtraPendingChanges(prev => prev.filter(c => c.id !== id))
     }
-  }, [pendingReplacements, extraPendingChanges])
+    
+    // 拒绝单条修改后也自动保存到磁盘
+    setTimeout(() => { silentSaveToFile().catch(() => {}) }, 200)
+  }, [pendingReplacements, extraPendingChanges, silentSaveToFile])
 
   const acceptAllChanges = useCallback(() => {
     confirmReplacement()
@@ -2226,8 +2864,105 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       return { success: false, message: '插入内容不能为空' }
     }
 
-    let newContent = document.content
-    const insertHtml = `<p>${content}</p>`
+    // 使用 ref 获取最新内容（避免连续工具调用时闭包拿到旧内容）
+    let newContent = documentContentRef.current
+    const diffId = generateDiffId()
+    const now = Date.now()
+
+    const trimmed = (content || '').trim()
+    const looksLikeHtml = /^</.test(trimmed) && /<\/?[a-z][\s\S]*>/i.test(trimmed)
+    const looksLikeBlockHtml = /<\s*(p|h[1-6]|ul|ol|table|blockquote|div|section|hr)\b/i.test(trimmed)
+
+    // 最小转义 + 换行处理（纯文本插入时使用），避免传入 `<` 破坏结构
+    const escapeHtmlText = (text: string) =>
+      (text || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;')
+
+    const sanitizeIncomingHtml = (html: string) => {
+      // 只做轻量净化：去掉 script/style/iframe 等高风险标签 + 去掉 on* 事件属性 + javascript: URL
+      try {
+        const parser = new DOMParser()
+        const doc = parser.parseFromString(`<div id="__wc_insert_root">${html}</div>`, 'text/html')
+        const root = doc.getElementById('__wc_insert_root')
+        if (!root) return html
+
+        const banned = root.querySelectorAll('script, style, iframe, object, embed, link, meta')
+        banned.forEach((n) => n.remove())
+
+        const all = root.querySelectorAll<HTMLElement>('*')
+        all.forEach((el) => {
+          // remove on* handlers
+          for (const attr of Array.from(el.attributes)) {
+            const name = (attr.name || '').toLowerCase()
+            const value = (attr.value || '').toLowerCase()
+            if (name.startsWith('on')) el.removeAttribute(attr.name)
+            if ((name === 'href' || name === 'src') && value.startsWith('javascript:')) el.removeAttribute(attr.name)
+          }
+        })
+
+        return root.innerHTML
+      } catch {
+        return html
+      }
+    }
+
+    let insertHtml = ''
+    if (looksLikeHtml) {
+      const safeHtml = sanitizeIncomingHtml(trimmed)
+      if (looksLikeBlockHtml) {
+        // 块级 HTML：用 data-diff-role="new" 进行块级修订标记（避免把 <p> 塞进 <span> 导致显示异常）
+        const parser = new DOMParser()
+        const doc = parser.parseFromString(`<div id="__wc_insert_root">${safeHtml}</div>`, 'text/html')
+        const root = doc.getElementById('__wc_insert_root')
+        const children = root ? Array.from(root.children) : []
+        const blockTags = new Set([
+          'P',
+          'H1',
+          'H2',
+          'H3',
+          'H4',
+          'H5',
+          'H6',
+          'UL',
+          'OL',
+          'TABLE',
+          'BLOCKQUOTE',
+          'DIV',
+          'SECTION',
+          'HR',
+        ])
+
+        const marked: string[] = []
+        for (const el of children) {
+          const tag = el.tagName.toUpperCase()
+          if (blockTags.has(tag)) {
+            el.setAttribute('data-diff-id', diffId)
+            el.setAttribute('data-diff-role', 'new')
+            el.setAttribute('data-diff-kind', 'block')
+            marked.push(el.outerHTML)
+          } else {
+            // 非块级顶层元素：包到一个段落里，仍按块级 diff 标记
+            const p = doc.createElement('p')
+            p.setAttribute('data-diff-id', diffId)
+            p.setAttribute('data-diff-role', 'new')
+            p.setAttribute('data-diff-kind', 'block')
+            p.appendChild(el.cloneNode(true))
+            marked.push(p.outerHTML)
+          }
+        }
+        insertHtml = marked.length > 0 ? marked.join('') : `<p data-diff-id="${diffId}" data-diff-role="new" data-diff-kind="block">${safeHtml}</p>`
+      } else {
+        // 仅内联 HTML：用 span.diff-new 包裹即可（strong/em/span/img 等）
+        insertHtml = `<p><span class="diff-new" data-diff-id="${diffId}">${safeHtml}</span></p>`
+      }
+    } else {
+      const formatted = escapeHtmlText(content).replace(/\n/g, '<br>')
+      insertHtml = `<p><span class="diff-new" data-diff-id="${diffId}">${formatted}</span></p>`
+    }
 
     if (position === 'start') {
       // 在开头插入
@@ -2259,6 +2994,8 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       return { success: false, message: `无效的位置参数: ${position}` }
     }
 
+    // 同步更新 ref（关键！保证下一次工具调用拿到最新内容）
+    documentContentRef.current = newContent
     setDocument(prev => ({
       ...prev,
       content: newContent,
@@ -2267,8 +3004,24 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     setDocxData(null)
     setHasUnsavedChanges(true)
 
-    return { success: true, message: `已在 ${position === 'start' ? '开头' : position === 'end' ? '末尾' : position} 插入内容` }
-  }, [document.content])
+    // 记录到待审阅修改（插入：仅 diff-new）
+    setExtraPendingChanges(prev => [
+      ...prev,
+      {
+        id: diffId,
+        kind: 'structure_edit',
+        scope: 'document',
+        summary: `插入内容（${position === 'start' ? '开头' : position === 'end' ? '末尾' : '指定位置后'}）`,
+        beforePreview: '—',
+        afterPreview: (content || '').length > 180 ? (content || '').slice(0, 180) + '…' : (content || ''),
+        stats: { matches: 1 },
+        timestamp: now,
+        meta: { position, contentLength: content.length },
+      },
+    ])
+
+    return { success: true, message: `已插入内容（已生成修订，可在修订面板查看）` }
+  }, []) // 使用 ref 后不依赖 document.content
 
   // 删除文档中的内容
   const deleteInDocument = useCallback((target: string): { success: boolean; count: number; message: string } => {
@@ -2276,20 +3029,58 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       return { success: false, count: 0, message: '删除目标不能为空' }
     }
 
-    const content = document.content
-    
-    // 统计匹配次数
-    const regex = new RegExp(target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')
-    const matches = content.match(regex)
-    const count = matches ? matches.length : 0
+    const content = documentContentRef.current
+    const diffId = generateDiffId()
+    const now = Date.now()
+
+    // 用 DOM 方式只处理文本节点，避免误伤标签/属性；同时跳过已有 diff 区域
+    const parser = new DOMParser()
+    const doc = parser.parseFromString(content, 'text/html')
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT)
+    let count = 0
+
+    const isInsideDiff = (n: Node) => {
+      const el = (n.parentElement || null)
+      return !!el?.closest?.('.diff-old, .diff-new')
+    }
+
+    const nodes: Text[] = []
+    let n: Node | null
+    while ((n = walker.nextNode())) {
+      if (n.nodeType === Node.TEXT_NODE) nodes.push(n as Text)
+    }
+
+    for (const textNode of nodes) {
+      if (isInsideDiff(textNode)) continue
+      const text = textNode.nodeValue || ''
+      if (!text || !text.includes(target)) continue
+
+      const parts = text.split(target)
+      if (parts.length <= 1) continue
+
+      const frag = doc.createDocumentFragment()
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i]) frag.appendChild(doc.createTextNode(parts[i]))
+        if (i < parts.length - 1) {
+          const span = doc.createElement('span')
+          span.setAttribute('class', 'diff-old')
+          span.setAttribute('data-diff-id', diffId)
+          span.textContent = target
+          frag.appendChild(span)
+          count++
+        }
+      }
+      textNode.parentNode?.replaceChild(frag, textNode)
+    }
 
     if (count === 0) {
       return { success: false, count: 0, message: `未找到「${target}」` }
     }
 
-    // 执行删除
-    const newContent = content.replace(regex, '')
+    const newContent = doc.body.innerHTML
 
+    // 同步更新 ref
+    documentContentRef.current = newContent
     setDocument(prev => ({
       ...prev,
       content: newContent,
@@ -2298,8 +3089,24 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     setDocxData(null)
     setHasUnsavedChanges(true)
 
-    return { success: true, count, message: `成功删除 ${count} 处「${target}」` }
-  }, [document.content])
+    // 记录到待审阅修改（删除：仅 diff-old）
+    setExtraPendingChanges(prev => [
+      ...prev,
+      {
+        id: diffId,
+        kind: 'structure_edit',
+        scope: 'document',
+        summary: `删除 ${count} 处`,
+        beforePreview: target.length > 180 ? target.slice(0, 180) + '…' : target,
+        afterPreview: '—',
+        stats: { matches: count },
+        timestamp: now,
+        meta: { target, count },
+      },
+    ])
+
+    return { success: true, count, message: `已标记删除 ${count} 处（可在修订面板接受/拒绝）` }
+  }, []) // 使用 ref 后不依赖 document.content
   
   // 滚动到指定文本
   const scrollToText = useCallback((text: string) => {
@@ -2320,6 +3127,192 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;')
+  }
+
+  const TEMPLATE_PLACEHOLDER_REGEX = /_{3,}|（\s*）|\(\s*\)|【\s*】|\[\s*\]|\{\s*\}/
+
+  const normalizeText = (text: string) =>
+    (text || '').replace(/\s+/g, ' ').trim()
+
+  const normalizeLabelKey = (label: string) =>
+    normalizeText(label).toLowerCase().replace(/[：:，,。\s]/g, '')
+
+  const inferFieldType = (label: string, value?: string) => {
+    const text = `${label || ''} ${value || ''}`.toLowerCase()
+    if (/日期|时间|date/.test(text)) return 'date'
+    if (/金额|费用|总价|¥|\$|usd|rmb/.test(text)) return 'amount'
+    if (/姓名|联系人|负责人|作者|签名|name/.test(text)) return 'person'
+    if (/单位|公司|机构|部门|org|company/.test(text)) return 'organization'
+    if (/电话|手机|联系方式|tel|phone/.test(text)) return 'phone'
+    if (/邮箱|邮件|email/.test(text)) return 'email'
+    if (/地址|住址|address/.test(text)) return 'address'
+    if (/编号|证件号|合同号|id/.test(text)) return 'id'
+    if (/%/.test(text)) return 'percent'
+    return 'text'
+  }
+
+  const buildBlockMeta = (blocks: HTMLElement[]) => {
+    const meta: Array<{
+      index: number
+      tag: string
+      path: string
+      headingPath: string
+      text: string
+    }> = []
+    const headingStack: Array<{ level: number; index: number; text: string }> = []
+    const counters: Record<string, number> = { p: 0, h1: 0, h2: 0, h3: 0, h4: 0, h5: 0, h6: 0 }
+
+    blocks.forEach((el, index) => {
+      const tag = el.tagName.toLowerCase()
+      if (/^h[1-6]$/.test(tag)) {
+        const level = Number(tag[1])
+        counters[tag] = (counters[tag] || 0) + 1
+        while (headingStack.length && headingStack[headingStack.length - 1].level >= level) {
+          headingStack.pop()
+        }
+        headingStack.push({
+          level,
+          index: counters[tag],
+          text: normalizeText(el.textContent || ''),
+        })
+        const path = headingStack.map((h) => `h${h.level}[${h.index}]`).join('/')
+        meta.push({
+          index,
+          tag,
+          path,
+          headingPath: path,
+          text: normalizeText(el.textContent || ''),
+        })
+        return
+      }
+
+      if (tag === 'p') {
+        counters.p += 1
+        const headingPath = headingStack.map((h) => `h${h.level}[${h.index}]`).join('/')
+        const path = headingPath ? `${headingPath}/p[${counters.p}]` : `p[${counters.p}]`
+        meta.push({
+          index,
+          tag,
+          path,
+          headingPath,
+          text: normalizeText(el.textContent || ''),
+        })
+      }
+    })
+
+    return meta
+  }
+
+  const detectTemplateFields = (doc: globalThis.Document, limit = 60): TemplateFieldCandidate[] => {
+    const fields: TemplateFieldCandidate[] = []
+    const blocks = Array.from(doc.body.querySelectorAll<HTMLElement>('p,h1,h2,h3,h4,h5,h6'))
+    const blockMeta = buildBlockMeta(blocks)
+    const groupCount = new Map<string, number>()
+
+    blocks.forEach((el, index) => {
+      if (fields.length >= limit) return
+      const rawText = normalizeText(el.textContent || '')
+      if (!rawText) return
+      const path = blockMeta[index]?.path || ''
+
+      // 1) 标签 + 冒号（右侧为空或占位符）
+      const colonIndex = rawText.indexOf('：') >= 0 ? rawText.indexOf('：') : rawText.indexOf(':')
+      if (colonIndex > -1) {
+        const label = rawText.slice(0, colonIndex).trim()
+        const tail = rawText.slice(colonIndex + 1).trim()
+        if (label && (!tail || TEMPLATE_PLACEHOLDER_REGEX.test(tail))) {
+          const labelWithColon = rawText.slice(0, colonIndex + 1)
+          const groupKey = normalizeLabelKey(label)
+          groupCount.set(groupKey, (groupCount.get(groupKey) || 0) + 1)
+          fields.push({
+            id: `p:${index}:colon`,
+            label,
+            kind: 'colon',
+            context: rawText.slice(0, 80),
+            path,
+            currentValue: tail || '',
+            fieldType: inferFieldType(label, tail || ''),
+            groupKey,
+            meta: { blockIndex: index, labelWithColon, placeholder: tail },
+          })
+        }
+      }
+
+      if (fields.length >= limit) return
+
+      // 2) 纯占位符（下划线/括号空位）
+      const blankMatch = rawText.match(TEMPLATE_PLACEHOLDER_REGEX)
+      if (blankMatch) {
+        const placeholder = blankMatch[0]
+        const before = rawText.split(placeholder)[0].trim()
+        const label = before || '未命名字段'
+        const groupKey = normalizeLabelKey(label)
+        groupCount.set(groupKey, (groupCount.get(groupKey) || 0) + 1)
+        fields.push({
+          id: `p:${index}:blank`,
+          label,
+          kind: 'blank',
+          context: rawText.slice(0, 80),
+          path,
+          currentValue: '',
+          fieldType: inferFieldType(label, ''),
+          groupKey,
+          meta: { blockIndex: index, placeholder },
+        })
+      }
+    })
+
+    if (fields.length >= limit) return fields
+
+    // 3) 表格：左标签 + 右空位
+    const tables = Array.from(doc.body.querySelectorAll<HTMLTableElement>('table'))
+    tables.forEach((table, tableIndex) => {
+      if (fields.length >= limit) return
+      const rows = Array.from(table.querySelectorAll('tr'))
+      rows.forEach((row, rowIndex) => {
+        if (fields.length >= limit) return
+        const cells = Array.from(row.querySelectorAll<HTMLElement>('th,td'))
+        for (let col = 0; col < cells.length - 1; col++) {
+          if (fields.length >= limit) break
+          const labelCell = cells[col]
+          const valueCell = cells[col + 1]
+          const labelText = normalizeText(labelCell.textContent || '')
+          if (!labelText) continue
+          const valueText = normalizeText(valueCell.textContent || '')
+          if (!valueText || TEMPLATE_PLACEHOLDER_REGEX.test(valueText)) {
+            const groupKey = normalizeLabelKey(labelText)
+            groupCount.set(groupKey, (groupCount.get(groupKey) || 0) + 1)
+            fields.push({
+              id: `t:${tableIndex}:r:${rowIndex}:c:${col + 1}`,
+              label: labelText,
+              kind: 'table',
+              context: `表格${tableIndex + 1} 行${rowIndex + 1}`,
+              path: `table[${tableIndex + 1}]/r[${rowIndex + 1}]/c[${col + 2}]`,
+              currentValue: valueText || '',
+              fieldType: inferFieldType(labelText, valueText || ''),
+              groupKey,
+              meta: { tableIndex, rowIndex, colIndex: col + 1 },
+            })
+          }
+        }
+      })
+    })
+
+    if (fields.length > 0) {
+      const groupCounts = new Map<string, number>()
+      fields.forEach((f) => {
+        const key = f.groupKey || normalizeLabelKey(f.label)
+        groupCounts.set(key, (groupCounts.get(key) || 0) + 1)
+      })
+      fields.forEach((f) => {
+        const key = f.groupKey || normalizeLabelKey(f.label)
+        const count = groupCounts.get(key) || 1
+        f.groupKey = key
+        f.meta = { ...(f.meta || {}), groupKey: key, groupCount: count }
+      })
+    }
+
+    return fields
   }
 
   const previewWordOps = useCallback((ops: WordEditOp[]) => {
@@ -2362,6 +3355,77 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           lines.push(`format_text: 预计命中 ${count} 处 "${t.slice(0, 30)}${t.length > 30 ? '…' : ''}"`)
           continue
         }
+
+        // 预览新增操作类型
+        if (type === 'outline_summary') {
+          const action = String(op.params?.action || 'extract_outline')
+          const headings = Array.from(doc.body.querySelectorAll<HTMLElement>('h1,h2,h3,h4,h5,h6'))
+          estimated += headings.length
+          lines.push(`outline_summary (${action}): 文档含 ${headings.length} 个标题`)
+          continue
+        }
+
+        if (type === 'template_fill') {
+          const action = String(op.params?.action || 'detect_placeholders')
+
+          if (action === 'detect_fields') {
+            const fields = detectTemplateFields(doc)
+            estimated += fields.length
+            lines.push(`template_fill (detect_fields): 发现 ${fields.length} 个候选字段`)
+            const previewLines = fields.slice(0, 12).map((f) => {
+              const path = f.path ? ` | ${f.path}` : ''
+              const value = f.currentValue ? ` | 当前值: ${f.currentValue}` : ''
+              return `${f.id} | ${f.label}${path}${value}`
+            })
+            if (previewLines.length) {
+              lines.push(...previewLines)
+            }
+            if (fields.length > previewLines.length) {
+              lines.push(`... 还有 ${fields.length - previewLines.length} 个字段未展示`)
+            }
+            continue
+          }
+
+          if (action === 'apply' || action === 'apply_fields') {
+            let assignments: Array<{ fieldId?: string; value?: string; label?: string }> = []
+            const raw = op.params?.assignments
+            if (Array.isArray(raw)) {
+              assignments = raw as Array<{ fieldId?: string; value?: string; label?: string }>
+            } else if (typeof raw === 'string') {
+              try {
+                assignments = JSON.parse(raw)
+              } catch {
+                assignments = []
+              }
+            }
+            estimated += assignments.length
+            lines.push(`template_fill (apply): 计划填充 ${assignments.length} 项`)
+            assignments.slice(0, 12).forEach((item) => {
+              const label = item.label || item.fieldId || '字段'
+              const value = (item.value || '').toString().slice(0, 40)
+              lines.push(`${label} → ${value}`)
+            })
+            if (assignments.length > 12) {
+              lines.push(`... 还有 ${assignments.length - 12} 项未展示`)
+            }
+            continue
+          }
+
+          const plainText = doc.body.innerHTML
+          // 简单统计占位符
+          const placeholderCount = (plainText.match(/\{\{[^}]+\}\}|【[^】]+】|\[[^\]]+\]|_{3,}|<[^>]+>/g) || []).length
+          estimated += placeholderCount
+          lines.push(`template_fill (${action}): 预计 ${placeholderCount} 个占位符`)
+          continue
+        }
+
+        if (type === 'citation_footnote') {
+          const action = String(op.params?.action || 'insert_footnote')
+          const existingNotes = doc.body.querySelectorAll('.footnote-ref, .endnote-ref, .bibliography-item')
+          estimated += 1
+          lines.push(`citation_footnote (${action}): 现有 ${existingNotes.length} 个注释/引用`)
+          continue
+        }
       }
 
       return {
@@ -2386,6 +3450,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
 
       const created: PendingChange[] = []
       const genId = () => `diff-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+      let templateFillReport: { applied: number; skipped: number; warnings: number } | null = null
 
       const markBlockPair = (oldEl: HTMLElement, newEl: HTMLElement, diffId: string) => {
         oldEl.setAttribute('data-diff-id', diffId)
@@ -2394,6 +3459,117 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         newEl.setAttribute('data-diff-id', diffId)
         newEl.setAttribute('data-diff-role', 'new')
         newEl.setAttribute('data-diff-kind', 'block')
+      }
+
+      const buildDiffOld = (diffId: string, text: string) =>
+        `<span class="diff-old" data-diff-id="${diffId}">${escapeHtml(text)}</span>`
+
+      const buildDiffNew = (diffId: string, text: string) =>
+        `<span class="diff-new" data-diff-id="${diffId}">${escapeHtml(text)}</span>`
+
+      const buildDiffPair = (diffId: string, oldText: string, newText: string) =>
+        `${buildDiffOld(diffId, oldText)}${buildDiffNew(diffId, newText)}`
+
+      const extractFormatTags = (htmlFragment: string): { openTags: string[]; closeTags: string[] } => {
+        const openTags: string[] = []
+        const closeTags: string[] = []
+        const formatTagRegex = /<(strong|em|u|s|b|i|sub|sup|span[^>]*|mark[^>]*)>/gi
+        const closeTagRegex = /<\/(strong|em|u|s|b|i|sub|sup|span|mark)>/gi
+        let match
+        while ((match = formatTagRegex.exec(htmlFragment)) !== null) {
+          openTags.push(match[0])
+        }
+        while ((match = closeTagRegex.exec(htmlFragment)) !== null) {
+          closeTags.unshift(match[0])
+        }
+        return { openTags, closeTags }
+      }
+
+      const buildDiffPairWithFormat = (diffId: string, oldText: string, newText: string, originalHtml: string) => {
+        const formatText = (text: string) => escapeHtml(text).replace(/\n/g, '<br>')
+        const { openTags, closeTags } = extractFormatTags(originalHtml)
+        const formattedNew = `${openTags.join('')}${formatText(newText)}${closeTags.join('')}`
+        return `<span class="diff-old" data-diff-id="${diffId}">${originalHtml}</span>` +
+          `<span class="diff-new" data-diff-id="${diffId}">${formattedNew}</span>`
+      }
+
+      const replaceFirstTextInHtml = (
+        htmlFragment: string,
+        searchText: string,
+        buildReplacement: (matchedText: string, originalHtml: string) => string
+      ) => {
+        if (!searchText) return htmlFragment
+        const parts: { type: 'text' | 'tag'; content: string; index: number }[] = []
+        let lastIdx = 0
+        const tagRegex = /<[^>]+>/g
+        let tagMatch: RegExpExecArray | null
+        while ((tagMatch = tagRegex.exec(htmlFragment)) !== null) {
+          if (tagMatch.index > lastIdx) {
+            parts.push({ type: 'text', content: htmlFragment.slice(lastIdx, tagMatch.index), index: lastIdx })
+          }
+          parts.push({ type: 'tag', content: tagMatch[0], index: tagMatch.index })
+          lastIdx = tagMatch.index + tagMatch[0].length
+        }
+        if (lastIdx < htmlFragment.length) {
+          parts.push({ type: 'text', content: htmlFragment.slice(lastIdx), index: lastIdx })
+        }
+
+        let pure = ''
+        const map: number[] = []
+        for (const p of parts) {
+          if (p.type === 'text') {
+            for (let i = 0; i < p.content.length; i++) {
+              map.push(p.index + i)
+              pure += p.content[i]
+            }
+          }
+        }
+        if (!pure) return htmlFragment
+        const idx = pure.indexOf(searchText)
+        if (idx < 0) return htmlFragment
+        const htmlStart = map[idx]
+        const htmlEnd = map[idx + searchText.length - 1] + 1
+        const originalHtml = htmlFragment.slice(htmlStart, htmlEnd)
+        const replacement = buildReplacement(searchText, originalHtml)
+        return htmlFragment.slice(0, htmlStart) + replacement + htmlFragment.slice(htmlEnd)
+      }
+
+      const applyTemplateValueToElement = (el: HTMLElement, value: string, diffId: string, oldValue?: string) => {
+        const rawText = normalizeText(el.textContent || '')
+        if (!rawText) {
+          el.innerHTML = buildDiffNew(diffId, value)
+          return
+        }
+
+        if (oldValue && rawText.includes(oldValue)) {
+          const updated = replaceFirstTextInHtml(el.innerHTML, oldValue, (_m, originalHtml) =>
+            buildDiffPairWithFormat(diffId, oldValue, value, originalHtml)
+          )
+          el.innerHTML = updated
+          return
+        }
+
+        const placeholderMatch = rawText.match(TEMPLATE_PLACEHOLDER_REGEX)
+        if (placeholderMatch) {
+          const placeholder = placeholderMatch[0]
+          const updated = replaceFirstTextInHtml(el.innerHTML, placeholder, () =>
+            buildDiffPair(diffId, placeholder, value)
+          )
+          el.innerHTML = updated
+          return
+        }
+
+        const colonIndex = rawText.indexOf('：') >= 0 ? rawText.indexOf('：') : rawText.indexOf(':')
+        if (colonIndex > -1) {
+          const labelWithColon = rawText.slice(0, colonIndex + 1)
+          const updated = replaceFirstTextInHtml(el.innerHTML, labelWithColon, (_m, originalHtml) =>
+            `${originalHtml}${buildDiffNew(diffId, value)}`
+          )
+          el.innerHTML = updated
+          return
+        }
+
+        el.innerHTML = `${el.innerHTML}${buildDiffNew(diffId, value)}`
       }
 
       for (const op of ops) {
@@ -2924,7 +4100,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           // 创建分页符元素
           const pageBreak = doc.createElement('div')
           pageBreak.className = 'page-break'
-          pageBreak.setAttribute('style', 'page-break-before: always; border-top: 2px dashed #999; margin: 20px 0; padding: 10px 0; text-align: center; color: #999; font-size: 12px;')
+          pageBreak.setAttribute('style', 'page-break-before: always; border-top: 2px dashed var(--word-rule); margin: 20px 0; padding: 10px 0; text-align: center; color: var(--word-ink-muted); font-size: 12px;')
           pageBreak.textContent = '--- 分页符 ---'
           
           const diffId = genId()
@@ -3090,7 +4266,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
               const tr = doc.createElement('tr')
               for (let c = 0; c < cols; c++) {
                 const cell = doc.createElement(r === 0 && headers ? 'th' : 'td')
-                cell.setAttribute('style', 'border: 1px solid #ccc; padding: 8px;')
+                cell.setAttribute('style', 'border: 0.5pt solid var(--word-rule); padding: 2pt 5pt;')
                 if (r === 0 && headers && headers[c]) {
                   cell.textContent = headers[c]
                 }
@@ -3132,7 +4308,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
               tr.setAttribute('data-diff-role', 'new')
               for (let c = 0; c < cols; c++) {
                 const td = doc.createElement('td')
-                td.setAttribute('style', 'border: 1px solid #ccc; padding: 8px;')
+                td.setAttribute('style', 'border: 0.5pt solid var(--word-rule); padding: 2pt 5pt;')
                 tr.appendChild(td)
               }
               targetTable.appendChild(tr)
@@ -3156,7 +4332,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
             for (let r = 0; r < rows.length; r++) {
               for (let i = 0; i < count; i++) {
                 const cell = doc.createElement(r === 0 ? 'th' : 'td')
-                cell.setAttribute('style', 'border: 1px solid #ccc; padding: 8px;')
+                cell.setAttribute('style', 'border: 0.5pt solid var(--word-rule); padding: 2pt 5pt;')
                 cell.setAttribute('data-diff-id', diffId)
                 cell.setAttribute('data-diff-role', 'new')
                 rows[r].appendChild(cell)
@@ -3173,8 +4349,195 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
               timestamp: Date.now(),
               meta: { op, action },
             })
+          } else if (action === 'delete_row' && targetTable) {
+            // 删除行
+            const rowIndex = parseInt(String(op.params?.rowIndex ?? op.params?.row ?? -1))
+            const count = parseInt(String(op.params?.count || 1))
+            const diffId = genId()
+            
+            if (rowIndex >= 0 && rowIndex < targetTable.rows.length) {
+              for (let i = 0; i < count && rowIndex < targetTable.rows.length; i++) {
+                const row = targetTable.rows[rowIndex]
+                row.setAttribute('data-diff-id', diffId)
+                row.setAttribute('data-diff-role', 'old')
+                row.style.textDecoration = 'line-through'
+                row.style.opacity = '0.5'
+              }
+              
+              created.push({
+                id: diffId,
+                kind: 'table_edit',
+                scope: 'selection',
+                summary: `删除第 ${rowIndex + 1} 行`,
+                beforePreview: `第 ${rowIndex + 1} 行`,
+                stats: { matches: count },
+                timestamp: Date.now(),
+                meta: { op, action },
+              })
+            }
+          } else if (action === 'delete_column' && targetTable) {
+            // 删除列
+            const colIndex = parseInt(String(op.params?.colIndex ?? op.params?.column ?? -1))
+            const diffId = genId()
+            
+            if (colIndex >= 0) {
+              const rows = targetTable.rows
+              let deletedCount = 0
+              for (let r = 0; r < rows.length; r++) {
+                if (colIndex < rows[r].cells.length) {
+                  const cell = rows[r].cells[colIndex]
+                  cell.setAttribute('data-diff-id', diffId)
+                  cell.setAttribute('data-diff-role', 'old')
+                  cell.style.textDecoration = 'line-through'
+                  cell.style.opacity = '0.5'
+                  deletedCount++
+                }
+              }
+              
+              created.push({
+                id: diffId,
+                kind: 'table_edit',
+                scope: 'selection',
+                summary: `删除第 ${colIndex + 1} 列`,
+                beforePreview: `第 ${colIndex + 1} 列`,
+                stats: { matches: deletedCount },
+                timestamp: Date.now(),
+                meta: { op, action },
+              })
+            }
+          } else if (action === 'merge_cells' && targetTable) {
+            // 合并单元格
+            const startRow = parseInt(String(op.params?.startRow ?? 0))
+            const startCol = parseInt(String(op.params?.startCol ?? 0))
+            const rowSpan = parseInt(String(op.params?.rowSpan ?? 1))
+            const colSpan = parseInt(String(op.params?.colSpan ?? 1))
+            const diffId = genId()
+            
+            if (startRow < targetTable.rows.length && startCol < (targetTable.rows[startRow]?.cells.length || 0)) {
+              const mainCell = targetTable.rows[startRow].cells[startCol]
+              
+              // 设置合并属性
+              if (rowSpan > 1) mainCell.setAttribute('rowspan', String(rowSpan))
+              if (colSpan > 1) mainCell.setAttribute('colspan', String(colSpan))
+              mainCell.setAttribute('data-diff-id', diffId)
+              mainCell.setAttribute('data-diff-role', 'new')
+              
+              // 标记要隐藏的单元格
+              for (let r = startRow; r < startRow + rowSpan && r < targetTable.rows.length; r++) {
+                for (let c = startCol; c < startCol + colSpan; c++) {
+                  if (r === startRow && c === startCol) continue
+                  if (c < targetTable.rows[r].cells.length) {
+                    const cell = targetTable.rows[r].cells[c]
+                    cell.setAttribute('data-diff-id', diffId)
+                    cell.setAttribute('data-diff-role', 'old')
+                    cell.style.display = 'none'
+                  }
+                }
+              }
+              
+              created.push({
+                id: diffId,
+                kind: 'table_edit',
+                scope: 'selection',
+                summary: `合并单元格 (${rowSpan}x${colSpan})`,
+                afterPreview: `从 (${startRow + 1},${startCol + 1}) 合并 ${rowSpan}行${colSpan}列`,
+                stats: { matches: 1 },
+                timestamp: Date.now(),
+                meta: { op, action },
+              })
+            }
+          } else if (action === 'set_cell_style' && targetTable) {
+            // 设置单元格样式（边框、背景色等）
+            const rowIndex = parseInt(String(op.params?.row ?? -1))
+            const colIndex = parseInt(String(op.params?.col ?? -1))
+            const backgroundColor = op.params?.backgroundColor as string | undefined
+            const borderColor = op.params?.borderColor as string | undefined
+            const borderWidth = op.params?.borderWidth as string | undefined
+            const borderStyle = op.params?.borderStyle as string | undefined
+            const diffId = genId()
+            
+            // 确定目标单元格（单个或范围）
+            const targetCells: HTMLTableCellElement[] = []
+            if (rowIndex >= 0 && colIndex >= 0) {
+              // 单个单元格
+              if (rowIndex < targetTable.rows.length && colIndex < targetTable.rows[rowIndex].cells.length) {
+                targetCells.push(targetTable.rows[rowIndex].cells[colIndex])
+              }
+            } else if (rowIndex >= 0) {
+              // 整行
+              if (rowIndex < targetTable.rows.length) {
+                targetCells.push(...Array.from(targetTable.rows[rowIndex].cells))
+              }
+            } else if (colIndex >= 0) {
+              // 整列
+              for (let r = 0; r < targetTable.rows.length; r++) {
+                if (colIndex < targetTable.rows[r].cells.length) {
+                  targetCells.push(targetTable.rows[r].cells[colIndex])
+                }
+              }
+            }
+            
+            for (const cell of targetCells) {
+              const prevStyle = cell.getAttribute('style') || ''
+              let newStyle = prevStyle
+              
+              if (backgroundColor) {
+                newStyle = newStyle.replace(/background-color\s*:\s*[^;]+;?/gi, '')
+                newStyle += `; background-color: ${backgroundColor};`
+              }
+              if (borderColor || borderWidth || borderStyle) {
+                const bw = borderWidth || '1px'
+                const bs = borderStyle || 'solid'
+                const bc = borderColor || '#000000'
+                newStyle = newStyle.replace(/border\s*:\s*[^;]+;?/gi, '')
+                newStyle += `; border: ${bw} ${bs} ${bc};`
+              }
+              
+              cell.setAttribute('style', newStyle.replace(/^;?\s*/, ''))
+              cell.setAttribute('data-diff-id', diffId)
+              cell.setAttribute('data-diff-role', 'new')
+            }
+            
+            if (targetCells.length > 0) {
+              created.push({
+                id: diffId,
+                kind: 'table_edit',
+                scope: 'selection',
+                summary: `设置 ${targetCells.length} 个单元格样式`,
+                afterPreview: backgroundColor ? `背景: ${backgroundColor}` : '边框样式',
+                stats: { matches: targetCells.length },
+                timestamp: Date.now(),
+                meta: { op, action },
+              })
+            }
+          } else if (action === 'set_table_border' && targetTable) {
+            // 设置整个表格边框
+            const borderColor = (op.params?.borderColor || '#000000').toString()
+            const borderWidth = (op.params?.borderWidth || '1px').toString()
+            const borderStyle = (op.params?.borderStyle || 'solid').toString()
+            const diffId = genId()
+            
+            const allCells = Array.from(targetTable.querySelectorAll<HTMLTableCellElement>('td, th'))
+            for (const cell of allCells) {
+              const prevStyle = cell.getAttribute('style') || ''
+              let newStyle = prevStyle.replace(/border\s*:\s*[^;]+;?/gi, '')
+              newStyle += `; border: ${borderWidth} ${borderStyle} ${borderColor};`
+              cell.setAttribute('style', newStyle.replace(/^;?\s*/, ''))
+              cell.setAttribute('data-diff-id', diffId)
+              cell.setAttribute('data-diff-role', 'new')
+            }
+            
+            created.push({
+              id: diffId,
+              kind: 'table_edit',
+              scope: 'selection',
+              summary: `设置表格边框`,
+              afterPreview: `${borderWidth} ${borderStyle} ${borderColor}`,
+              stats: { matches: allCells.length },
+              timestamp: Date.now(),
+              meta: { op, action },
+            })
           }
-          // 其他表格操作（delete_row, delete_column, merge_cells）可以类似实现
           continue
         }
 
@@ -3231,8 +4594,9 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           } else if (action === 'resize_image') {
             const anchor = (op.params?.anchor || '').toString()
             const newWidth = (op.params?.width || '').toString()
+            const newHeight = (op.params?.height || '').toString()
             
-            if (!newWidth) continue
+            if (!newWidth && !newHeight) continue
             
             const images = Array.from(doc.body.querySelectorAll<HTMLImageElement>('img'))
             // 找到最近的图片（基于锚点或第一张）
@@ -3245,23 +4609,172 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
             
             if (targetImg) {
               const diffId = genId()
-              const prevStyle = targetImg.getAttribute('style') || ''
-              const newStyle = prevStyle.replace(/max-width\s*:\s*[^;]+;?/gi, '') + `; max-width: ${newWidth};`
+              let prevStyle = targetImg.getAttribute('style') || ''
+              if (newWidth) {
+                prevStyle = prevStyle.replace(/max-width\s*:\s*[^;]+;?/gi, '').replace(/width\s*:\s*[^;]+;?/gi, '')
+                prevStyle += `; max-width: ${newWidth}; width: ${newWidth};`
+              }
+              if (newHeight) {
+                prevStyle = prevStyle.replace(/height\s*:\s*[^;]+;?/gi, '')
+                prevStyle += `; height: ${newHeight};`
+              }
               
               targetImg.setAttribute('data-diff-id', diffId)
               targetImg.setAttribute('data-diff-role', 'new')
-              targetImg.setAttribute('style', newStyle)
+              targetImg.setAttribute('style', prevStyle.replace(/^;?\s*/, ''))
               
               created.push({
                 id: diffId,
                 kind: 'image_edit',
                 scope: 'selection',
-                summary: `调整图片大小为 ${newWidth}`,
-                afterPreview: newWidth,
+                summary: `调整图片大小`,
+                afterPreview: newWidth ? `宽: ${newWidth}` : `高: ${newHeight}`,
                 stats: { matches: 1 },
                 timestamp: Date.now(),
                 meta: { op, action },
               })
+            }
+          } else if (action === 'set_caption') {
+            // 设置图片标题/说明
+            const anchor = (op.params?.anchor || '').toString()
+            const caption = (op.params?.caption || '').toString()
+            
+            if (!caption) continue
+            
+            const images = Array.from(doc.body.querySelectorAll<HTMLImageElement>('img'))
+            const targetImg = anchor
+              ? images.find(img => {
+                  const parent = img.parentElement
+                  return parent && (parent.textContent || '').includes(anchor)
+                })
+              : images[0]
+            
+            if (targetImg) {
+              const diffId = genId()
+              const parent = targetImg.parentElement
+              
+              // 检查是否已经在 figure 中
+              if (parent?.tagName.toLowerCase() === 'figure') {
+                // 更新或添加 figcaption
+                let figcaption = parent.querySelector('figcaption')
+                if (!figcaption) {
+                  figcaption = doc.createElement('figcaption')
+                  figcaption.setAttribute('style', 'font-size: 0.9em; color: #666; text-align: center; margin-top: 0.5em;')
+                  parent.appendChild(figcaption)
+                }
+                figcaption.textContent = caption
+                figcaption.setAttribute('data-diff-id', diffId)
+                figcaption.setAttribute('data-diff-role', 'new')
+              } else if (parent) {
+                // 包装到 figure 中
+                const figure = doc.createElement('figure')
+                figure.setAttribute('style', 'margin: 1em 0; text-align: center;')
+                figure.setAttribute('data-diff-id', diffId)
+                figure.setAttribute('data-diff-role', 'new')
+                figure.setAttribute('data-diff-kind', 'block')
+                
+                parent.insertBefore(figure, targetImg)
+                figure.appendChild(targetImg)
+                
+                const figcaption = doc.createElement('figcaption')
+                figcaption.setAttribute('style', 'font-size: 0.9em; color: #666; text-align: center; margin-top: 0.5em;')
+                figcaption.textContent = caption
+                figure.appendChild(figcaption)
+              }
+              
+              created.push({
+                id: diffId,
+                kind: 'image_edit',
+                scope: 'selection',
+                summary: `设置图片标题`,
+                afterPreview: caption.slice(0, 50),
+                stats: { matches: 1 },
+                timestamp: Date.now(),
+                meta: { op, action },
+              })
+            }
+          } else if (action === 'delete_image') {
+            // 删除图片
+            const anchor = (op.params?.anchor || '').toString()
+            const index = parseInt(String(op.params?.index ?? -1))
+            
+            const images = Array.from(doc.body.querySelectorAll<HTMLImageElement>('img'))
+            let targetImg: HTMLImageElement | undefined
+            
+            if (index >= 0 && index < images.length) {
+              targetImg = images[index]
+            } else if (anchor) {
+              targetImg = images.find(img => {
+                const parent = img.parentElement
+                return parent && (parent.textContent || '').includes(anchor)
+              })
+            } else {
+              targetImg = images[0]
+            }
+            
+            if (targetImg) {
+              const diffId = genId()
+              const parent = targetImg.parentElement
+              
+              // 标记为删除
+              if (parent?.tagName.toLowerCase() === 'figure') {
+                parent.setAttribute('data-diff-id', diffId)
+                parent.setAttribute('data-diff-role', 'old')
+                parent.style.opacity = '0.3'
+                parent.style.textDecoration = 'line-through'
+              } else {
+                targetImg.setAttribute('data-diff-id', diffId)
+                targetImg.setAttribute('data-diff-role', 'old')
+                targetImg.style.opacity = '0.3'
+              }
+              
+              created.push({
+                id: diffId,
+                kind: 'image_edit',
+                scope: 'selection',
+                summary: `删除图片`,
+                beforePreview: targetImg.alt || '图片',
+                stats: { matches: 1 },
+                timestamp: Date.now(),
+                meta: { op, action },
+              })
+            }
+          } else if (action === 'set_alignment') {
+            // 设置图片对齐方式
+            const anchor = (op.params?.anchor || '').toString()
+            const alignment = (op.params?.alignment || 'center').toString()
+            
+            const images = Array.from(doc.body.querySelectorAll<HTMLImageElement>('img'))
+            const targetImg = anchor
+              ? images.find(img => {
+                  const parent = img.parentElement
+                  return parent && (parent.textContent || '').includes(anchor)
+                })
+              : images[0]
+            
+            if (targetImg) {
+              const diffId = genId()
+              const parent = targetImg.parentElement
+              
+              if (parent) {
+                const prevStyle = parent.getAttribute('style') || ''
+                let newStyle = prevStyle.replace(/text-align\s*:\s*[^;]+;?/gi, '')
+                newStyle += `; text-align: ${alignment};`
+                parent.setAttribute('style', newStyle.replace(/^;?\s*/, ''))
+                parent.setAttribute('data-diff-id', diffId)
+                parent.setAttribute('data-diff-role', 'new')
+                
+                created.push({
+                  id: diffId,
+                  kind: 'image_edit',
+                  scope: 'selection',
+                  summary: `设置图片对齐: ${alignment}`,
+                  afterPreview: alignment,
+                  stats: { matches: 1 },
+                  timestamp: Date.now(),
+                  meta: { op, action },
+                })
+              }
             }
           }
           continue
@@ -3559,7 +5072,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           tocContainer.setAttribute('data-diff-id', diffId)
           tocContainer.setAttribute('data-diff-role', 'new')
           tocContainer.setAttribute('data-diff-kind', 'block')
-          tocContainer.setAttribute('style', 'margin: 1em 0; padding: 1em; border: 1px solid #ddd; background: #f9f9f9;')
+          tocContainer.setAttribute('style', 'margin: 1em 0; padding: 1em; border: 1px solid var(--word-rule); background: #f9f9f9;')
           
           // 目录标题
           const tocTitle = doc.createElement('h2')
@@ -3678,6 +5191,603 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           }
           continue
         }
+
+        // outline_summary - 大纲/摘要生成
+        if (type === 'outline_summary') {
+          const diffId = genId()
+          const action = String(op.params?.action || 'extract_outline')
+          
+          if (action === 'extract_outline') {
+            // 提取文档大纲
+            const headings = Array.from(doc.body.querySelectorAll<HTMLElement>('h1,h2,h3,h4,h5,h6'))
+            const outline: Array<{ level: number; text: string }> = []
+            
+            headings.forEach(h => {
+              const level = parseInt(h.tagName.substring(1))
+              const text = (h.textContent || '').trim()
+              if (text) {
+                outline.push({ level, text })
+              }
+            })
+            
+            // 生成大纲文本
+            const outlineText = outline.map(item => {
+              const indent = '  '.repeat(item.level - 1)
+              const prefix = item.level === 1 ? '■' : item.level === 2 ? '●' : '○'
+              return `${indent}${prefix} ${item.text}`
+            }).join('\n')
+            
+            created.push({
+              id: diffId,
+              kind: 'outline_summary',
+              scope: 'document',
+              summary: `提取大纲（${outline.length} 个标题）`,
+              afterPreview: outlineText.slice(0, 200) + (outlineText.length > 200 ? '...' : ''),
+              stats: { matches: outline.length },
+              timestamp: Date.now(),
+              meta: { op, outline },
+            })
+            continue
+          }
+          
+          if (action === 'generate_summary') {
+            // 生成摘要 - 提取文档文本供 AI 使用
+            const plainText = (doc.body.textContent || '').trim()
+            const summaryLength = String(op.params?.summaryLength || 'medium')
+            const targetLength = summaryLength === 'short' ? 100 : summaryLength === 'long' ? 300 : 200
+            
+            // 简单的摘要生成：提取前几个段落的内容
+            const paragraphs = Array.from(doc.body.querySelectorAll<HTMLElement>('p'))
+            let summaryText = ''
+            for (const p of paragraphs) {
+              const text = (p.textContent || '').trim()
+              if (text && summaryText.length < targetLength) {
+                summaryText += text + ' '
+              }
+            }
+            summaryText = summaryText.trim().slice(0, targetLength) + '...'
+            
+            created.push({
+              id: diffId,
+              kind: 'outline_summary',
+              scope: 'document',
+              summary: `生成摘要（${targetLength}字）`,
+              afterPreview: summaryText,
+              stats: { matches: 1 },
+              timestamp: Date.now(),
+              meta: { op, plainText: plainText.slice(0, 2000), targetLength },
+            })
+            continue
+          }
+          
+          if (action === 'insert_summary') {
+            // 插入摘要到文档
+            const summaryContent = String(op.params?.content || '')
+            const position = String(op.params?.position || 'start')
+            
+            if (summaryContent) {
+              const summaryDiv = doc.createElement('div')
+              summaryDiv.className = 'document-summary'
+              summaryDiv.setAttribute('data-diff-id', diffId)
+              summaryDiv.setAttribute('data-diff-role', 'new')
+              summaryDiv.setAttribute('data-diff-kind', 'block')
+              summaryDiv.setAttribute('style', 'margin: 1em 0; padding: 1em; border-left: 4px solid var(--accent); background: #e3f2fd;')
+              
+              const summaryTitle = doc.createElement('h3')
+              summaryTitle.textContent = '摘要'
+              summaryTitle.setAttribute('style', 'margin: 0 0 0.5em 0; color: #1976d2;')
+              summaryDiv.appendChild(summaryTitle)
+              
+              const summaryPara = doc.createElement('p')
+              summaryPara.textContent = summaryContent
+              summaryPara.setAttribute('style', 'margin: 0; line-height: 1.6;')
+              summaryDiv.appendChild(summaryPara)
+              
+              if (position === 'start') {
+                doc.body.insertBefore(summaryDiv, doc.body.firstChild)
+              } else {
+                doc.body.appendChild(summaryDiv)
+              }
+              
+              created.push({
+                id: diffId,
+                kind: 'outline_summary',
+                scope: 'document',
+                summary: '插入摘要',
+                afterPreview: summaryContent.slice(0, 100),
+                stats: { matches: 1 },
+                timestamp: Date.now(),
+                meta: { op },
+              })
+            }
+            continue
+          }
+        }
+
+        // template_fill - 模板智能填充
+        if (type === 'template_fill') {
+          const diffId = genId()
+          const action = String(op.params?.action || 'detect_placeholders')
+          
+          // 占位符模式：{{xxx}}, 【xxx】, [xxx], ___, <xxx>
+          const placeholderPatterns = [
+            /\{\{([^}]+)\}\}/g,           // {{公司名称}}
+            /【([^】]+)】/g,               // 【日期】
+            /\[([^\]]+)\]/g,              // [姓名]
+            /_{3,}/g,                      // ___
+            /<([^>]+)>/g,                  // <地址>
+          ]
+          
+          if (action === 'detect_placeholders') {
+            // 检测所有占位符
+            const plainText = doc.body.innerHTML
+            const foundPlaceholders: Array<{ pattern: string; text: string; count: number }> = []
+            
+            for (const pattern of placeholderPatterns) {
+              const matches = plainText.match(pattern) || []
+              if (matches.length > 0) {
+                const uniqueMatches = [...new Set(matches)]
+                uniqueMatches.forEach(m => {
+                  const count = matches.filter(x => x === m).length
+                  foundPlaceholders.push({ pattern: pattern.source, text: m, count })
+                })
+              }
+            }
+            
+            created.push({
+              id: diffId,
+              kind: 'template_fill',
+              scope: 'document',
+              summary: `检测到 ${foundPlaceholders.length} 个占位符`,
+              afterPreview: foundPlaceholders.map(p => `${p.text} (${p.count}处)`).join(', ').slice(0, 150),
+              stats: { matches: foundPlaceholders.length },
+              timestamp: Date.now(),
+              meta: { op, placeholders: foundPlaceholders },
+            })
+            continue
+          }
+
+          if (action === 'detect_fields') {
+            const fields = detectTemplateFields(doc)
+            created.push({
+              id: diffId,
+              kind: 'template_fill',
+              scope: 'document',
+              summary: `检测到 ${fields.length} 个候选字段`,
+              afterPreview: fields
+                .slice(0, 6)
+                .map(f => `${f.label}${f.path ? `(${f.path})` : ''}`)
+                .join('，')
+                .slice(0, 120),
+              stats: { matches: fields.length },
+              timestamp: Date.now(),
+              meta: { op, fields },
+            })
+            continue
+          }
+
+          if (action === 'apply' || action === 'apply_fields') {
+            let assignments: Array<{
+              fieldId?: string
+              label?: string
+              value?: string
+              path?: string
+              oldValue?: string
+              fieldType?: string
+            }> = []
+            const raw = op.params?.assignments
+            if (Array.isArray(raw)) {
+              assignments = raw as Array<{
+                fieldId?: string
+                label?: string
+                value?: string
+                path?: string
+                oldValue?: string
+                fieldType?: string
+              }>
+            } else if (typeof raw === 'string') {
+              try {
+                assignments = JSON.parse(raw)
+              } catch {
+                assignments = []
+              }
+            }
+
+            const blocks = Array.from(doc.body.querySelectorAll<HTMLElement>('p,h1,h2,h3,h4,h5,h6'))
+            const tables = Array.from(doc.body.querySelectorAll<HTMLTableElement>('table'))
+            const fields = detectTemplateFields(doc, 200)
+            const fieldsById = new Map(fields.map((f) => [f.id, f]))
+            let appliedCount = 0
+            const skipped: Array<{ fieldId?: string; label?: string; reason: string }> = []
+            const warnings: string[] = []
+
+            const validateFieldValue = (fieldType: string, value: string) => {
+              if (!fieldType || !value) return true
+              const v = value.trim()
+              if (fieldType === 'date') {
+                return /\d{4}[./\-年]\d{1,2}[./\-月]?\d{0,2}日?/.test(v)
+              }
+              if (fieldType === 'amount') {
+                return /[\d,.]+/.test(v)
+              }
+              if (fieldType === 'phone') {
+                return /[0-9]{6,}/.test(v)
+              }
+              if (fieldType === 'email') {
+                return /@/.test(v)
+              }
+              if (fieldType === 'id') {
+                return /[0-9A-Za-z]{4,}/.test(v)
+              }
+              return true
+            }
+
+            const resolveCellByPath = (path?: string) => {
+              if (!path) return null
+              const m = path.match(/table\[(\d+)\]\/r\[(\d+)\]\/c\[(\d+)\]/i)
+              if (!m) return null
+              const tableIndex = parseInt(m[1], 10) - 1
+              const rowIndex = parseInt(m[2], 10) - 1
+              const colIndex = parseInt(m[3], 10) - 1
+              const table = tables[tableIndex]
+              const row = table?.querySelectorAll('tr')?.[rowIndex]
+              const cell = row?.querySelectorAll<HTMLElement>('th,td')?.[colIndex]
+              return cell || null
+            }
+
+            const resolveBlockByPath = (path?: string) => {
+              if (!path) return null
+              const seg = path.split('/').pop() || path
+              const m = seg.match(/(p|h[1-6])\[(\d+)\]/i)
+              if (!m) return null
+              const tag = m[1].toLowerCase()
+              const idx = parseInt(m[2], 10) - 1
+              if (Number.isNaN(idx) || idx < 0) return null
+              const list = Array.from(doc.body.querySelectorAll<HTMLElement>(tag))
+              return list[idx] || null
+            }
+
+            const applyByLabel = (label: string, value: string, diffIdForFill: string, oldValue?: string) => {
+              const labelText = label.trim()
+              if (!labelText) return false
+              const target = blocks.find((b) => {
+                const text = normalizeText(b.textContent || '')
+                return text.includes(labelText)
+              })
+              if (!target) return false
+              if (oldValue) {
+                const text = normalizeText(target.textContent || '')
+                if (!text.includes(oldValue)) return false
+              }
+              applyTemplateValueToElement(target, value, diffIdForFill, oldValue)
+              return true
+            }
+
+            for (const item of assignments) {
+              const value = (item.value || '').toString().trim()
+              if (!value) continue
+              const fieldId = (item.fieldId || '').toString().trim()
+              let applied = false
+              const itemDiffId = genId()
+              const fieldInfo = fieldId ? fieldsById.get(fieldId) : undefined
+              const resolvedPath = item.path || fieldInfo?.path || (fieldInfo?.meta as any)?.path
+              const oldValue = (item.oldValue || fieldInfo?.currentValue || '').toString().trim()
+              const fieldType = (item.fieldType || fieldInfo?.fieldType || '').toString().trim()
+
+              if (fieldType && !validateFieldValue(fieldType, value)) {
+                warnings.push(`${item.label || fieldId || resolvedPath || '字段'} 的值可能不符合类型(${fieldType})`)
+              }
+
+              if (fieldId.startsWith('p:')) {
+                const parts = fieldId.split(':')
+                const index = parseInt(parts[1], 10)
+                if (!Number.isNaN(index) && blocks[index]) {
+                  if (!oldValue || normalizeText(blocks[index].textContent || '').includes(oldValue)) {
+                    applyTemplateValueToElement(blocks[index], value, itemDiffId, oldValue)
+                    applied = true
+                  }
+                }
+              } else if (fieldId.startsWith('t:')) {
+                const parts = fieldId.split(':')
+                const tableIndex = parseInt(parts[1], 10)
+                const rowIndex = parseInt(parts[3], 10)
+                const colIndex = parseInt(parts[5], 10)
+                const table = tables[tableIndex]
+                const row = table?.querySelectorAll('tr')?.[rowIndex]
+                const cell = row?.querySelectorAll<HTMLElement>('th,td')?.[colIndex]
+                if (cell) {
+                  if (!oldValue || normalizeText(cell.textContent || '').includes(oldValue)) {
+                    applyTemplateValueToElement(cell, value, itemDiffId, oldValue)
+                    applied = true
+                  }
+                }
+              } else if (resolvedPath) {
+                const cell = resolveCellByPath(resolvedPath)
+                if (cell) {
+                  if (!oldValue || normalizeText(cell.textContent || '').includes(oldValue)) {
+                    applyTemplateValueToElement(cell, value, itemDiffId, oldValue)
+                    applied = true
+                  }
+                } else {
+                  const block = resolveBlockByPath(resolvedPath)
+                  if (block) {
+                    if (!oldValue || normalizeText(block.textContent || '').includes(oldValue)) {
+                      applyTemplateValueToElement(block, value, itemDiffId, oldValue)
+                      applied = true
+                    }
+                  }
+                }
+              }
+
+              if (!applied && item.label) {
+                applied = applyByLabel(item.label, value, itemDiffId, oldValue)
+              }
+
+              if (applied) {
+                appliedCount += 1
+                created.push({
+                  id: itemDiffId,
+                  kind: 'template_fill',
+                  scope: 'document',
+                  summary: `填写 ${item.label || fieldId || '字段'}`,
+                  beforePreview: item.label || fieldId,
+                  afterPreview: value.slice(0, 80),
+                  stats: { matches: 1 },
+                  timestamp: Date.now(),
+                  meta: { op, fieldId, label: item.label, path: resolvedPath },
+                })
+              } else {
+                skipped.push({
+                  fieldId,
+                  label: item.label,
+                  reason: resolvedPath ? '未匹配到定位路径或旧值不一致' : '未匹配到字段',
+                })
+              }
+            }
+
+            if (appliedCount > 0) {
+              html = doc.body.innerHTML
+            }
+
+            templateFillReport = {
+              applied: appliedCount,
+              skipped: skipped.length,
+              warnings: warnings.length,
+            }
+
+            if (skipped.length > 0) {
+              created.push({
+                id: diffId,
+                kind: 'template_fill',
+                scope: 'document',
+                summary: `未匹配 ${skipped.length} 项字段`,
+                afterPreview: skipped.slice(0, 6).map((s) => s.label || s.fieldId || '字段').join('，'),
+                stats: { matches: 0 },
+                timestamp: Date.now(),
+                meta: { op, skipped },
+              })
+            }
+
+            if (warnings.length > 0) {
+              created.push({
+                id: genId(),
+                kind: 'template_fill',
+                scope: 'document',
+                summary: `字段类型校验提示 ${warnings.length} 条`,
+                afterPreview: warnings.slice(0, 4).join('；'),
+                stats: { matches: 0 },
+                timestamp: Date.now(),
+                meta: { op, warnings },
+              })
+            }
+
+            continue
+          }
+          
+          if (action === 'fill_single' || action === 'fill_all') {
+            // 填充占位符
+            const placeholder = String(op.params?.placeholder || '')
+            const value = String(op.params?.value || '')
+            
+            if (placeholder && value) {
+              let htmlContent = doc.body.innerHTML
+              const escapedPlaceholder = placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+              const regex = new RegExp(escapedPlaceholder, 'g')
+              const matches = htmlContent.match(regex) || []
+              
+              if (matches.length > 0) {
+                // 创建带高亮的替换
+                const highlightedValue = `<span style="background-color: #c8e6c9; padding: 0 2px;" data-diff-id="${diffId}" data-diff-role="new">${value}</span>`
+                htmlContent = htmlContent.replace(regex, highlightedValue)
+                doc.body.innerHTML = htmlContent
+                
+                created.push({
+                  id: diffId,
+                  kind: 'template_fill',
+                  scope: 'document',
+                  summary: `填充「${placeholder}」→「${value}」`,
+                  beforePreview: placeholder,
+                  afterPreview: value,
+                  stats: { matches: matches.length },
+                  timestamp: Date.now(),
+                  meta: { op },
+                })
+              }
+            }
+            continue
+          }
+        }
+
+        // citation_footnote - 引用/脚注管理
+        if (type === 'citation_footnote') {
+          const diffId = genId()
+          const action = String(op.params?.action || 'insert_footnote')
+          
+          if (action === 'insert_footnote' || action === 'insert_endnote') {
+            const content = String(op.params?.content || '')
+            const anchorText = String(op.params?.anchorText || op.target?.text || '')
+            
+            if (content) {
+              // 查找现有脚注数量
+              const existingNotes = doc.body.querySelectorAll('.footnote-ref, .endnote-ref')
+              const noteNumber = existingNotes.length + 1
+              const isEndnote = action === 'insert_endnote'
+              const noteClass = isEndnote ? 'endnote' : 'footnote'
+              
+              // 在锚点文本后插入脚注引用
+              if (anchorText) {
+                const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, null)
+                let node: Node | null
+                while ((node = walker.nextNode())) {
+                  if (node.textContent?.includes(anchorText)) {
+                    const text = node.textContent
+                    const idx = text.indexOf(anchorText)
+                    const before = text.slice(0, idx + anchorText.length)
+                    const after = text.slice(idx + anchorText.length)
+                    
+                    const span = doc.createElement('span')
+                    span.innerHTML = `${before}<sup class="${noteClass}-ref" style="color: #1976d2; cursor: pointer;" data-note-id="${noteNumber}">[${noteNumber}]</sup>${after}`
+                    node.parentNode?.replaceChild(span, node)
+                    break
+                  }
+                }
+              }
+              
+              // 创建脚注/尾注内容区
+              let notesContainer = doc.body.querySelector(`.${noteClass}-container`)
+              if (!notesContainer) {
+                notesContainer = doc.createElement('div')
+                notesContainer.className = `${noteClass}-container`
+                notesContainer.setAttribute('style', 'margin-top: 2em; padding-top: 1em; border-top: 1px solid var(--word-rule);')
+                
+                const title = doc.createElement('h4')
+                title.textContent = isEndnote ? '尾注' : '脚注'
+                title.setAttribute('style', 'margin: 0 0 0.5em 0; color: #666;')
+                notesContainer.appendChild(title)
+                
+                doc.body.appendChild(notesContainer)
+              }
+              
+              // 添加脚注内容
+              const noteItem = doc.createElement('p')
+              noteItem.className = `${noteClass}-item`
+              noteItem.setAttribute('data-diff-id', diffId)
+              noteItem.setAttribute('data-diff-role', 'new')
+              noteItem.setAttribute('data-diff-kind', 'block')
+              noteItem.setAttribute('style', 'margin: 0.3em 0; font-size: 0.9em; color: #555;')
+              noteItem.innerHTML = `<sup style="color: #1976d2;">[${noteNumber}]</sup> ${content}`
+              notesContainer.appendChild(noteItem)
+              
+              created.push({
+                id: diffId,
+                kind: 'citation_footnote',
+                scope: 'document',
+                summary: `插入${isEndnote ? '尾注' : '脚注'} [${noteNumber}]`,
+                afterPreview: content.slice(0, 80),
+                stats: { matches: 1 },
+                timestamp: Date.now(),
+                meta: { op, noteNumber },
+              })
+            }
+            continue
+          }
+          
+          if (action === 'add_citation') {
+            // 添加引用
+            const source = op.params?.source as { type?: string; title?: string; author?: string; year?: string; url?: string } | undefined
+            const format = String(op.params?.format || 'gb7714')
+            
+            if (source?.title) {
+              // 查找现有引用数量
+              const existingCitations = doc.body.querySelectorAll('.citation-ref')
+              const citationNumber = existingCitations.length + 1
+              
+              // 格式化引用文本
+              let citationText = ''
+              if (format === 'gb7714') {
+                // GB/T 7714 格式
+                if (source.author) citationText += `${source.author}. `
+                citationText += `${source.title}`
+                if (source.year) citationText += `[${source.type === 'website' ? 'EB/OL' : source.type === 'article' ? 'J' : 'M'}]. ${source.year}`
+                if (source.url) citationText += `. ${source.url}`
+              } else if (format === 'apa') {
+                // APA 格式
+                if (source.author) citationText += `${source.author} `
+                if (source.year) citationText += `(${source.year}). `
+                citationText += `${source.title}.`
+                if (source.url) citationText += ` Retrieved from ${source.url}`
+              } else {
+                // MLA 格式
+                if (source.author) citationText += `${source.author}. `
+                citationText += `"${source.title}."`
+                if (source.year) citationText += ` ${source.year}.`
+              }
+              
+              // 创建或获取参考文献区
+              let bibContainer = doc.body.querySelector('.bibliography-container')
+              if (!bibContainer) {
+                bibContainer = doc.createElement('div')
+                bibContainer.className = 'bibliography-container'
+                bibContainer.setAttribute('style', 'margin-top: 2em; padding-top: 1em; border-top: 2px solid #333;')
+                
+                const title = doc.createElement('h3')
+                title.textContent = '参考文献'
+                title.setAttribute('style', 'margin: 0 0 1em 0;')
+                bibContainer.appendChild(title)
+                
+                doc.body.appendChild(bibContainer)
+              }
+              
+              // 添加引用条目
+              const bibItem = doc.createElement('p')
+              bibItem.className = 'bibliography-item'
+              bibItem.setAttribute('data-diff-id', diffId)
+              bibItem.setAttribute('data-diff-role', 'new')
+              bibItem.setAttribute('data-diff-kind', 'block')
+              bibItem.setAttribute('style', 'margin: 0.5em 0; text-indent: -2em; padding-left: 2em;')
+              bibItem.innerHTML = `[${citationNumber}] ${citationText}`
+              bibContainer.appendChild(bibItem)
+              
+              created.push({
+                id: diffId,
+                kind: 'citation_footnote',
+                scope: 'document',
+                summary: `添加引用 [${citationNumber}]`,
+                afterPreview: citationText.slice(0, 80),
+                stats: { matches: 1 },
+                timestamp: Date.now(),
+                meta: { op, citationNumber },
+              })
+            }
+            continue
+          }
+          
+          if (action === 'generate_bibliography') {
+            // 生成参考文献（如果已有引用，整理格式）
+            const bibContainer = doc.body.querySelector('.bibliography-container')
+            if (bibContainer) {
+              // 重新编号所有引用
+              const items = bibContainer.querySelectorAll('.bibliography-item')
+              items.forEach((item, index) => {
+                const text = item.textContent || ''
+                const cleanText = text.replace(/^\[\d+\]\s*/, '')
+                item.innerHTML = `[${index + 1}] ${cleanText}`
+              })
+              
+              created.push({
+                id: diffId,
+                kind: 'citation_footnote',
+                scope: 'document',
+                summary: `整理参考文献（${items.length} 条）`,
+                afterPreview: `共 ${items.length} 条引用`,
+                stats: { matches: items.length },
+                timestamp: Date.now(),
+                meta: { op },
+              })
+            }
+            continue
+          }
+        }
       }
 
       const newHtml = doc.body.innerHTML
@@ -3696,10 +5806,15 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         setExtraPendingChanges(prev => [...prev, ...created])
       }
 
+      const baseMessage = `已生成修订：${created.length} 条。请在底部或“修订面板”中逐条确认。`
+      const reportMessage = templateFillReport
+        ? `已生成修订：${created.length} 条（填充 ${templateFillReport.applied}，未匹配 ${templateFillReport.skipped}，校验提示 ${templateFillReport.warnings}）。请在底部或“修订面板”中逐条确认。`
+        : baseMessage
+
       return {
         success: true,
-        message: `已生成修订：${created.length} 条。请在底部或“修订面板”中逐条确认。`,
-        data: { created: created.length },
+        message: reportMessage,
+        data: { created: created.length, templateFillReport },
       }
     } catch (e) {
       return { success: false, message: `应用失败: ${(e as Error).message || String(e)}` }
@@ -3853,16 +5968,24 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         docxData,
         excelData,
         pptData,
+        typographyProfile,
         refreshExcelData,
         lastReplacement,
         pendingChanges: [
-          ...pendingReplacements.items.map((item) => ({
+          ...pendingReplacements.items.map((item) => {
+            const stripHtml = (s: string) => (s || '').replace(/<[^>]+>/g, '').trim()
+            const isReview = !!(item.reviewReason || item.reviewType)
+            const typeLabels: Record<string, string> = { grammar: '语法', logic: '逻辑', style: '措辞', typo: '错别字', format: '格式' }
+            const summaryText = isReview
+              ? `[${typeLabels[item.reviewType || 'style'] || item.reviewType}] ${item.reviewReason || '审查修改'}`
+              : `替换 ${item.count} 处`
+            return ({
             id: item.id,
             kind: 'replace_text' as const,
             scope: 'document' as const,
-            summary: `替换 ${item.count} 处`,
-            beforePreview: item.searchText,
-            afterPreview: item.replaceText,
+            summary: summaryText,
+            beforePreview: stripHtml(item.searchText),
+            afterPreview: stripHtml(item.replaceText),
             stats: { matches: item.count },
             timestamp: item.timestamp,
             meta: {
@@ -3870,7 +5993,10 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
               replaceText: item.replaceText,
               count: item.count,
             },
-          })),
+            reviewReason: item.reviewReason,
+            reviewType: item.reviewType,
+            })
+          }),
           ...extraPendingChanges,
         ],
         pendingChangesTotal:
@@ -3885,6 +6011,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         setCurrentFile,
         addFile,
         createNewDocument,
+        createDocumentFromDsl,
         uploadDocxFile,
         saveDocument,
         applyAIEdit,
@@ -3905,6 +6032,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         openFolder,
         openFile,
         saveCurrentFile,
+        silentSaveToFile,
         refreshFiles,
         onlyOfficeReplace,
         onlyOfficeInsert,

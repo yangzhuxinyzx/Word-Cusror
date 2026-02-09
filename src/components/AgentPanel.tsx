@@ -49,7 +49,7 @@ function getStepIcon(type: AgentStep['type'], status: AgentStep['status']) {
     return <Loader2 className="w-4 h-4 text-primary animate-spin" />
   }
   if (status === 'completed') {
-    return <CheckCircle2 className="w-4 h-4 text-green-400" />
+    return <CheckCircle2 className="w-4 h-4 text-success" />
   }
   if (status === 'error') {
     return <Circle className="w-4 h-4 text-red-400" />
@@ -89,21 +89,21 @@ export default function AgentPanel({
   const runningStep = steps.find(s => s.status === 'running')
 
   return (
-    <div className="border-t border-border bg-gradient-to-b from-surface/80 to-surface/50 animate-enter">
+    <div className="border-t border-border glass animate-enter">
       {/* 当前操作状态栏 */}
       {(thinkingTime > 0 || currentAction) && (
-        <div className="px-4 py-2.5 border-b border-border/50 flex items-center justify-between">
+        <div className="px-4 py-2.5 border-b border-border flex items-center justify-between">
           <div className="flex items-center gap-2">
             <div className="relative">
-              <Sparkles className="w-4 h-4 text-violet-400" />
-              <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-violet-400 rounded-full animate-pulse" />
+              <Sparkles className="w-4 h-4 text-accent" />
+              <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-accent rounded-full animate-pulse" />
             </div>
             <span className="text-sm font-medium text-text">
               {currentAction || 'AI 正在处理...'}
             </span>
           </div>
           {thinkingTime > 0 && (
-            <div className="flex items-center gap-1.5 text-xs text-text-muted bg-background/50 px-2 py-1 rounded-md">
+            <div className="flex items-center gap-1.5 text-xs text-text-muted bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 px-2 py-1 rounded-md">
               <Clock className="w-3 h-3" />
               <span>{thinkingTime}s</span>
             </div>
@@ -113,10 +113,10 @@ export default function AgentPanel({
 
       {/* 步骤列表 */}
       {steps.length > 0 && (
-        <div className="border-b border-border/50">
+        <div className="border-b border-border">
           <button
             onClick={() => setIsStepsExpanded(!isStepsExpanded)}
-            className="w-full px-4 py-2.5 flex items-center justify-between hover:bg-surface-hover/50 transition-colors"
+            className="w-full px-4 py-2.5 flex items-center justify-between hover:bg-surface-hover transition-colors"
           >
             <div className="flex items-center gap-2">
               {isStepsExpanded ? (
@@ -125,12 +125,12 @@ export default function AgentPanel({
                 <ChevronRight className="w-3.5 h-3.5 text-text-muted" />
               )}
               <span className="text-xs font-medium text-text">执行步骤</span>
-              <span className="text-[10px] text-text-dim bg-background/50 px-1.5 py-0.5 rounded">
+              <span className="text-[10px] text-text-dim bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 px-1.5 py-0.5 rounded">
                 {completedSteps}/{steps.length}
               </span>
             </div>
             {runningStep && (
-              <div className="flex items-center gap-1.5 text-xs text-violet-400">
+              <div className="flex items-center gap-1.5 text-xs text-accent">
                 <Loader2 className="w-3 h-3 animate-spin" />
                 <span className="truncate max-w-[180px]">{runningStep.description}</span>
               </div>
@@ -143,7 +143,7 @@ export default function AgentPanel({
                 <div 
                   key={step.id} 
                   className={`flex items-start gap-2.5 py-1.5 px-2 rounded-md transition-colors ${
-                    step.status === 'running' ? 'bg-violet-500/10' : 'hover:bg-surface-hover/30'
+                    step.status === 'running' ? 'bg-accent/10' : 'hover:bg-surface-hover'
                   }`}
                 >
                   <div className="mt-0.5">
@@ -180,7 +180,7 @@ export default function AgentPanel({
         <div>
           <button
             onClick={() => setIsFilesExpanded(!isFilesExpanded)}
-            className="w-full px-4 py-2.5 flex items-center gap-2 hover:bg-surface-hover/50 transition-colors"
+            className="w-full px-4 py-2.5 flex items-center gap-2 hover:bg-surface-hover transition-colors"
           >
             {isFilesExpanded ? (
               <ChevronDown className="w-3.5 h-3.5 text-text-muted" />
@@ -188,7 +188,7 @@ export default function AgentPanel({
               <ChevronRight className="w-3.5 h-3.5 text-text-muted" />
             )}
             <span className="text-xs font-medium text-text">文件变更</span>
-            <span className="text-[10px] text-text-dim bg-background/50 px-1.5 py-0.5 rounded">
+            <span className="text-[10px] text-text-dim bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 px-1.5 py-0.5 rounded">
               {fileChanges.length} 个文件
             </span>
           </button>
@@ -199,15 +199,15 @@ export default function AgentPanel({
                 <div 
                   key={index} 
                   className={`py-2 px-2.5 rounded-lg transition-colors ${
-                    file.status === 'writing' ? 'bg-violet-500/10 border border-violet-500/20' : 'hover:bg-surface-hover/30'
+                    file.status === 'writing' ? 'bg-accent/10 border border-accent/20' : 'hover:bg-surface-hover'
                   }`}
                 >
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       {file.status === 'writing' ? (
-                        <Loader2 className="w-4 h-4 text-violet-400 animate-spin" />
+                        <Loader2 className="w-4 h-4 text-accent animate-spin" />
                       ) : file.status === 'done' ? (
-                        <CheckCircle2 className="w-4 h-4 text-green-400" />
+                        <CheckCircle2 className="w-4 h-4 text-success" />
                       ) : (
                         <FileText className="w-4 h-4 text-text-dim" />
                       )}
@@ -220,7 +220,7 @@ export default function AgentPanel({
                     </div>
                     <div className="flex items-center gap-2 text-xs font-mono">
                       {file.additions > 0 && (
-                        <span className="text-green-400 bg-green-500/10 px-1.5 py-0.5 rounded">
+                        <span className="text-success bg-success/10 px-1.5 py-0.5 rounded">
                           +{file.additions}
                         </span>
                       )}

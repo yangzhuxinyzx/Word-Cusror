@@ -1,31 +1,212 @@
+/* Google Fonts - @import must come first */
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=Sora:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Noto+Sans+SC:wght@300;400;500;600;700&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
+  /* 默认主题由 src/utils/theme.ts 写入 data-theme；此处给出兜底值（dark） */
   color-scheme: dark;
+
+  /* macOS 风格：低饱和中性色 + system blue 作为主强调 */
+  --accent: #0a84ff;        /* macOS system blue */
+  --accent-rgb: 10 132 255;
+  --accent-hover: #007aff;
+  --accent-hover-rgb: 0 122 255;
+  --accent-soft: rgba(10, 132, 255, 0.12);
+  --accent-glow: rgba(10, 132, 255, 0.18);
+
+  /* 兼容现有 Tailwind token：primary/accent/highlight 仍引用这些变量 */
+  --sage: var(--accent);
+  --lavender: #bf5af2;      /* system purple（少量点缀） */
+  --lavender-rgb: 191 90 242;
+  --peach: #ff9f0a;         /* system orange（少量点缀） */
+  --peach-rgb: 255 159 10;
+  --rose: #ff375f;          /* system pink/red */
+  --rose-rgb: 255 55 95;
+  --cream: #ffd60a;         /* system yellow */
+  --cream-rgb: 255 214 10;
+
+  /* 额外的系统点缀色（用于 Finder 风格图标） */
+  --teal: #64d2ff;
+  --teal-rgb: 100 210 255;
+  --system-gray: #8e8e93;
+  --system-gray-rgb: 142 142 147;
+
+  /* macOS 壁纸风格主色（再降饱和：更“Graphite”，避免背景把 UI 染色） */
+  --wallpaper-warm-rgb: 145 120 255;  /* muted periwinkle */
+  --wallpaper-cool-rgb: 70 145 255;   /* muted blue */
+  --wallpaper-teal-rgb: 90 205 255;   /* soft cyan */
+  --wallpaper-vignette-top: rgb(0 0 0 / 0.00);
+  --wallpaper-vignette-bottom: rgb(0 0 0 / 0.10);
+
+  /* 状态色（macOS system） */
+  --success: #34c759;
+  --success-rgb: 52 199 89;
+  --warning: var(--peach);
+  --warning-rgb: 255 159 10;
+  --danger: #ff3b30;
+  --danger-rgb: 255 59 48;
+
+  --sage-soft: var(--accent-soft);
+  --sage-glow: var(--accent-glow);
+  --lavender-soft: rgba(191, 90, 242, 0.14);
+  --lavender-glow: rgba(191, 90, 242, 0.18);
+  --peach-soft: rgba(255, 159, 10, 0.14);
+  --peach-glow: rgba(255, 159, 10, 0.18);
+  --cream-soft: rgba(255, 214, 10, 0.14);
+  --cream-glow: rgba(255, 214, 10, 0.18);
+  --rose-soft: rgba(255, 55, 95, 0.14);
+
+  /* 文字色（由主题覆盖） */
+  --text-primary: rgba(255, 255, 255, 0.92);
+  --text-secondary: rgba(235, 235, 245, 0.72);
+  --text-muted: rgba(235, 235, 245, 0.52);
+  --text-dim: rgba(235, 235, 245, 0.38);
+
+  /* 背景/玻璃（由主题覆盖） */
+  --bg-primary: #0b0c0f;
+  --bg-secondary: #13141a;
+  --bg-elevated: rgba(18, 18, 24, 0.62);
+  --glass-bg: rgba(18, 18, 24, 0.45);
+  --glass-border: rgba(255, 255, 255, 0.10);
+  --glass-highlight: rgba(255, 255, 255, 0.06);
+  --glass-blur: 28px;
+
+  /* Surface tokens（用于 Tailwind 的 bg-surface / bg-surface-hover 等） */
+  --surface: var(--bg-elevated);
+  --surface-hover: rgba(255, 255, 255, 0.06);
+  --surface-active: rgba(255, 255, 255, 0.10);
+
+  /* Border light（用于细分隔线） */
+  --border-light: rgba(255, 255, 255, 0.08);
+  --word-canvas-bg: #1e1e1e;
+  --word-page-bg: #2b2b2b;
+  --word-page-border: rgba(255, 255, 255, 0.08);
+  --word-page-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+  --word-rule: rgba(255, 255, 255, 0.16);
+  --word-ink: rgba(255, 255, 255, 0.9);
+  --word-ink-muted: rgba(255, 255, 255, 0.55);
+  --word-font-family-cn: "DengXian", "SimSun", "Songti SC", "Microsoft YaHei", serif;
+  --word-font-size: 14px; /* 10.5pt @ 96 DPI */
+  --word-line-height: 1.15;
+  --a4-width: 793.7px;  /* 210mm @ 96 DPI */
+  --a4-height: 1122.5px; /* 297mm @ 96 DPI */
+
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  /* 深色：使用高透明黑色遮罩，透出壁纸的“光晕” */
+  --bg-primary: rgba(5, 5, 10, 0.75);
+  --bg-secondary: rgba(20, 20, 25, 0.85);
+  /* 弹窗背景：提高不透明度，增加一点冷灰色调，提升对比度 */
+  --bg-elevated: rgba(35, 36, 40, 0.88);
+  /* 玻璃底：再“实”一点，减少壁纸透色 */
+  --glass-bg: rgba(24, 24, 28, 0.72);
+  /* 边框：稍微调亮，增加清晰度 */
+  --glass-border: rgba(255, 255, 255, 0.14);
+  --glass-highlight: rgba(255, 255, 255, 0.10);
+  --glass-blur: 40px;
+  --text-primary: rgba(255, 255, 255, 0.92);
+  --text-secondary: rgba(235, 235, 245, 0.72);
+  --text-muted: rgba(235, 235, 245, 0.52);
+  --text-dim: rgba(235, 235, 245, 0.38);
+
+  --surface: var(--bg-elevated);
+  --surface-hover: rgba(255, 255, 255, 0.06);
+  --surface-active: rgba(255, 255, 255, 0.10);
+  --border-light: rgba(255, 255, 255, 0.08);
+  --word-canvas-bg: #1c1c1c;
+  --word-page-bg: #2a2a2a;
+  --word-page-border: rgba(255, 255, 255, 0.08);
+  --word-page-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  --word-rule: rgba(255, 255, 255, 0.16);
+  --word-ink: rgba(255, 255, 255, 0.9);
+  --word-ink-muted: rgba(255, 255, 255, 0.55);
+
+
+  --wallpaper-vignette-top: rgb(0 0 0 / 0.32);
+  --wallpaper-vignette-bottom: rgb(0 0 0 / 0.62);
+  
+  /* 壁纸透明度：深色模式更克制，避免左右面板被强烈染色 */
+  --wallpaper-opacity-1: 0.12;
+  --wallpaper-opacity-2: 0.10;
+  --wallpaper-opacity-3: 0.08;
+  --wallpaper-opacity-4: 0.06;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  /* 浅色：极高透明度，让鲜艳壁纸透出来 */
+  --bg-primary: rgba(255, 255, 255, 0.05); /* 几乎全透 */
+  --bg-secondary: rgba(255, 255, 255, 0.65);
+  --bg-elevated: rgba(255, 255, 255, 0.45);
+  --glass-bg: rgba(255, 255, 255, 0.28); /* 强磨砂，高透 */
+  --glass-border: rgba(255, 255, 255, 0.40);
+  --glass-highlight: rgba(255, 255, 255, 0.60);
+  --glass-blur: 30px;
+  --text-primary: rgba(0, 0, 0, 0.88);
+  --text-secondary: rgba(0, 0, 0, 0.65);
+  --text-muted: rgba(0, 0, 0, 0.45);
+  --text-dim: rgba(0, 0, 0, 0.30);
+
+  --surface: var(--bg-elevated);
+  --surface-hover: rgba(255, 255, 255, 0.20);
+  --surface-active: rgba(255, 255, 255, 0.30);
+  --border-light: rgba(0, 0, 0, 0.05);
+  --word-canvas-bg: #f2f2f2;
+  --word-page-bg: #ffffff;
+  --word-page-border: rgba(0, 0, 0, 0.12);
+  --word-page-shadow: 0 10px 28px rgba(0, 0, 0, 0.12);
+  --word-rule: rgba(0, 0, 0, 0.2);
+  --word-ink: rgba(0, 0, 0, 0.9);
+  --word-ink-muted: rgba(0, 0, 0, 0.55);
+
+
+  --wallpaper-vignette-top: rgb(255 255 255 / 0.20);
+  --wallpaper-vignette-bottom: rgb(255 255 255 / 0.00);
+  
+  /* 壁纸透明度：浅色模式也更克制（避免像“彩色壁纸 app”） */
+  --wallpaper-opacity-1: 0.50;
+  --wallpaper-opacity-2: 0.40;
+  --wallpaper-opacity-3: 0.32;
+  --wallpaper-opacity-4: 0.26;
 }
 
 body {
   @apply bg-background text-text font-sans antialiased overflow-hidden;
+  /* macOS Vibrant Wallpaper: Light=Bright/Vivid, Dark=Dimmed/Glow */
+  background:
+    radial-gradient(1200px circle at 18% 12%, rgb(var(--wallpaper-warm-rgb) / var(--wallpaper-opacity-1)) 0%, transparent 58%),
+    radial-gradient(1200px circle at 82% 18%, rgb(var(--wallpaper-cool-rgb) / var(--wallpaper-opacity-2)) 0%, transparent 62%),
+    radial-gradient(950px circle at 88% 88%, rgb(var(--wallpaper-teal-rgb) / var(--wallpaper-opacity-3)) 0%, transparent 55%),
+    radial-gradient(900px circle at 38% 92%, rgb(var(--wallpaper-warm-rgb) / var(--wallpaper-opacity-4)) 0%, transparent 62%),
+    linear-gradient(180deg, var(--wallpaper-vignette-top) 0%, var(--wallpaper-vignette-bottom) 100%),
+    var(--bg-primary);
 }
 
-/* 自定义滚动条 - 极简风格 */
+/* ========================================
+   自定义滚动条 - 极简柔和风格
+   ======================================== */
+
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  @apply bg-transparent;
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  @apply bg-surface-hover rounded-full;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  @apply bg-text-dim;
+  background: rgba(255, 255, 255, 0.15);
 }
 
 /* 基础样式重置与增强 */
@@ -33,87 +214,145 @@ input, textarea, select, button {
   @apply outline-none font-sans;
 }
 
-/* 工具类：毛玻璃效果 */
+/* ========================================
+   Glass Morphism 工具类 - 增强版
+   ======================================== */
+
 .glass {
-  @apply bg-surface/80 backdrop-blur-md border border-white/5;
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(180%);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(180%);
+  border: 1px solid var(--glass-border);
+  box-shadow: 
+    0 14px 40px rgba(0, 0, 0, 0.24),
+    0 1px 0 rgba(0, 0, 0, 0.10),
+    inset 0 1px 0 var(--glass-highlight);
 }
 
-/* 工具类：渐变文字 */
-.text-gradient {
-  @apply bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-violet-400;
+.glass-card {
+  background: linear-gradient(145deg, rgb(255 255 255 / 0.075) 0%, rgb(255 255 255 / 0.03) 100%);
+  backdrop-filter: blur(36px) saturate(180%);
+  -webkit-backdrop-filter: blur(36px) saturate(180%);
+  border: 1px solid var(--glass-border);
+  border-radius: 24px;
+  box-shadow: 
+    0 24px 68px rgba(0, 0, 0, 0.35), /* 加深阴影 */
+    0 1px 0 rgba(0, 0, 0, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1), /* 顶部高光 */
+    inset 0 0 0 1px rgba(255, 255, 255, 0.05); /* 全局微弱内描边 */
 }
 
-/* Word 预览样式覆盖 */
-.word-preview h1 { @apply text-2xl font-bold mb-6 text-gray-900 border-b border-gray-200 pb-2; }
-.word-preview h2 { @apply text-xl font-bold mb-4 mt-8 text-gray-800; }
-.word-preview h3 { @apply text-lg font-semibold mb-3 mt-6 text-gray-800; }
-.word-preview p { @apply mb-4 leading-7 text-gray-700 text-justify; }
-.word-preview ul { @apply list-disc pl-6 mb-4 space-y-1 text-gray-700; }
-.word-preview ol { @apply list-decimal pl-6 mb-4 space-y-1 text-gray-700; }
-.word-preview li { @apply pl-1; }
-.word-preview blockquote { @apply border-l-4 border-indigo-500 pl-4 py-1 my-4 bg-gray-50 text-gray-600 italic; }
-.word-preview code { @apply bg-gray-100 text-indigo-600 px-1.5 py-0.5 rounded font-mono text-sm; }
-.word-preview pre { @apply bg-gray-900 text-gray-100 p-4 rounded-lg mb-4 overflow-x-auto; }
-.word-preview table { @apply w-full border-collapse mb-4; }
-.word-preview th { @apply border border-gray-300 px-4 py-2 bg-gray-50 font-semibold text-left text-gray-900; }
-.word-preview td { @apply border border-gray-300 px-4 py-2 text-gray-700; }
-
-/* 动画工具 */
-.animate-enter {
-  animation: enter 0.2s ease-out;
+.glass-card-soft {
+  background: rgb(255 255 255 / 0.035);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--glass-border);
+  border-radius: 20px;
+  box-shadow: 
+    0 10px 24px rgba(0, 0, 0, 0.10),
+    0 1px 0 rgba(0, 0, 0, 0.05),
+    inset 0 1px 0 var(--glass-highlight);
 }
 
-@keyframes enter {
-  from { opacity: 0; transform: scale(0.98); }
-  to { opacity: 1; transform: scale(1); }
+.glass-panel {
+  background: var(--glass-bg);
+  backdrop-filter: blur(48px) saturate(190%);
+  -webkit-backdrop-filter: blur(48px) saturate(190%);
+  border-right: 1px solid var(--glass-border);
 }
 
-/* 平滑吐字光标动画 - 更自然的闪烁 */
-@keyframes cursor-blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.3; }
+.glass-button {
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-.cursor-blink {
-  animation: cursor-blink 0.8s ease-in-out infinite;
+.glass-button:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgb(var(--accent-rgb) / 0.22);
+  transform: translateY(-0.5px);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.14);
+}
+
+.glass-input {
+  background: rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.glass-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  background: rgba(0, 0, 0, 0.3);
 }
 
 /* ========================================
-   流式文字动画系统 - 按块浮现（类似 ChatGPT/Claude）
+   Orb Decorations - 柔和发光球体
    ======================================== */
 
-/* 
- * 核心思路：不是逐字符动画，而是按"块"做动画
- * 一个块 = 一个词/一个短语/一行内容
- * 每个块整体浮现，动画时长 200-250ms
- */
+/* 已移除 Orb，背景改用 macOS 雾面渐变，此处保留空类名以防组件引用报错，后续可完全清理 */
+.orb, .orb-sage, .orb-lavender, .orb-peach, .orb-cream, .orb-rose {
+  display: none;
+}
 
-/* 块级浮现动画 - 只用 translateY + opacity，不用 scale 避免变形 */
+/* ========================================
+   渐变文字 - 统一为 Accent 风格
+   ======================================== */
+
+.text-gradient, .text-gradient-sage, .text-gradient-lavender, .text-gradient-peach {
+  color: var(--accent);
+  background: none;
+  -webkit-text-fill-color: initial;
+}
+
+/* ========================================
+   动画效果 - 柔和流畅
+   ======================================== */
+
+.animate-enter {
+  animation: enter 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes enter {
+  from { opacity: 0; transform: scale(0.96) translateY(10px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* 平滑吐字光标动画 */
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.cursor-blink {
+  animation: cursor-blink 1s step-end infinite;
+}
+
+/* 块级浮现动画 */
 @keyframes chunk-float-up {
   0% {
     opacity: 0;
     transform: translateY(4px);
-    filter: blur(1.5px);
   }
   100% {
     opacity: 1;
     transform: translateY(0);
-    filter: blur(0);
   }
 }
 
-/* 应用于新增的文字块 */
 .char-enter-active {
   display: inline;
-  animation: chunk-float-up 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-  /* cubic-bezier(0.16, 1, 0.3, 1) = "快出慢停"，非常丝滑 */
+  animation: chunk-float-up 0.2s ease-out forwards;
 }
 
-/* 块级动画 - 用于段落/列表项等 Markdown 块 */
 @keyframes block-slide-in {
   0% {
     opacity: 0;
-    transform: translateY(3px);
+    transform: translateY(4px);
   }
   100% {
     opacity: 1;
@@ -122,24 +361,14 @@ input, textarea, select, button {
 }
 
 .block-enter {
-  animation: block-slide-in 0.22s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  animation: block-slide-in 0.2s ease-out forwards;
 }
 
-/* 流式内容容器 */
-.streaming-chunk {
-  display: contents;
-}
-
-/* 稳定文本 - 无动画 */
-.stable-text {
-  /* 空样式，保持原样 */
-}
-
-/* 消息气泡淡入 + 上浮 */
+/* 消息气泡淡入 */
 @keyframes message-enter {
   from {
     opacity: 0;
-    transform: translateY(8px);
+    transform: translateY(10px);
   }
   to {
     opacity: 1;
@@ -148,138 +377,75 @@ input, textarea, select, button {
 }
 
 .message-enter {
-  animation: message-enter 0.25s ease-out;
+  animation: message-enter 0.3s ease-out;
 }
 
-/* AI 建议高亮背景 - 浅蓝色脉冲 */
+/* AI 建议高亮背景 */
 @keyframes suggestion-pulse {
   0%, 100% {
-    background-color: rgba(59, 130, 246, 0.08);
+    background-color: var(--accent-soft);
   }
   50% {
-    background-color: rgba(59, 130, 246, 0.15);
+    background-color: var(--accent-glow);
   }
 }
 
 .ai-suggestion {
-  background-color: rgba(59, 130, 246, 0.1);
-  border-left: 2px solid rgba(59, 130, 246, 0.5);
+  background-color: var(--accent-soft);
+  border-left: 2px solid var(--accent);
   animation: suggestion-pulse 2s ease-in-out infinite;
 }
 
-/* Accept 后的淡出效果 */
-@keyframes suggestion-accept {
-  from {
-    background-color: rgba(59, 130, 246, 0.1);
-    border-left-color: rgba(59, 130, 246, 0.5);
-  }
-  to {
-    background-color: transparent;
-    border-left-color: transparent;
-  }
-}
-
-.ai-suggestion-accepted {
-  animation: suggestion-accept 0.3s ease-out forwards;
-}
-
-/* 控制条淡入 */
-@keyframes control-bar-enter {
-  from {
-    opacity: 0;
-    transform: translateY(4px) scale(0.95);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-}
-
-.control-bar-enter {
-  animation: control-bar-enter 0.2s ease-out;
-}
-
-/* 控制条淡出 */
-@keyframes control-bar-exit {
-  from {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-  to {
-    opacity: 0;
-    transform: translateY(-4px) scale(0.95);
-  }
-}
-
-.control-bar-exit {
-  animation: control-bar-exit 0.15s ease-in forwards;
-}
-
-/* 打字机光标 - 精致的呼吸效果 */
+/* 打字机光标 */
 @keyframes cursor-breathe {
   0%, 100% { 
     opacity: 1; 
-    transform: scaleY(1);
-    box-shadow: 0 0 8px rgba(139, 92, 246, 0.6), 0 0 2px rgba(139, 92, 246, 0.8);
   }
   50% { 
-    opacity: 0.4; 
-    transform: scaleY(0.9);
-    box-shadow: 0 0 4px rgba(139, 92, 246, 0.3);
+    opacity: 0.5; 
   }
 }
 
 .typing-cursor {
   display: inline-block;
-  width: 2.5px;
+  width: 2px;
   height: 1.15em;
-  background: linear-gradient(180deg, #c4b5fd 0%, #a78bfa 50%, #8b5cf6 100%);
-  border-radius: 2px;
-  margin-left: 2px;
+  background: var(--accent);
+  margin-left: 1px;
   vertical-align: text-bottom;
   animation: cursor-breathe 1s ease-in-out infinite;
-  transform-origin: center bottom;
-}
-
-/* 流式内容容器 - 平滑高度变化 */
-.streaming-container {
-  transition: height 0.2s cubic-bezier(0.25, 0.1, 0.25, 1);
-  overflow: visible; /* 允许动画溢出 */
 }
 
 /* ========================================
-   Cinematic Typer（光学模糊打字机）
+   Cinematic Typer
    ======================================== */
+
 @keyframes cinematic-focus {
   0% {
-    filter: blur(4px);
     opacity: 0;
-    transform: scale(0.95);
   }
   100% {
-    filter: blur(0);
     opacity: 1;
-    transform: scale(1);
   }
 }
 
 .cinematic-typer {
-  font-family: 'Merriweather', 'Geist Mono', 'SFMono-Regular', 'Microsoft YaHei', serif;
+  font-family: 'Plus Jakarta Sans', 'Noto Sans SC', sans-serif;
   font-size: 13px;
   line-height: 1.6;
   white-space: pre-wrap;
   letter-spacing: 0.01em;
-  color: #dcdcdc;
+  color: var(--text-primary);
 }
 
 .cinematic-thinking {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
   margin-bottom: 4px;
   opacity: 0.85;
   font-size: 12px;
-  color: #9ca3af;
+  color: var(--text-muted);
 }
 
 .cinematic-thinking span {
@@ -287,278 +453,35 @@ input, textarea, select, button {
   width: 4px;
   height: 4px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #a78bfa, #7c3aed);
-  animation: cinematic-thinking-pulse 1s ease-in-out infinite;
+  background: var(--text-muted);
+  animation: cinematic-thinking-pulse 1.2s ease-in-out infinite;
 }
 
-.cinematic-thinking span:nth-child(2) { animation-delay: 0.1s; }
-.cinematic-thinking span:nth-child(3) { animation-delay: 0.2s; }
-
-.cinematic-thinking-text {
-  margin-left: 4px;
-}
+.cinematic-thinking span:nth-child(2) { animation-delay: 0.15s; }
+.cinematic-thinking span:nth-child(3) { animation-delay: 0.3s; }
 
 @keyframes cinematic-thinking-pulse {
   0%, 100% { opacity: 0.3; transform: scale(0.8); }
-  50%      { opacity: 1;   transform: scale(1);   }
+  50%      { opacity: 1;   transform: scale(1.1);   }
 }
 
 .cinematic-char {
   display: inline;
-  animation: cinematic-focus 0.3s ease-out forwards;
-  will-change: filter, transform;
+  animation: cinematic-focus 0.15s ease-out forwards;
 }
 
-/* Word 风格的文字选中效果 - 浅灰色半透明背景，白色文字 */
-.word-editor-content ::selection {
-  background-color: rgba(0, 0, 0, 0.15);
-  color: inherit;
-}
+/* ========================================
+   Diff 高亮样式
+   ======================================== */
 
-.word-editor-content ::-moz-selection {
-  background-color: rgba(0, 0, 0, 0.15);
-  color: inherit;
-}
-
-/* ========== 专业排版格式支持 ========== */
-
-/* 段落格式 - 支持首行缩进、行距、段前段后 */
-.word-editor-content p,
-.word-editor-content h1,
-.word-editor-content h2,
-.word-editor-content h3,
-.word-editor-content h4,
-.word-editor-content h5,
-.word-editor-content h6 {
-  /* 允许内联样式覆盖 */
-  margin: 0;
-  padding: 0;
-}
-
-/* 默认段落样式 */
-.word-editor-content p {
-  text-indent: 2em;
-  line-height: 1.8;
-  margin-bottom: 0.5em;
-}
-
-/* 标题默认不缩进 */
-.word-editor-content h1,
-.word-editor-content h2,
-.word-editor-content h3 {
-  text-indent: 0 !important;
-  font-weight: bold;
-}
-
-.word-editor-content h1 {
-  font-size: 22pt;
-  line-height: 1.5;
-  margin: 24pt 0 12pt 0;
-}
-
-.word-editor-content h2 {
-  font-size: 16pt;
-  line-height: 1.5;
-  margin: 18pt 0 9pt 0;
-}
-
-.word-editor-content h3 {
-  font-size: 14pt;
-  line-height: 1.5;
-  margin: 12pt 0 6pt 0;
-}
-
-/* 删除线 */
-.word-editor-content s,
-.word-editor-content del,
-.word-editor-content strike {
-  text-decoration: line-through;
-  color: inherit;
-}
-
-/* 上标下标 */
-.word-editor-content sup {
-  vertical-align: super;
-  font-size: 0.75em;
-  line-height: 0;
-}
-
-.word-editor-content sub {
-  vertical-align: sub;
-  font-size: 0.75em;
-  line-height: 0;
-}
-
-/* 字符间距 - 通过 style 属性设置 letter-spacing */
-
-/* 引用块样式 */
-.word-editor-content blockquote {
-  margin: 1em 2em;
-  padding: 0.5em 1em;
-  border-left: 4px solid #ddd;
-  background: #f9f9f9;
-  font-style: italic;
-  color: #666;
-}
-
-/* 分栏布局 */
-.word-editor-content .column-layout {
-  column-gap: 2em;
-}
-
-.word-editor-content .column-layout p {
-  break-inside: avoid;
-}
-
-/* 目录样式 */
-.word-editor-content .table-of-contents {
-  margin: 1.5em 0;
-  padding: 1em 1.5em;
-  border: 1px solid #e0e0e0;
-  background: #fafafa;
-  border-radius: 4px;
-}
-
-.word-editor-content .table-of-contents h2 {
-  font-size: 16pt;
-  margin: 0 0 0.5em 0;
-  padding-bottom: 0.5em;
-  border-bottom: 1px solid #e0e0e0;
-}
-
-.word-editor-content .table-of-contents ul {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-}
-
-.word-editor-content .table-of-contents li {
-  margin: 0.3em 0;
-  line-height: 1.6;
-}
-
-.word-editor-content .table-of-contents a {
-  color: #1976d2;
-  text-decoration: none;
-  transition: color 0.2s;
-}
-
-.word-editor-content .table-of-contents a:hover {
-  color: #1565c0;
-  text-decoration: underline;
-}
-
-/* 水印样式 */
-.word-editor-content .document-watermark {
-  position: fixed !important;
-  pointer-events: none;
-  user-select: none;
-  z-index: 1000;
-}
-
-/* 分页符样式 */
-.word-editor-content .page-break {
-  page-break-before: always;
-  border-top: 2px dashed #ccc;
-  margin: 24px 0;
-  padding: 12px 0;
-  text-align: center;
-  color: #999;
-  font-size: 12px;
-  background: linear-gradient(to bottom, #f5f5f5, transparent);
-}
-
-/* 表格样式增强 */
-.word-editor-content table {
-  border-collapse: collapse;
-  width: 100%;
-  margin: 1em 0;
-}
-
-.word-editor-content th,
-.word-editor-content td {
-  border: 1px solid #ddd;
-  padding: 8px 12px;
-  text-align: left;
-}
-
-.word-editor-content th {
-  background: #f5f5f5;
-  font-weight: bold;
-}
-
-.word-editor-content tr:nth-child(even) {
-  background: #fafafa;
-}
-
-/* 图片样式 */
-.word-editor-content img {
-  max-width: 100%;
-  height: auto;
-  display: block;
-  margin: 1em auto;
-}
-
-.word-editor-content img[style*="text-align: center"],
-.word-editor-content p[style*="text-align: center"] img {
-  margin-left: auto;
-  margin-right: auto;
-}
-
-/* 列表样式 */
-.word-editor-content ul,
-.word-editor-content ol {
-  margin: 0.5em 0;
-  padding-left: 2em;
-}
-
-.word-editor-content li {
-  margin: 0.25em 0;
-  line-height: 1.6;
-}
-
-/* 嵌套列表 */
-.word-editor-content ul ul,
-.word-editor-content ol ol,
-.word-editor-content ul ol,
-.word-editor-content ol ul {
-  margin: 0.25em 0;
-}
-
-/* Word 页面选中效果 - 浅灰色半透明（类似 Word 的选中效果） */
-.word-page ::selection {
-  background-color: rgba(0, 0, 0, 0.12);
-  color: inherit;
-}
-
-.word-page ::-moz-selection {
-  background-color: rgba(0, 0, 0, 0.12);
-  color: inherit;
-}
-
-/* Tiptap 编辑器选中效果 */
-.ProseMirror ::selection {
-  background-color: rgba(0, 0, 0, 0.12);
-  color: inherit;
-}
-
-.ProseMirror ::-moz-selection {
-  background-color: rgba(0, 0, 0, 0.12);
-  color: inherit;
-}
-
-/* Diff 高亮样式 - Cursor 风格 */
-
-/* Diff 块容器 - 包含删除和新增两行 */
 .diff-block {
   display: inline-block;
   margin: 2px 0;
-  border-radius: 4px;
+  border-radius: 6px;
   overflow: hidden;
   vertical-align: middle;
 }
 
-/* Diff 行 - 每行单独显示 */
 .diff-line {
   display: block;
   padding: 2px 8px;
@@ -586,123 +509,799 @@ input, textarea, select, button {
 
 .diff-block-enter {
   animation: diff-block-float 0.45s cubic-bezier(0.22, 1, 0.36, 1) forwards;
-  will-change: transform, filter, opacity;
-  transform-origin: top left;
 }
 
-@keyframes diff-mark-focus {
-  0% {
-    background-color: rgba(59, 130, 246, 0.28);
-    box-shadow: 0 6px 18px rgba(59, 130, 246, 0.25);
-  }
-  100% {
-    background-color: rgba(59, 130, 246, 0.12);
-    box-shadow: none;
-  }
-}
-
-.diff-mark-enter {
-  animation: diff-mark-focus 0.4s ease-out forwards;
-}
-
-/* 删除内容 - 红色背景 + 删除线 + 平滑动画 */
+/* Word 修订：删除红色删除线 / 插入绿色标记 */
 .diff-line.diff-remove,
-.diff-old {
-  background-color: rgba(239, 68, 68, 0.15) !important;
-  color: #dc2626 !important;
+.diff-old,
+.docx-track-delete {
+  background-color: rgba(254, 202, 202, 0.9) !important;
+  color: #b91c1c !important;
   text-decoration: line-through !important;
-  text-decoration-color: rgba(239, 68, 68, 0.6) !important;
-  padding: 1px 4px !important;
-  border-radius: 4px !important;
+  padding: 1px 2px !important;
+  border-radius: 2px !important;
   display: inline !important;
-  animation: diff-old-enter 0.3s ease-out;
 }
 
-@keyframes diff-old-enter {
-  from {
-    background-color: rgba(239, 68, 68, 0);
-    opacity: 0.5;
-  }
-  to {
-    background-color: rgba(239, 68, 68, 0.15);
-    opacity: 1;
-  }
-}
-
-/* 新增内容 - 浅蓝色背景（类似 Notion AI / Cursor 风格） + 脉冲动画 */
 .diff-line.diff-add,
-.diff-new {
-  background-color: rgba(59, 130, 246, 0.12) !important;
-  color: inherit !important;
-  padding: 1px 4px !important;
-  border-radius: 4px !important;
+.diff-new,
+.docx-track-insert {
+  background-color: rgba(187, 247, 208, 0.9) !important;
+  color: #15803d !important;
+  padding: 1px 2px !important;
+  border-radius: 2px !important;
   display: inline !important;
-  border-left: 2px solid rgba(59, 130, 246, 0.5) !important;
-  animation: diff-new-enter 0.3s ease-out, diff-new-pulse 2s ease-in-out 0.3s infinite;
 }
 
-@keyframes diff-new-enter {
-  from {
-    background-color: rgba(59, 130, 246, 0);
-    transform: translateX(-2px);
-    opacity: 0;
-  }
-  to {
-    background-color: rgba(59, 130, 246, 0.12);
-    transform: translateX(0);
-    opacity: 1;
-  }
+/* ========================================
+   Word 编辑器样式
+   ======================================== */
+
+.word-editor-content ::selection {
+  background-color: rgb(var(--accent-rgb) / 0.22);
+  color: inherit;
 }
 
-@keyframes diff-new-pulse {
-  0%, 100% {
-    background-color: rgba(59, 130, 246, 0.08);
-  }
-  50% {
-    background-color: rgba(59, 130, 246, 0.15);
-  }
+.word-editor-content ::-moz-selection {
+  background-color: rgb(var(--accent-rgb) / 0.22);
+  color: inherit;
 }
 
-.diff-accept-new {
-  animation: diff-accept-new 0.32s ease forwards;
+.word-editor-content p,
+.word-editor-content h1,
+.word-editor-content h2,
+.word-editor-content h3,
+.word-editor-content h4,
+.word-editor-content h5,
+.word-editor-content h6 {
+  margin: 0;
+  padding: 0;
 }
 
-@keyframes diff-accept-new {
-  0% {
-    background-color: rgba(59, 130, 246, 0.2);
-    color: #0f6ad8;
-  }
-  100% {
-    background-color: transparent;
-    color: inherit;
-  }
+.word-editor-content p {
+  text-indent: 2em;
+  line-height: 1.8;
+  margin-bottom: 0.5em;
 }
 
-.diff-accept-old {
-  animation: diff-accept-old 0.28s ease forwards;
+.word-editor-content h1,
+.word-editor-content h2,
+.word-editor-content h3 {
+  text-indent: 0 !important;
+  font-weight: bold;
 }
 
-@keyframes diff-accept-old {
-  0% {
-    opacity: 1;
-    transform: translateY(0);
-  }
-  100% {
-    opacity: 0;
-    transform: translateY(-6px);
-  }
+.word-editor-content h1 {
+  font-size: 22pt;
+  line-height: 1.5;
+  margin: 24pt 0 12pt 0;
 }
 
-/* 待确认状态的 Diff 块 - 蓝色脉冲边框 */
-.diff-block[data-diff="pending"] {
-  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.4);
-  animation: pending-pulse 2s ease-in-out infinite;
+.word-editor-content h2 {
+  font-size: 16pt;
+  line-height: 1.5;
+  margin: 18pt 0 9pt 0;
 }
 
-@keyframes pending-pulse {
-  0%, 100% { box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3); }
-  50% { box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.5); }
+.word-editor-content h3 {
+  font-size: 14pt;
+  line-height: 1.5;
+  margin: 12pt 0 6pt 0;
 }
+
+/* ========================================
+   聊天面板样式 - 柔和优雅
+   ======================================== */
+
+.chat-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+
+.chat-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.chat-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+}
+
+.chat-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+/* AI Markdown 样式 */
+.ai-markdown {
+  word-break: break-word;
+}
+
+.ai-markdown > *:first-child {
+  margin-top: 0 !important;
+}
+
+.ai-markdown > *:last-child {
+  margin-bottom: 0 !important;
+}
+
+.ai-markdown ul {
+  padding-left: 0;
+}
+
+.ai-markdown ol {
+  padding-left: 1.25rem;
+}
+
+.ai-markdown code {
+  background: rgba(0, 0, 0, 0.35);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.9em;
+  color: var(--text-primary);
+}
+
+.ai-markdown a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.ai-markdown a:hover {
+  text-decoration: underline;
+}
+
+.ai-markdown-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 12px;
+}
+
+.ai-markdown-th,
+.ai-markdown-td {
+  border: 1px solid var(--border-light);
+  padding: 4px 6px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.ai-table-cards {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.ai-table-card {
+  border: 1px solid var(--border-light);
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+
+.ai-table-field {
+  display: flex;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--border-light);
+}
+
+.ai-table-field:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.ai-table-field-label {
+  min-width: 64px;
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.ai-table-field-value {
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+/* ========================================
+   ONLYOFFICE 编辑器样式
+   ======================================== */
+
+#onlyoffice-editor-container {
+  background: #fff;
+}
+
+#onlyoffice-editor-container iframe {
+  width: 100% !important;
+  height: 100% !important;
+  border: none !important;
+  display: block !important;
+}
+
+/* ========================================
+   拖拽调节条样式
+   ======================================== */
+
+.resize-handle {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  transition: background-color 0.2s;
+  z-index: 10;
+}
+
+.resize-handle:hover,
+.resize-handle:active {
+  background-color: var(--accent);
+}
+
+.resize-handle::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 40px;
+  background-color: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+  transition: background-color 0.2s;
+}
+
+.resize-handle:hover::after {
+  background-color: var(--accent);
+}
+
+/* ========================================
+   Word Editor 容器
+   ======================================== */
+
+.word-editor {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.editor-scroll-area {
+  background: var(--word-canvas-bg);
+}
+
+/* ========================================
+   Excel 预览样式
+   ======================================== */
+
+.excel-preview {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background: #fff;
+  font-family: 'Plus Jakarta Sans', 'Noto Sans SC', sans-serif;
+  user-select: none;
+}
+
+.excel-ribbon {
+  background: var(--bg-secondary);
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--glass-border);
+  flex-shrink: 0;
+}
+
+.excel-ribbon-tabs {
+  display: flex;
+  padding: 0 12px;
+  gap: 14px;
+  height: 30px;
+  align-items: center;
+  font-size: 12px;
+  justify-content: space-between;
+}
+
+.excel-ribbon-tabs-inner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.excel-ribbon-tab {
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: default;
+}
+
+.excel-ribbon-tab:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.excel-ribbon-collapse {
+  width: 28px;
+  height: 24px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.85);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.excel-ribbon-collapse:hover {
+  background: rgba(255, 255, 255, 0.10);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.excel-table-wrapper {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: #fff;
+  position: relative;
+}
+
+.excel-ribbon-tools {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  padding: 8px 10px 8px;
+  overflow-x: auto;
+}
+
+.excel-tool-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  position: relative;
+  padding: 0 8px;
+  min-width: 96px;
+}
+
+.tool-title {
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.7);
+  text-align: center;
+}
+
+.ribbon-divider {
+  position: absolute;
+  right: -6px;
+  top: 6px;
+  bottom: 6px;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.10);
+}
+
+.ribbon-group-layout {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.ribbon-btn-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ribbon-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 7px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.88);
+  font-size: 11px;
+  line-height: 1;
+}
+
+.ribbon-btn:hover {
+  background: rgba(255, 255, 255, 0.10);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.ribbon-btn.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.ribbon-btn.big {
+  padding: 8px 10px;
+  font-weight: 600;
+}
+
+.excel-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #e5e7eb;
+  background: #f6f7f9;
+  flex-shrink: 0;
+}
+
+.excel-name-box {
+  width: 84px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  font-size: 12px;
+  color: #111827;
+}
+
+.excel-formula-bar {
+  flex: 1;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  color: #111827;
+}
+
+.fx-icon {
+  font-size: 12px;
+  font-weight: 700;
+  color: #6b7280;
+}
+
+.formula-input {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: #111827;
+}
+
+.formula-input-wrapper {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.formula-input-edit {
+  flex: 1;
+  height: 24px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  padding: 0 8px;
+  font-size: 12px;
+  outline: none;
+}
+
+.formula-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.formula-btn:hover {
+  background: #f3f4f6;
+}
+
+.excel-table-scaler {
+  display: inline-block;
+}
+
+.excel-table {
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 12px;
+  color: #111827;
+}
+
+.excel-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border-top: 1px solid #e5e7eb;
+  background: #f6f7f9;
+  flex-shrink: 0;
+}
+
+.excel-sheet-area {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.excel-sheet-scroll-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #374151;
+}
+
+.excel-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  min-width: 0;
+}
+
+.excel-tab,
+.excel-new-sheet {
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  color: #374151;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.excel-tab.active {
+  border-color: rgb(var(--accent-rgb) / 0.45);
+  background: rgb(var(--accent-rgb) / 0.10);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.excel-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+  color: #374151;
+}
+
+.excel-status-text {
+  font-size: 12px;
+  color: #6b7280;
+}
+
+.excel-zoom {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.zoom-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  color: #374151;
+}
+
+.zoom-track {
+  width: 120px;
+  height: 6px;
+  border-radius: 999px;
+  background: #e5e7eb;
+  position: relative;
+}
+
+.zoom-thumb {
+  position: absolute;
+  top: -3px;
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: rgb(var(--accent-rgb) / 0.9);
+  border: 2px solid #fff;
+  transform: translateX(-50%);
+}
+
+.zoom-label {
+  font-size: 12px;
+  color: #374151;
+  width: 44px;
+  text-align: right;
+}
+
+.excel-col-header,
+.excel-row-header,
+.excel-corner-header {
+  background: #f3f4f6;
+  color: #374151;
+  font-size: 11px;
+  font-weight: 600;
+  border-right: 1px solid #d4d4d4;
+  border-bottom: 1px solid #d4d4d4;
+  user-select: none;
+}
+
+.excel-col-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  text-align: center;
+  height: 20px;
+}
+
+.excel-row-header {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  text-align: center;
+  width: 40px;
+  min-width: 40px;
+}
+
+.excel-corner-header {
+  position: sticky;
+  left: 0;
+  top: 0;
+  z-index: 3;
+  width: 40px;
+  min-width: 40px;
+}
+
+.excel-col-header.active,
+.excel-row-header.active {
+  background: rgb(var(--accent-rgb) / 0.16);
+  color: var(--accent);
+}
+
+.excel-cell {
+  height: 20px;
+  min-width: 72px;
+}
+
+.excel-cell {
+  border-right: 1px solid #d4d4d4;
+  border-bottom: 1px solid #d4d4d4;
+  overflow: hidden;
+  padding: 2px 4px;
+  vertical-align: middle;
+}
+
+.excel-cell-in-selection {
+  background: rgb(var(--accent-rgb) / 0.12) !important;
+}
+
+.excel-cell-active {
+  background: #fff !important;
+}
+
+/* ========================================
+   标签页状态栏 - 柔和风格
+   ======================================== */
+
+.status-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.status-indicator.online {
+  background: rgb(var(--success-rgb) / 0.10);
+  border: 1px solid rgb(var(--success-rgb) / 0.18);
+  color: rgb(var(--success-rgb) / 0.78);
+}
+
+.status-indicator.offline {
+  background: rgb(var(--danger-rgb) / 0.10);
+  border: 1px solid rgb(var(--danger-rgb) / 0.18);
+  color: rgb(var(--danger-rgb) / 0.78);
+}
+
+.status-indicator::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  /* macOS 风格：更克制，不要强烈的呼吸/闪烁 */
+  animation: none;
+}
+
+/* ========================================
+   快捷命令标签 - 柔和交互
+   ======================================== */
+
+.command-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 20px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.command-tag:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgb(var(--accent-rgb) / 0.35);
+  color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.command-tag.active {
+  background: rgb(var(--accent-rgb) / 0.14);
+  border-color: rgb(var(--accent-rgb) / 0.35);
+  color: var(--accent);
+}
+
+/* ========================================
+   底部信息提示
+   ======================================== */
+
+.hint-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 16px;
+  background: rgba(0, 0, 0, 0.2);
+  border-top: 1px solid var(--glass-border);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.hint-bar a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.hint-bar a:hover {
+  text-decoration: underline;
+}
+
+/* ========================================
+   Word 预览覆盖样式
+   ======================================== */
+
+.word-preview h1 { @apply text-2xl font-bold mb-6 text-gray-900 border-b border-gray-200 pb-2; }
+.word-preview h2 { @apply text-xl font-bold mb-4 mt-8 text-gray-800; }
+.word-preview h3 { @apply text-lg font-semibold mb-3 mt-6 text-gray-800; }
+.word-preview p { @apply mb-4 leading-7 text-gray-700 text-justify; }
+.word-preview ul { @apply list-disc pl-6 mb-4 space-y-1 text-gray-700; }
+.word-preview ol { @apply list-decimal pl-6 mb-4 space-y-1 text-gray-700; }
+.word-preview li { @apply pl-1; }
+.word-preview blockquote { @apply border-l-4 border-accent pl-4 py-1 my-4 bg-gray-50 text-gray-600 italic; }
+.word-preview code { @apply bg-gray-100 text-accent px-1.5 py-0.5 rounded font-mono text-sm; }
+.word-preview pre { @apply bg-gray-900 text-gray-100 p-4 rounded-lg mb-4 overflow-x-auto; }
+.word-preview table { @apply w-full border-collapse mb-4; }
+.word-preview th { @apply border border-gray-300 px-4 py-2 bg-gray-50 font-semibold text-left text-gray-900; }
+.word-preview td { @apply border border-gray-300 px-4 py-2 text-gray-700; }
+
+/* ========================================
+   Doc Block 动画
+   ======================================== */
 
 @keyframes doc-block-appear {
   0% {
@@ -735,969 +1334,457 @@ input, textarea, select, button {
 @keyframes highlight-flash {
   0% { 
     transform: scale(1.02);
-    box-shadow: 0 0 0 4px rgba(251, 191, 36, 0.8);
+    box-shadow: 0 0 0 4px rgba(251, 146, 60, 0.8);
   }
   100% { 
     transform: scale(1);
-    box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.3);
+    box-shadow: 0 0 0 2px rgba(251, 146, 60, 0.3);
   }
 }
 
-/* ONLYOFFICE 编辑器样式 */
-#onlyoffice-editor-container {
-  background: #fff;
+/* ========================================
+   新增：柔和按钮变体
+   ======================================== */
+
+.btn-sage {
+  background: linear-gradient(135deg, rgb(var(--accent-rgb) / 0.84) 0%, rgb(var(--accent-hover-rgb) / 0.84) 100%);
+  color: white;
+  border: none;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 1px 8px rgb(var(--accent-rgb) / 0.16);
 }
 
-#onlyoffice-editor-container iframe {
-  width: 100% !important;
-  height: 100% !important;
-  border: none !important;
-  display: block !important;
+.btn-sage:hover {
+  background: linear-gradient(135deg, rgb(var(--accent-rgb) / 0.92) 0%, rgb(var(--accent-hover-rgb) / 0.92) 100%);
+  box-shadow: 0 3px 14px rgb(var(--accent-rgb) / 0.22);
+  transform: translateY(-0.5px);
 }
 
-/* 拖拽调节条样式 */
-.resize-handle {
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 4px;
-  cursor: col-resize;
+.btn-lavender {
+  /* 兼容旧类名：统一走系统蓝 */
+  background: linear-gradient(135deg, rgb(var(--accent-rgb) / 0.95) 0%, rgb(var(--accent-hover-rgb) / 0.95) 100%);
+  color: white;
+  border: none;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 2px 10px rgb(var(--accent-rgb) / 0.22);
+}
+
+.btn-lavender:hover {
+  background: linear-gradient(135deg, rgb(var(--accent-rgb) / 1) 0%, rgb(var(--accent-hover-rgb) / 1) 100%);
+  box-shadow: 0 4px 20px rgb(var(--accent-rgb) / 0.32);
+  transform: translateY(-1px);
+}
+
+/* ========================================
+   新增：柔和卡片悬浮效果
+   ======================================== */
+
+.hover-lift {
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.hover-lift:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 25px rgba(0, 0, 0, 0.2);
+}
+
+/* ========================================
+   新增：柔和边框发光
+   ======================================== */
+
+.glow-border-sage {
+  box-shadow: 0 0 0 1px rgb(var(--accent-rgb) / 0.28), 0 0 15px rgb(var(--accent-rgb) / 0.12);
+}
+
+.glow-border-lavender {
+  box-shadow: 0 0 0 1px rgb(var(--accent-rgb) / 0.28), 0 0 15px rgb(var(--accent-rgb) / 0.12);
+}
+
+.glow-border-peach {
+  box-shadow: 0 0 0 1px rgb(var(--accent-rgb) / 0.28), 0 0 15px rgb(var(--accent-rgb) / 0.12);
+}
+
+/* Word-like header/footer styling */
+.word-editor-content .docx-header,
+.word-editor-content .docx-footer {
+  padding: 4px 0;
+  font-size: 9pt;
+  color: var(--word-ink-muted);
   background: transparent;
-  transition: background-color 0.2s;
-  z-index: 10;
+  position: relative;
 }
 
-.resize-handle:hover,
-.resize-handle:active {
-  background-color: rgba(14, 99, 156, 0.5);
+.word-editor-content .docx-header {
+  border-bottom: 0.5pt solid var(--word-rule);
+  margin-bottom: 8px;
+  padding-bottom: 4px;
 }
 
-.resize-handle::after {
-  content: '';
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-  width: 3px;
-  height: 40px;
-  background-color: #3c3c3c;
-  border-radius: 2px;
-  transition: background-color 0.2s;
+.word-editor-content .docx-footer {
+  border-top: 0.5pt solid var(--word-rule);
+  margin-top: 8px;
+  padding-top: 4px;
 }
 
-.resize-handle:hover::after {
-  background-color: #0e639c;
-}
-
-/* 聊天面板滚动条 - 更细更隐蔽 */
-.chat-scrollbar::-webkit-scrollbar {
-  width: 4px;
-}
-
-.chat-scrollbar::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.chat-scrollbar::-webkit-scrollbar-thumb {
-  background: #3c3c3c;
-  border-radius: 2px;
-}
-
-.chat-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: #5a5a5a;
-}
-
-/* 代码块样式 - Cursor 风格 */
-.chat-code-block {
-  background: #1e1e1e;
-  border: 1px solid #2d2d2d;
-  border-radius: 6px;
-  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-  font-size: 12px;
-  line-height: 1.5;
-  overflow-x: auto;
-}
-
-.chat-code-block pre {
+.word-editor-content .header-footer-para,
+.page-preview-page .page-header .header-footer-para,
+.page-preview-page .page-footer .header-footer-para {
   margin: 0;
-  padding: 12px;
+  padding: 0;
+  line-height: 1;
+  font-family: inherit;
 }
 
-/* Markdown 样式 - 聊天面板 */
-.chat-markdown h1,
-.chat-markdown h2,
-.chat-markdown h3 {
-  font-weight: 600;
-  margin-top: 1em;
-  margin-bottom: 0.5em;
-  color: #cccccc;
+.word-editor-content .docx-header .header-footer-para {
+  text-align: right;
 }
 
-.chat-markdown h1 { font-size: 1.25em; }
-.chat-markdown h2 { font-size: 1.1em; }
-.chat-markdown h3 { font-size: 1em; }
-
-.chat-markdown p {
-  margin-bottom: 0.75em;
-  line-height: 1.6;
+.word-editor-content .docx-footer .header-footer-para {
+  text-align: center;
 }
 
-.chat-markdown ul,
-.chat-markdown ol {
-  padding-left: 1.5em;
-  margin-bottom: 0.75em;
-}
-
-.chat-markdown li {
-  margin-bottom: 0.25em;
-}
-
-.chat-markdown code {
-  background: #2d2d2d;
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-family: 'Consolas', monospace;
-  font-size: 0.9em;
-  color: #ce9178;
-}
-
-.chat-markdown a {
-  color: #75beff;
-  text-decoration: none;
-}
-
-.chat-markdown a:hover {
-  text-decoration: underline;
-}
-
-/* AI 消息 Markdown 渲染样式 */
-.ai-markdown {
-  word-break: break-word;
-}
-
-.ai-markdown > *:first-child {
-  margin-top: 0 !important;
-}
-
-.ai-markdown > *:last-child {
-  margin-bottom: 0 !important;
-}
-
-/* 列表样式优化 */
-.ai-markdown ul {
-  padding-left: 0;
-}
-
-.ai-markdown ol {
-  padding-left: 1.25rem;
-}
-
-.ai-markdown li > ul,
-.ai-markdown li > ol {
-  margin-top: 0.25rem;
-  margin-bottom: 0.25rem;
-}
-
-/* 嵌套列表缩进 */
-.ai-markdown li li {
-  padding-left: 0.5rem;
-}
-
-/* 代码块样式 */
-.ai-markdown pre code {
-  display: block;
-  padding: 0.75rem;
-  background: transparent;
-}
-
-/* 表格样式 */
-.ai-markdown table {
+/* Tab-based header/footer layout */
+.word-editor-content .docx-header .header-footer-para.hf-tabs,
+.word-editor-content .docx-footer .header-footer-para.hf-tabs,
+.page-preview-page .page-header .header-footer-para.hf-tabs,
+.page-preview-page .page-footer .header-footer-para.hf-tabs {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: baseline;
+  column-gap: 8px;
   width: 100%;
-  border-collapse: collapse;
-  margin: 0.5rem 0;
-  font-size: 12px;
-}
-
-.ai-markdown th,
-.ai-markdown td {
-  border: 1px solid #3c3c3c;
-  padding: 0.5rem;
   text-align: left;
 }
 
-.ai-markdown th {
-  background: #2d2d2d;
-  font-weight: 600;
+.word-editor-content .header-footer-para.hf-tabs .hf-left,
+.page-preview-page .header-footer-para.hf-tabs .hf-left {
+  justify-self: start;
+  text-align: left;
+  min-width: 0;
+  white-space: pre-wrap;
 }
 
-/* 任务列表样式 */
-.ai-markdown input[type="checkbox"] {
-  margin-right: 0.5rem;
-  accent-color: #0e639c;
-}
-
-/* Word Editor 容器（用于 Excel 预览等） */
-.word-editor {
-  width: 100%;
-  height: 100%;
-  min-height: 0; /* 允许 flex 子项收缩 */
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-}
-
-/* Excel 预览 */
-.excel-preview {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-height: 0; /* 重要：允许子元素收缩 */
-  background: #fff;
-  font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
-  user-select: none;
-}
-
-/* 顶部 Ribbon 模拟 */
-.excel-ribbon {
-  background: #2b2b2b;
-  color: #fff;
-  display: flex;
-  flex-direction: column;
-  border-bottom: 1px solid #1f1f1f;
-  flex-shrink: 0; /* 防止 Ribbon 被压缩 */
-}
-
-.excel-ribbon-tabs {
-  display: flex;
-  padding: 0 12px;
-  gap: 14px;
-  height: 30px;
-  align-items: center;
-  font-size: 12px;
-}
-
-.excel-ribbon-tab {
-  padding: 6px 8px;
-  border-radius: 4px;
-  cursor: default;
-}
-
-.excel-ribbon-tab:hover {
-  background: rgba(255, 255, 255, 0.08);
-}
-
-.excel-ribbon-tools {
-  display: flex;
-  gap: 8px;
-  padding: 4px 10px 4px;
-  background: #2f2f2f;
-  border-top: 1px solid #1f1f1f;
-  border-bottom: 1px solid #1f1f1f;
-  align-items: flex-start;
-  flex-wrap: nowrap;
-  overflow-x: auto;
-}
-
-.excel-tool-group {
-  min-width: 120px;
-  max-width: 170px;
-  color: #ddd;
-  display: flex;
-  flex-direction: column;
-  position: relative;
-  padding-right: 8px;
-  gap: 2px;
-}
-
-.tool-title {
-  font-size: 11px;
-  margin-top: 0;
-  color: #aaa;
+.word-editor-content .header-footer-para.hf-tabs .hf-center,
+.page-preview-page .header-footer-para.hf-tabs .hf-center {
+  justify-self: center;
   text-align: center;
+  min-width: 0;
+  white-space: pre-wrap;
 }
 
-.ribbon-group-layout {
+.word-editor-content .header-footer-para.hf-tabs .hf-right,
+.page-preview-page .header-footer-para.hf-tabs .hf-right {
+  justify-self: end;
+  text-align: right;
+  min-width: 0;
+  white-space: pre-wrap;
+}
+
+.word-editor-content .docx-header .header-footer-para.hf-tabs-abs,
+.word-editor-content .docx-footer .header-footer-para.hf-tabs-abs,
+.page-preview-page .page-header .header-footer-para.hf-tabs-abs,
+.page-preview-page .page-footer .header-footer-para.hf-tabs-abs {
+  position: relative;
+  min-height: 1em;
+}
+
+.word-editor-content .header-footer-para.hf-tabs-abs .hf-seg,
+.page-preview-page .header-footer-para.hf-tabs-abs .hf-seg {
+  position: absolute;
+  top: 0;
+  white-space: pre-wrap;
+}
+
+.word-editor-content .header-footer-para.hf-tabs-abs .hf-left,
+.page-preview-page .header-footer-para.hf-tabs-abs .hf-left {
+  position: relative;
+  display: inline-block;
+  text-align: left;
+  white-space: pre-wrap;
+}
+
+/* ========================================
+   AI 思考动画 - 优雅等待状态
+   ======================================== */
+
+.ai-thinking-indicator {
   display: flex;
-  gap: 6px;
   align-items: center;
-  justify-content: flex-start;
-  flex-wrap: nowrap;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, 
+    rgba(var(--accent-rgb), 0.06) 0%, 
+    rgba(var(--accent-rgb), 0.02) 100%
+  );
+  border: 1px solid rgba(var(--accent-rgb), 0.12);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  animation: thinking-breathe 3s ease-in-out infinite;
 }
 
-.ribbon-group-layout.font-group {
-  flex-direction: column;
-  align-items: flex-start;
+@keyframes thinking-breathe {
+  0%, 100% {
+    border-color: rgba(var(--accent-rgb), 0.12);
+    box-shadow: 0 0 0 0 rgba(var(--accent-rgb), 0);
+  }
+  50% {
+    border-color: rgba(var(--accent-rgb), 0.25);
+    box-shadow: 0 0 20px 0 rgba(var(--accent-rgb), 0.08);
+  }
 }
 
-.ribbon-group-layout.single-col {
-  flex-direction: column;
+.thinking-avatar {
+  position: relative;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+}
+
+.thinking-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  border-top-color: var(--accent);
+  border-right-color: rgba(var(--accent-rgb), 0.3);
+  animation: thinking-spin 1.2s cubic-bezier(0.5, 0, 0.5, 1) infinite;
+}
+
+.thinking-core {
+  position: absolute;
+  inset: 6px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, 
+    rgba(var(--accent-rgb), 0.4) 0%, 
+    rgba(var(--accent-rgb), 0.15) 100%
+  );
+  animation: thinking-pulse 2s ease-in-out infinite;
+}
+
+@keyframes thinking-spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+@keyframes thinking-pulse {
+  0%, 100% { 
+    transform: scale(0.85);
+    opacity: 0.6;
+  }
+  50% { 
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.thinking-content {
+  display: flex;
+  align-items: baseline;
   gap: 4px;
 }
 
-.ribbon-row {
+.thinking-text {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  letter-spacing: 0.01em;
+}
+
+.thinking-dots {
   display: flex;
+  align-items: center;
   gap: 3px;
+  margin-left: 2px;
 }
 
-.ribbon-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 5px;
-  border-radius: 4px;
-  border: 1px solid transparent;
-  background: rgba(255, 255, 255, 0.04);
-  color: #f3f3f3;
-  font-size: 11px;
-  cursor: default;
+.thinking-dots span {
+  display: block;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: thinking-dot-bounce 1.4s ease-in-out infinite;
 }
 
-.ribbon-btn.icon-only {
-  width: 26px;
-  justify-content: center;
-  padding: 3px;
+.thinking-dots span:nth-child(1) { animation-delay: 0ms; }
+.thinking-dots span:nth-child(2) { animation-delay: 160ms; }
+.thinking-dots span:nth-child(3) { animation-delay: 320ms; }
+
+@keyframes thinking-dot-bounce {
+  0%, 60%, 100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-6px);
+    opacity: 1;
+  }
 }
 
-.ribbon-btn.big {
-  min-width: 44px;
-  height: 32px;
-  flex-direction: column;
-  justify-content: center;
-}
+/* ========================================
+   AI 思考过程展示区域 - ChatGPT 风格
+   ======================================== */
 
-.ribbon-btn.pill {
+.thinking-section {
+  margin-bottom: 12px;
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.08);
-  padding-left: 8px;
-  padding-right: 8px;
-}
-
-.ribbon-btn:hover {
-  background: rgba(255, 255, 255, 0.08);
-}
-
-.ribbon-divider {
-  position: absolute;
-  right: 0;
-  top: 4px;
-  bottom: 4px;
-  width: 1px;
-  background: rgba(255, 255, 255, 0.08);
-}
-
-/* 顶部工具栏 */
-.excel-toolbar {
-  display: flex;
-  align-items: center;
-  height: 28px;
-  border-bottom: 1px solid #e1e1e1;
-  background: #fff;
-  padding: 0 4px;
-  flex-shrink: 0; /* 防止工具栏被压缩 */
-}
-
-.excel-name-box {
-  width: 40px;
-  height: 20px;
-  line-height: 20px;
-  font-size: 12px;
-  color: #333;
-  border: 1px solid #fff;
-  text-align: center;
-  margin-right: 4px;
-}
-
-.excel-formula-bar {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  height: 20px;
-  border: 1px solid #fff;
-}
-
-.fx-icon {
-  font-size: 12px;
-  color: #999;
-  padding: 0 8px;
-  border-right: 1px solid #e1e1e1;
-  font-style: italic;
-  font-family: serif;
-}
-
-.formula-input {
-  flex: 1;
-  height: 100%;
-  padding-left: 8px;
-  font-size: 12px;
-  color: #333;
-}
-
-/* 表格区域 */
-.excel-table-wrapper {
-  flex: 1;
-  min-height: 0; /* 重要：允许 flex 子项收缩并启用滚动 */
-  overflow: auto;
-  background: #fff;
-  position: relative;
-}
-
-.excel-table-scaler {
-  width: fit-content;
-  min-width: 100%;
-}
-
-.excel-table {
-  border-collapse: separate;
-  border-spacing: 0;
-  table-layout: fixed;
-  width: max-content;
-  cursor: cell;
-}
-
-/* 表头样式 */
-.excel-col-header {
-  background: #f8f9fa;
-  border-right: 1px solid #d4d4d4;
-  border-bottom: 1px solid #d4d4d4;
-  color: #666;
-  font-weight: normal;
-  font-size: 12px;
-  text-align: center;
-  height: 24px;
-  position: sticky;
-  top: 0;
-  z-index: 10;
-}
-
-.excel-col-header:hover {
-  background: #e1e1e1;
-}
-
-.excel-row-header {
-  background: #f8f9fa;
-  border-right: 1px solid #d4d4d4;
-  border-bottom: 1px solid #d4d4d4;
-  color: #666;
-  font-size: 12px;
-  text-align: center;
-  position: sticky;
-  left: 0;
-  z-index: 10;
-}
-
-.excel-row-header:hover {
-  background: #e1e1e1;
-}
-
-.excel-col-header.active,
-.excel-row-header.active {
-  background: #dbe9f9;
-  color: #0f4fa8;
-  font-weight: 600;
-}
-.excel-corner-header {
-  background: #f8f9fa;
-  border-right: 1px solid #d4d4d4;
-  border-bottom: 1px solid #d4d4d4;
-  position: sticky;
-  top: 0;
-  left: 0;
-  z-index: 20;
-  width: 40px;
-  height: 24px;
-}
-
-.excel-corner-header::after {
-  content: '◢';
-  position: absolute;
-  bottom: 0;
-  right: 0;
-  font-size: 8px;
-  color: #ccc;
-  line-height: 1;
-}
-
-/* 单元格样式 */
-.excel-cell {
-  border-right: 1px solid #d4d4d4;
-  border-bottom: 1px solid #d4d4d4;
   overflow: hidden;
-  padding: 2px 4px;
-  vertical-align: middle;
 }
 
-/* 选区内的单元格 - 浅蓝色背景 */
-.excel-cell-in-selection {
-  background: rgba(0, 120, 215, 0.1) !important;
+.thinking-section[open] .thinking-arrow {
+  transform: rotate(90deg);
 }
 
-/* 活动单元格（选区起始点）- 白色背景 */
-.excel-cell-active {
-  background: #fff !important;
-}
-
-/* 选区边框 - 使用伪元素绘制，模拟 Excel 的选区框 */
-.excel-cell.selection-top {
-  box-shadow: inset 0 2px 0 0 #217346;
-}
-.excel-cell.selection-bottom {
-  box-shadow: inset 0 -2px 0 0 #217346;
-}
-.excel-cell.selection-left {
-  box-shadow: inset 2px 0 0 0 #217346;
-}
-.excel-cell.selection-right {
-  box-shadow: inset -2px 0 0 0 #217346;
-}
-
-/* 组合边框 */
-.excel-cell.selection-top.selection-left {
-  box-shadow: inset 2px 2px 0 0 #217346;
-}
-.excel-cell.selection-top.selection-right {
-  box-shadow: inset -2px 2px 0 0 #217346;
-}
-.excel-cell.selection-bottom.selection-left {
-  box-shadow: inset 2px -2px 0 0 #217346;
-}
-.excel-cell.selection-bottom.selection-right {
-  box-shadow: inset -2px -2px 0 0 #217346;
-}
-.excel-cell.selection-top.selection-bottom {
-  box-shadow: inset 0 2px 0 0 #217346, inset 0 -2px 0 0 #217346;
-}
-.excel-cell.selection-left.selection-right {
-  box-shadow: inset 2px 0 0 0 #217346, inset -2px 0 0 0 #217346;
-}
-.excel-cell.selection-top.selection-left.selection-bottom {
-  box-shadow: inset 2px 2px 0 0 #217346, inset 2px -2px 0 0 #217346;
-}
-.excel-cell.selection-top.selection-right.selection-bottom {
-  box-shadow: inset -2px 2px 0 0 #217346, inset -2px -2px 0 0 #217346;
-}
-.excel-cell.selection-left.selection-top.selection-right {
-  box-shadow: inset 2px 2px 0 0 #217346, inset -2px 2px 0 0 #217346;
-}
-.excel-cell.selection-left.selection-bottom.selection-right {
-  box-shadow: inset 2px -2px 0 0 #217346, inset -2px -2px 0 0 #217346;
-}
-.excel-cell.selection-top.selection-bottom.selection-left.selection-right {
-  box-shadow: inset 0 0 0 2px #217346;
-}
-
-/* 单个单元格选中 - 粗边框 */
-.excel-cell-active.selection-top.selection-bottom.selection-left.selection-right {
-  box-shadow: inset 0 0 0 2px #217346;
-}
-
-/* 选区右下角的小方块（调整手柄） */
-.excel-cell.selection-bottom.selection-right::after {
-  content: '';
-  position: absolute;
-  right: -3px;
-  bottom: -3px;
-  width: 6px;
-  height: 6px;
-  background: #217346;
-  cursor: crosshair;
-}
-
-/* 被选中时的行列头高亮 */
-.excel-col-header.active,
-.excel-row-header.active {
-  background: #d4e6f1 !important;
-  color: #217346;
-  font-weight: 600;
-}
-
-/* 禁止选择文字（拖选时） */
-.excel-table {
+.thinking-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: linear-gradient(135deg, 
+    rgba(245, 158, 11, 0.08) 0%, 
+    rgba(245, 158, 11, 0.03) 100%
+  );
+  border: 1px solid rgba(245, 158, 11, 0.15);
+  border-radius: 12px;
+  transition: all 0.2s ease;
+  list-style: none;
   user-select: none;
 }
 
-/* 左上角全选按钮 */
-.excel-corner-header {
-  cursor: pointer;
-}
-.excel-corner-header:hover {
-  background: #e0e0e0;
+.thinking-summary::-webkit-details-marker {
+  display: none;
 }
 
-/* 列头和行头可点击 */
-.excel-col-header,
-.excel-row-header {
-  cursor: pointer;
-}
-.excel-col-header:hover,
-.excel-row-header:hover {
-  background: #e8e8e8;
+.thinking-summary:hover {
+  background: linear-gradient(135deg, 
+    rgba(245, 158, 11, 0.12) 0%, 
+    rgba(245, 158, 11, 0.05) 100%
+  );
+  border-color: rgba(245, 158, 11, 0.25);
 }
 
-/* 底部标签栏 */
-.excel-footer {
-  display: flex;
-  align-items: center;
-  height: 32px;
-  background: #f8f9fa;
-  border-top: 1px solid #e1e1e1;
-  padding-left: 4px;
-  flex-shrink: 0; /* 防止底部栏被压缩 */
+.thinking-section[open] .thinking-summary {
+  border-radius: 12px 12px 0 0;
+  border-bottom-color: transparent;
 }
 
-.excel-sheet-area {
-  display: flex;
-  align-items: center;
-}
-
-.excel-sheet-scroll-btn {
+.thinking-indicator {
+  position: relative;
   width: 16px;
   height: 16px;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #999;
-  cursor: pointer;
-  font-size: 10px;
 }
 
-.excel-sheet-scroll-btn:hover {
-  color: #666;
-}
-
-.excel-tabs {
-  display: flex;
-  align-items: flex-end;
-  height: 100%;
-  margin-left: 8px;
-  overflow-x: auto;
-}
-
-.excel-tab {
-  height: 26px;
-  padding: 0 16px;
-  border: none;
-  background: transparent;
-  font-size: 13px;
-  color: #444;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  border-radius: 0;
-  margin-right: 1px;
-  position: relative;
-}
-
-.excel-tab:hover {
-  background: #e1e1e1;
-}
-
-.excel-tab.active {
-  background: #fff;
-  color: #107c41; /* Excel Green */
-  border-bottom: 2px solid #107c41;
-  font-weight: 600;
-}
-
-.excel-new-sheet {
-  width: 28px;
-  height: 26px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 18px;
-  color: #666;
-  cursor: pointer;
-  background: transparent;
-  border: none;
-}
-
-.excel-new-sheet:hover {
-  background: #e1e1e1;
+.thinking-pulse {
+  width: 8px;
+  height: 8px;
+  background: #f59e0b;
   border-radius: 50%;
-  height: 20px;
-  width: 20px;
-  margin: 3px 4px;
+  animation: thinking-pulse-anim 1.5s ease-in-out infinite;
 }
 
-.excel-footer-spacer {
-  flex: 1;
-  background: #f8f9fa;
+@keyframes thinking-pulse-anim {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.4);
+  }
+  50% {
+    transform: scale(1.1);
+    opacity: 0.8;
+    box-shadow: 0 0 8px 2px rgba(245, 158, 11, 0.3);
+  }
 }
 
-.excel-status {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+.thinking-arrow {
   margin-left: auto;
-  padding-right: 12px;
-  font-size: 12px;
-  color: #444;
+  color: rgba(245, 158, 11, 0.6);
+  transition: transform 0.2s ease;
 }
 
-.excel-zoom {
-  display: flex;
-  align-items: center;
-  gap: 4px;
+.thinking-body {
+  padding: 14px 16px;
+  background: rgba(245, 158, 11, 0.04);
+  border: 1px solid rgba(245, 158, 11, 0.15);
+  border-top: none;
+  border-radius: 0 0 12px 12px;
+  max-height: 240px;
+  overflow-y: auto;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
-.zoom-btn {
-  color: #666;
-  font-size: 14px;
+.thinking-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.thinking-body::-webkit-scrollbar-track {
   background: transparent;
-  border: none;
-  cursor: pointer;
-  padding: 2px 6px;
+}
+
+.thinking-body::-webkit-scrollbar-thumb {
+  background: rgba(245, 158, 11, 0.2);
   border-radius: 3px;
-  line-height: 1;
 }
 
-.zoom-btn:hover {
-  background: #e5e5e5;
-  color: #107c41;
+.thinking-body::-webkit-scrollbar-thumb:hover {
+  background: rgba(245, 158, 11, 0.35);
 }
 
-.zoom-track {
-  width: 80px;
-  height: 6px;
-  background: #e1e1e1;
-  border-radius: 999px;
-  position: relative;
-  cursor: pointer;
+/* 思考内容中的打字机效果 */
+.thinking-body .cinematic-typer {
+  color: var(--text-secondary);
 }
 
-.zoom-thumb {
-  position: absolute;
-  top: -4px;
-  width: 12px;
-  height: 12px;
-  background: #107c41;
-  border-radius: 50%;
-  box-shadow: 0 0 0 2px #fff;
-  margin-left: -6px;
-  pointer-events: none;
+.thinking-body .cinematic-char {
+  color: rgba(245, 158, 11, 0.9);
 }
 
-.zoom-label {
-  font-size: 11px;
-  color: #444;
-  min-width: 35px;
-  text-align: right;
+/* DSL 预览展示 */
+.dsl-preview {
+  padding: 12px;
+  border: 1px dashed var(--border-light);
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 12px;
 }
 
-/* Excel 编辑功能样式 */
-.excel-preview:focus {
-  outline: none;
-}
-
-.cell-edit-input {
-  width: 100%;
-  height: 100%;
-  border: none;
-  outline: none;
-  padding: 2px 4px;
-  font-size: inherit;
-  font-family: inherit;
-  background: #fff;
-  box-sizing: border-box;
-}
-
-.excel-cell.has-local-change {
-  background-color: #fff3cd !important;
-}
-
-.excel-formula-bar .formula-input {
-  flex: 1;
-  height: 100%;
-  padding: 0 8px;
+.dsl-preview-header {
   font-size: 12px;
-  color: #333;
-  border: none;
-  outline: none;
-  background: transparent;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  letter-spacing: 0.02em;
 }
 
-.excel-formula-bar .formula-input:focus {
-  background: #fff;
+.dsl-preview-body {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  white-space: normal;
 }
 
-.excel-save-status {
-  display: flex;
-  align-items: center;
-  padding: 0 12px;
-  font-size: 11px;
+.dsl-preview-body p {
+  margin: 0 0 8px;
 }
 
-.excel-save-status .saving {
-  color: #f59e0b;
-}
-
-.excel-save-status .saved {
-  color: #10b981;
-}
-
-.excel-save-status .unsaved {
-  color: #ef4444;
-}
-
-.ribbon-btn.disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.ribbon-btn.disabled:hover {
-  background: transparent;
-}
-
-/* 列宽调整手柄 */
-.excel-col-header {
-  position: relative;
-}
-
-.col-resize-handle {
-  position: absolute;
-  top: 0;
-  right: -2px;
-  width: 5px;
-  height: 100%;
-  cursor: col-resize;
-  z-index: 10;
-}
-
-.col-resize-handle:hover,
-.excel-col-header.resizing .col-resize-handle {
-  background: #107c41;
-}
-
-/* 行高调整手柄 */
-.excel-row-header {
-  position: relative;
-}
-
-.row-resize-handle {
-  position: absolute;
-  left: 0;
-  bottom: -2px;
+.dsl-preview-body table {
   width: 100%;
-  height: 5px;
-  cursor: row-resize;
-  z-index: 10;
+  border-collapse: collapse;
+  margin: 6px 0 10px;
 }
 
-.row-resize-handle:hover,
-.excel-row-header.resizing .row-resize-handle {
-  background: #107c41;
-}
-
-/* 调整时的光标样式 */
-.excel-preview.resizing-col,
-.excel-preview.resizing-col * {
-  cursor: col-resize !important;
-}
-
-.excel-preview.resizing-row,
-.excel-preview.resizing-row * {
-  cursor: row-resize !important;
-}
-
-/* Excel 编辑模式样式 */
-.excel-cell-editing {
-  padding: 0 !important;
-  background: #fff !important;
-}
-
-.cell-edit-input {
-  width: 100%;
-  height: 100%;
-  min-height: 20px;
-  padding: 2px 4px;
-  border: 2px solid #217346 !important;
-  outline: none;
-  font-family: inherit;
-  font-size: inherit;
-  background: #fff;
-  box-sizing: border-box;
-}
-
-/* 公式栏编辑 */
-.formula-input-wrapper {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding-right: 4px;
-}
-
-.formula-input-edit {
-  flex: 1;
-  height: 24px;
-  padding: 0 8px;
-  border: 1px solid #217346;
-  border-radius: 2px;
+.dsl-preview-body th,
+.dsl-preview-body td {
+  border: 1px solid var(--border-light);
+  padding: 4px 6px;
   font-size: 12px;
-  outline: none;
 }
-
-.formula-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  border: none;
-  border-radius: 2px;
-  cursor: pointer;
-}
-
-.formula-btn.confirm {
-  background: #217346;
-  color: white;
-}
-
-.formula-btn.confirm:hover {
-  background: #1a5c38;
-}
-
-.formula-btn.cancel {
-  background: #e5e5e5;
-  color: #333;
-}
-
-.formula-btn.cancel:hover {
-  background: #d4d4d4;
-}
-
-/* 剪贴板高亮 */
-.excel-cell.clipboard-source {
-  animation: clipboard-dash 1s infinite linear;
-  background-image: repeating-linear-gradient(
-    -45deg,
-    transparent,
-    transparent 3px,
-    rgba(33, 115, 70, 0.1) 3px,
-    rgba(33, 115, 70, 0.1) 6px
-  );
-}
-
-@keyframes clipboard-dash {
-  0% {
-    background-position: 0 0;
-  }
-  100% {
-    background-position: 12px 12px;
-  }
-}
-
-/* Excel 预览容器焦点样式 */
-.excel-preview:focus {
-  outline: none;
-}
-
-/* 禁用按钮样式增强 */
-.ribbon-btn.disabled,
-.ribbon-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-  pointer-events: none;
-}
-

@@ -374,17 +374,17 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
   }, [pptxBase64])
 
   return (
-    <div className={`flex flex-col h-full bg-[#1e1e1e] ${isFullscreen ? 'fixed inset-0 z-50' : ''}`}>
+    <div className={`flex flex-col h-full bg-background ${isFullscreen ? 'fixed inset-0 z-50 bg-background' : ''}`}>
       {/* Ribbon / Toolbar */}
-      <div className="border-b border-[#2d2d2d] bg-[#252526] px-3 py-2 flex items-center gap-3">
-        <div className="text-xs text-[#cccccc] font-medium truncate max-w-[30vw]">
+      <div className="glass border-b border-border px-3 py-2 flex items-center gap-3">
+        <div className="text-xs text-text font-medium truncate max-w-[30vw]">
           PPT 预览：{title}
         </div>
         
         {/* 编辑操作区 */}
         {pptxPath && (
           <>
-            <div className="w-px h-5 bg-[#3a3a3a] mx-1" />
+            <div className="w-px h-5 bg-black/10 dark:bg-white/10 mx-1" />
             <div className="flex items-center gap-1">
               {/* 多选模式切换 */}
               <button
@@ -397,8 +397,8 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
                 }}
                 className={`flex items-center gap-1 px-2 py-1 rounded-md text-xs transition-colors ${
                   isMultiSelectMode
-                    ? 'bg-[#0e639c] text-white'
-                    : 'text-[#cfcfcf] hover:bg-[#2d2d2d]'
+                    ? 'bg-accent text-white border border-accent/25'
+                    : 'text-text-muted hover:text-text hover:bg-black/5 dark:hover:bg-white/5 border border-transparent'
                 }`}
                 title={isMultiSelectMode ? '退出多选' : '多选页面'}
               >
@@ -409,20 +409,20 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
               {isMultiSelectMode && (
                 <button
                   onClick={toggleSelectAll}
-                  className="px-2 py-1 rounded-md text-xs text-[#cfcfcf] hover:bg-[#2d2d2d]"
+                  className="px-2 py-1 rounded-md text-xs text-text-muted hover:text-text hover:bg-black/5 dark:hover:bg-white/5"
                   title={selectedPages.size === slideCount ? '取消全选' : '全选'}
                 >
                   {selectedPages.size === slideCount ? '取消全选' : '全选'}
                 </button>
               )}
               
-              <div className="w-px h-4 bg-[#3a3a3a] mx-1" />
+              <div className="w-px h-4 bg-black/10 dark:bg-white/10 mx-1" />
               
               {/* 整页重做 */}
               <button
                 onClick={() => handleEditRequest('regenerate')}
                 disabled={isMultiSelectMode && selectedPages.size === 0}
-                className="flex items-center gap-1 px-2 py-1 rounded-md text-xs text-[#cfcfcf] hover:bg-[#2d2d2d] disabled:opacity-40 disabled:cursor-not-allowed"
+                className="flex items-center gap-1 px-2 py-1 rounded-md text-xs text-text-muted hover:text-text hover:bg-black/5 dark:hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed"
                 title="整页重做：根据反馈重新生成选中页面"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
@@ -433,7 +433,7 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
               <button
                 onClick={() => handleEditRequest('partial_edit')}
                 disabled={isMultiSelectMode && selectedPages.size === 0}
-                className="flex items-center gap-1 px-2 py-1 rounded-md text-xs text-[#cfcfcf] hover:bg-[#2d2d2d] disabled:opacity-40 disabled:cursor-not-allowed"
+                className="flex items-center gap-1 px-2 py-1 rounded-md text-xs text-text-muted hover:text-text hover:bg-black/5 dark:hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed"
                 title="局部编辑：修改背景、文字等局部内容"
               >
                 <Paintbrush className="w-3.5 h-3.5" />
@@ -450,7 +450,7 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
               if (!canPrev) return
               setActiveIndex((i) => Math.max(0, i - 1))
             }}
-            className="p-1.5 rounded-md text-[#cfcfcf] disabled:opacity-40 hover:bg-[#2d2d2d]"
+            className="p-1.5 rounded-md text-text-muted hover:text-text disabled:opacity-40 hover:bg-black/5 dark:hover:bg-white/5"
             title="上一页"
           >
             <ChevronLeft className="w-4 h-4" />
@@ -461,26 +461,26 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
               if (!canNext) return
               setActiveIndex((i) => Math.min(Math.max(slideCount - 1, 0), i + 1))
             }}
-            className="p-1.5 rounded-md text-[#cfcfcf] disabled:opacity-40 hover:bg-[#2d2d2d]"
+            className="p-1.5 rounded-md text-text-muted hover:text-text disabled:opacity-40 hover:bg-black/5 dark:hover:bg-white/5"
             title="下一页"
           >
             <ChevronRight className="w-4 h-4" />
           </button>
 
-          <div className="w-px h-5 bg-[#3a3a3a] mx-2" />
+          <div className="w-px h-5 bg-black/10 dark:bg-white/10 mx-2" />
 
-          <div className="flex items-center bg-[#1e1e1e] border border-[#2d2d2d] rounded-md overflow-hidden">
+          <div className="flex items-center bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 rounded-md overflow-hidden">
             <button
               onClick={() => setScale((s) => Math.max(25, s - 10))}
-              className="px-2 py-1 text-xs text-[#cfcfcf] hover:bg-[#2d2d2d]"
+              className="px-2 py-1 text-xs text-text-muted hover:text-text hover:bg-black/10 dark:hover:bg-white/10"
               title="缩小"
             >
               -
             </button>
-            <span className="px-2 text-xs text-[#cfcfcf] min-w-[52px] text-center">{scale}%</span>
+            <span className="px-2 text-xs text-text-secondary min-w-[52px] text-center">{scale}%</span>
             <button
               onClick={() => setScale((s) => Math.min(200, s + 10))}
-              className="px-2 py-1 text-xs text-[#cfcfcf] hover:bg-[#2d2d2d]"
+              className="px-2 py-1 text-xs text-text-muted hover:text-text hover:bg-black/10 dark:hover:bg-white/10"
               title="放大"
             >
               +
@@ -489,7 +489,7 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
 
           <button
             onClick={() => setIsFullscreen((v) => !v)}
-            className="p-1.5 rounded-md text-[#cfcfcf] hover:bg-[#2d2d2d] ml-2"
+            className="p-1.5 rounded-md text-text-muted hover:text-text hover:bg-black/5 dark:hover:bg-white/5 ml-2"
             title={isFullscreen ? '退出全屏' : '全屏'}
           >
             {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
@@ -500,7 +500,7 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
       {/* Body - 左侧缩略图 + 右侧主画布 */}
       <div className="flex-1 flex overflow-hidden">
         {/* 左侧缩略图导航栏 */}
-        <div className="w-[140px] flex-shrink-0 bg-[#1a1a1a] border-r border-[#2d2d2d] overflow-y-auto">
+        <div className="w-[140px] flex-shrink-0 glass-panel overflow-y-auto">
           <div className="p-2 space-y-2">
             {slideImages.map((img, idx) => {
               const isSelected = selectedPages.has(idx)
@@ -520,7 +520,7 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
                       }}
                       className={`absolute top-1 right-1 z-20 w-5 h-5 rounded flex items-center justify-center transition-colors ${
                         isSelected
-                          ? 'bg-[#0e639c] text-white'
+                          ? 'bg-accent text-white'
                           : 'bg-black/60 text-white/60 hover:bg-black/80'
                       }`}
                     >
@@ -544,10 +544,10 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
                     }}
                     className={`w-full relative rounded-md overflow-hidden border-2 transition-all cursor-pointer ${
                       isSelected
-                        ? 'border-[#0e639c] ring-2 ring-[#0e639c]/50'
+                        ? 'border-accent ring-2 ring-accent/25'
                         : isActive
-                        ? 'border-[#0e639c] ring-1 ring-[#0e639c]/50'
-                        : 'border-transparent hover:border-[#3c3c3c]'
+                        ? 'border-accent ring-1 ring-accent/20'
+                        : 'border-transparent hover:border-black/20 dark:hover:border-white/20'
                     }`}
                   >
                     {/* 页码标签 */}
@@ -561,7 +561,7 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
                       </div>
                     )}
                     {/* 缩略图 */}
-                    <div className="aspect-[16/10] bg-[#111] flex items-center justify-center">
+                    <div className="aspect-[16/10] bg-black/40 flex items-center justify-center">
                       {img ? (
                         <img
                           src={img}
@@ -570,7 +570,7 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
                           draggable={false}
                         />
                       ) : (
-                        <div className="text-[8px] text-[#666]">无图片</div>
+                        <div className="text-[8px] text-text-dim">无图片</div>
                       )}
                     </div>
                   </div>
@@ -578,7 +578,7 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
               )
             })}
             {loading && slideImages.length === 0 && (
-              <div className="text-[10px] text-[#666] text-center py-4">
+              <div className="text-[10px] text-text-dim text-center py-4">
                 <Loader2 className="w-4 h-4 animate-spin mx-auto mb-2" />
                 加载中...
               </div>
@@ -589,7 +589,7 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
         {/* 右侧主画布区域 */}
         <div 
           ref={mainCanvasRef}
-          className="flex-1 overflow-auto bg-[#111] relative"
+          className="flex-1 overflow-auto bg-black/5 dark:bg-white/5 relative"
           onMouseUp={handleSelectionMouseUp}
           onMouseLeave={() => {
             if (isSelecting) {
@@ -602,7 +602,7 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
           <div className="min-h-full p-6 flex flex-col items-center justify-center">
             <div
               ref={slideContainerRef}
-              className="bg-black shadow-[0_10px_40px_rgba(0,0,0,0.55)] border border-[#2d2d2d] origin-center overflow-hidden relative select-none"
+              className="bg-black shadow-[0_10px_40px_rgba(0,0,0,0.55)] border border-black/10 dark:border-white/10 origin-center overflow-hidden relative select-none"
               style={{
                 width: '960px',
                 height: '600px',
@@ -624,7 +624,7 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
                   />
                 ) : (
                   !loading && (
-                    <div className="text-xs text-[#9aa0a6] px-6 text-center">
+                    <div className="text-xs text-text-dim px-6 text-center">
                       本页未检测到可渲染的图片元素
                     </div>
                   )
@@ -634,7 +634,7 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
               {/* 框选区域可视化 */}
               {isSelecting && selectionRect && selectionRect.w > 0 && selectionRect.h > 0 && (
                 <div
-                  className="absolute border-2 border-dashed border-[#0e639c] bg-[#0e639c]/20 pointer-events-none z-30"
+                  className="absolute border-2 border-dashed border-accent bg-accent/20 pointer-events-none z-30"
                   style={{
                     left: selectionRect.x,
                     top: selectionRect.y,
@@ -645,25 +645,25 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
               )}
 
               {loading && (
-                <div className="absolute inset-0 flex items-center justify-center text-sm text-[#9aa0a6] gap-2 bg-black/40">
+                <div className="absolute inset-0 flex items-center justify-center text-sm text-text-dim gap-2 bg-black/40">
                   <Loader2 className="w-4 h-4 animate-spin" />
                   正在渲染 PPT…
                 </div>
               )}
 
               {!loading && error && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center text-sm px-6 text-center bg-[#1a1a1a]">
+                <div className="absolute inset-0 flex flex-col items-center justify-center text-sm px-6 text-center bg-black/60">
                   <FileWarning className="w-12 h-12 text-amber-500 mb-4" />
-                  <div className="text-[#ffb4b4] mb-2">预览加载失败</div>
-                  <div className="text-xs text-[#888] mb-4 max-w-[300px]">{error}</div>
+                  <div className="text-error mb-2">预览加载失败</div>
+                  <div className="text-xs text-text-muted mb-4 max-w-[300px]">{error}</div>
                 </div>
               )}
             </div>
             
             {/* Ctrl 框选提示 */}
             {!loading && !error && currentSlideImage && (
-              <div className="mt-2 text-[10px] text-[#666] flex items-center gap-1">
-                <span className="px-1.5 py-0.5 bg-[#2d2d2d] rounded text-[#999]">Ctrl</span>
+              <div className="mt-2 text-[10px] text-text-dim flex items-center gap-1">
+                <span className="px-1.5 py-0.5 bg-black/10 dark:bg-white/10 border border-black/10 dark:border-white/10 rounded text-text-dim">Ctrl</span>
                 + 拖拽框选区域进行局部编辑
               </div>
             )}
@@ -673,18 +673,18 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
               <button
                 disabled={!canPrev}
                 onClick={() => setActiveIndex((i) => Math.max(0, i - 1))}
-                className="flex items-center gap-1 px-3 py-1.5 rounded-md bg-[#2d2d2d] text-[#cfcfcf] text-xs disabled:opacity-40 hover:bg-[#3c3c3c] transition-colors"
+                className="flex items-center gap-1 px-3 py-1.5 rounded-md bg-black/10 dark:bg-white/10 border border-black/10 dark:border-white/10 text-text-secondary text-xs disabled:opacity-40 hover:bg-black/15 dark:hover:bg-white/15 transition-colors"
               >
                 <ChevronLeft className="w-4 h-4" />
                 上一页
               </button>
-              <div className="text-sm text-[#cfcfcf] font-medium">
+              <div className="text-sm text-text font-medium">
                 {safeActiveIndex + 1} / {slideCount}
               </div>
               <button
                 disabled={!canNext}
                 onClick={() => setActiveIndex((i) => Math.min(Math.max(slideCount - 1, 0), i + 1))}
-                className="flex items-center gap-1 px-3 py-1.5 rounded-md bg-[#2d2d2d] text-[#cfcfcf] text-xs disabled:opacity-40 hover:bg-[#3c3c3c] transition-colors"
+                className="flex items-center gap-1 px-3 py-1.5 rounded-md bg-black/10 dark:bg-white/10 border border-black/10 dark:border-white/10 text-text-secondary text-xs disabled:opacity-40 hover:bg-black/15 dark:hover:bg-white/15 transition-colors"
               >
                 下一页
                 <ChevronRight className="w-4 h-4" />

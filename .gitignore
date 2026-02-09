@@ -27,4 +27,60 @@ docs/*.docx
 docs/*.pptx
 docs/*_assets/
 
+# ===== 大型资源目录（不纳入版本控制） =====
 
+# ONLYOFFICE Document Server（第三方，请按 README 说明单独部署）
+DocumentServer/
+
+# 运行时字体（public/fonts/onlyoffice 下的大型字体文件）
+public/fonts/onlyoffice/*.ttf
+public/fonts/onlyoffice/*.ttc
+public/fonts/onlyoffice/*.TTF
+
+# 字体目录：仅保留常用字体，忽略其余
+Fonts/*
+# --- 中文核心字体 ---
+!Fonts/simsun.ttc
+!Fonts/simhei.ttf
+!Fonts/simkai.ttf
+!Fonts/simfang.ttf
+!Fonts/msyh.ttc
+!Fonts/msyhbd.ttc
+!Fonts/Deng.ttf
+!Fonts/Dengb.ttf
+!Fonts/STKAITI.TTF
+!Fonts/STSONG.TTF
+!Fonts/STFANGSO.TTF
+# --- 英文核心字体 (Calibri / Times New Roman / Arial / Cambria) ---
+!Fonts/calibri.ttf
+!Fonts/calibrib.ttf
+!Fonts/calibrii.ttf
+!Fonts/calibriz.ttf
+!Fonts/times.ttf
+!Fonts/timesbd.ttf
+!Fonts/timesi.ttf
+!Fonts/timesbi.ttf
+!Fonts/arial.ttf
+!Fonts/arialbd.ttf
+!Fonts/ariali.ttf
+!Fonts/arialbi.ttf
+!Fonts/cambria.ttc
+!Fonts/cambriab.ttf
+!Fonts/cambriai.ttf
+!Fonts/cambriaz.ttf
+# --- 常用补充 (Segoe UI / Consolas / Tahoma / Courier New) ---
+!Fonts/segoeui.ttf
+!Fonts/segoeuib.ttf
+!Fonts/consola.ttf
+!Fonts/consolab.ttf
+!Fonts/tahoma.ttf
+!Fonts/tahomabd.ttf
+!Fonts/cour.ttf
+!Fonts/courbd.ttf
+
+# 第三方项目
+openskills-fix/
+moltbot/
+
+# Claude / AI skills（开发工具配置）
+.claude/

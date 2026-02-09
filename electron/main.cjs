@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog, shell, globalShortcut } = require('electron')
 const path = require('path')
 const fs = require('fs')
+const { createMemoryManager } = require('./memory/index.cjs')
 const http = require('http')
 const https = require('https')
 const mammoth = require('mammoth')
@@ -21,7 +22,15 @@ dotenv.config({ path: path.join(__dirname, '..', '.env') })
 
 let mainWindow
 let fileServer = null
-const FILE_SERVER_PORT = 9090
+let fileServerPort = 9090
+let memoryManager = null
+
+const getMemoryManager = () => {
+  if (!memoryManager) {
+    memoryManager = createMemoryManager(app)
+  }
+  return memoryManager
+}
 
 // 开发模式检测
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged
@@ -320,8 +329,8 @@ function isWebResult(data) {
 }
 
 // 创建本地文件服务器（供 ONLYOFFICE 访问文档）
-function createFileServer() {
-  fileServer = http.createServer((req, res) => {
+function createFileServer(startPort = 9090) {
+  const handler = (req, res) => {
     // 设置 CORS 头，允许 ONLYOFFICE 访问
     res.setHeader('Access-Control-Allow-Origin', '*')
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
@@ -378,15 +387,32 @@ function createFileServer() {
       res.writeHead(500)
       res.end('Internal server error')
     }
-  })
-  
-  fileServer.listen(FILE_SERVER_PORT, '0.0.0.0', () => {
-    console.log(`📁 本地文件服务器已启动: http://localhost:${FILE_SERVER_PORT}`)
-  })
-  
-  fileServer.on('error', (err) => {
-    console.error('文件服务器错误:', err)
-  })
+  }
+
+  const tryListen = (port) => {
+    try {
+      fileServerPort = port
+      fileServer = http.createServer(handler)
+
+      fileServer.on('error', (err) => {
+        if (err && err.code === 'EADDRINUSE') {
+          console.warn(`文件服务器端口 ${port} 被占用，尝试端口 ${port + 1}...`)
+          tryListen(port + 1)
+          return
+        }
+        console.error('文件服务器错误:', err)
+      })
+
+      fileServer.listen(port, '0.0.0.0', () => {
+        fileServerPort = port
+        console.log(`📁 本地文件服务器已启动: http://localhost:${fileServerPort}`)
+      })
+    } catch (e) {
+      console.error('文件服务器启动失败:', e)
+    }
+  }
+
+  tryListen(startPort)
 }
 
 function createWindow() {
@@ -507,13 +533,13 @@ ipcMain.handle('get-file-url', async (event, filePath) => {
   // 将本地文件路径转换为 HTTP URL
   // 使用 host.docker.internal 让 Docker 容器能访问宿主机
   const encodedPath = encodeURIComponent(filePath.replace(/\\/g, '/'))
-  return `http://host.docker.internal:${FILE_SERVER_PORT}/file/${encodedPath}`
+  return `http://host.docker.internal:${fileServerPort}/file/${encodedPath}`
 })
 
 // 获取文件的 HTTP URL（供渲染进程直接使用）
 ipcMain.handle('get-local-file-url', async (_event, filePath) => {
   const encodedPath = encodeURIComponent(filePath.replace(/\\/g, '/'))
-  return `http://localhost:${FILE_SERVER_PORT}/file/${encodedPath}`
+  return `http://localhost:${fileServerPort}/file/${encodedPath}`
 })
 
 // 选择文件夹
@@ -667,6 +693,92 @@ ipcMain.handle('read-file', async (event, filePath) => {
     }
   } catch (error) {
     console.error('读取文件失败:', error)
+    return { success: false, error: error.message }
+  }
+})
+
+// ==================== IPC 处理：记忆系统 ====================
+
+ipcMain.handle('memory-search', async (_event, options) => {
+  try {
+    const mgr = getMemoryManager()
+    const query = options?.query || ''
+    const topK = options?.topK || 5
+    const textWeight = typeof options?.textWeight === 'number' ? options.textWeight : 0.6
+    const vectorWeight = typeof options?.vectorWeight === 'number' ? options.vectorWeight : 0.4
+    const workspaceKey = options?.workspaceKey || ''
+    const sources = options?.sources
+    return mgr.search({ query, topK, textWeight, vectorWeight, workspaceKey, sources })
+  } catch (error) {
+    return { success: false, error: error.message, results: [] }
+  }
+})
+
+ipcMain.handle('memory-append', async (_event, payload) => {
+  try {
+    const mgr = getMemoryManager()
+    const text = payload?.text || ''
+    if (!text.trim()) return { success: false, error: '内容为空' }
+    return mgr.appendDaily({
+      text,
+      source: payload?.source || 'chat',
+      tags: Array.isArray(payload?.tags) ? payload.tags : [],
+    })
+  } catch (error) {
+    return { success: false, error: error.message }
+  }
+})
+
+ipcMain.handle('memory-append-session', async (_event, payload) => {
+  try {
+    const mgr = getMemoryManager()
+    const sessionId = payload?.sessionId || ''
+    const text = payload?.text || ''
+    if (!sessionId || !text.trim()) return { success: false, error: 'sessionId 或内容为空' }
+    return mgr.appendSession({
+      sessionId,
+      text,
+      meta: payload?.meta || {},
+    })
+  } catch (error) {
+    return { success: false, error: error.message }
+  }
+})
+
+ipcMain.handle('memory-status', async () => {
+  try {
+    const mgr = getMemoryManager()
+    return mgr.getStatus()
+  } catch (error) {
+    return { success: false, error: error.message }
+  }
+})
+
+ipcMain.handle('memory-status-detail', async () => {
+  try {
+    const mgr = getMemoryManager()
+    return mgr.getStatusDetail()
+  } catch (error) {
+    return { success: false, error: error.message }
+  }
+})
+
+ipcMain.handle('memory-clear', async (_event, payload) => {
+  try {
+    const mgr = getMemoryManager()
+    const scope = payload?.scope || 'all'
+    return mgr.clear(scope)
+  } catch (error) {
+    return { success: false, error: error.message }
+  }
+})
+
+ipcMain.handle('memory-rebuild-index', async () => {
+  try {
+    const mgr = getMemoryManager()
+    mgr.rebuildAll()
+    return mgr.getStatusDetail()
+  } catch (error) {
     return { success: false, error: error.message }
   }
 })
@@ -1213,9 +1325,24 @@ ipcMain.handle('excel-open', async (_event, filePath) => {
     const names = workbook.definedNames?.model || []
     
     workbook.eachSheet((worksheet, sheetId) => {
+      // 注意：ExcelJS 的 worksheet.rowCount/columnCount 可能因为“整表格式/模板”变成 1048576/16384
+      // 前端会按 range 构造矩阵，导致 OOM/白屏。这里按真实 used-range（非空单元格 + 合并区域）计算。
+      let maxR = -1
+      let maxC = -1
+
+      const decodeCell = (addr) => {
+        const match = String(addr || '').toUpperCase().match(/^(\$?)([A-Z]+)(\$?)(\d+)$/)
+        if (!match) return null
+        let col = 0
+        for (let i = 0; i < match[2].length; i++) {
+          col = col * 26 + (match[2].charCodeAt(i) - 64)
+        }
+        return { c: col - 1, r: parseInt(match[4], 10) - 1 }
+      }
+
       const sheetData = {
         name: worksheet.name,
-        range: { s: { r: 0, c: 0 }, e: { r: worksheet.rowCount - 1, c: worksheet.columnCount - 1 } },
+        range: { s: { r: 0, c: 0 }, e: { r: 0, c: 0 } },
         merges: [],
         colWidths: [],
         rowHeights: [],
@@ -1229,25 +1356,14 @@ ipcMain.handle('excel-open', async (_event, filePath) => {
       // 合并单元格
       if (worksheet.model && worksheet.model.merges) {
         worksheet.model.merges.forEach((mergeRange) => {
-          const decoded = ExcelJS.utils ? ExcelJS.utils.decodeAddress(mergeRange) : null
-          if (!decoded) {
-            // 手动解析 "A1:B2" 格式
-            const parts = mergeRange.split(':')
-            if (parts.length === 2) {
-              const decodeCell = (addr) => {
-                const match = addr.match(/^([A-Z]+)(\d+)$/)
-                if (!match) return { c: 0, r: 0 }
-                let col = 0
-                for (let i = 0; i < match[1].length; i++) {
-                  col = col * 26 + (match[1].charCodeAt(i) - 64)
-                }
-                return { c: col - 1, r: parseInt(match[2], 10) - 1 }
-              }
-              const start = decodeCell(parts[0])
-              const end = decodeCell(parts[1])
-              sheetData.merges.push({ s: { r: start.r, c: start.c }, e: { r: end.r, c: end.c } })
-            }
-          }
+          const parts = String(mergeRange || '').split(':')
+          if (parts.length !== 2) return
+          const start = decodeCell(parts[0])
+          const end = decodeCell(parts[1])
+          if (!start || !end) return
+          sheetData.merges.push({ s: { r: start.r, c: start.c }, e: { r: end.r, c: end.c } })
+          maxR = Math.max(maxR, end.r)
+          maxC = Math.max(maxC, end.c)
         })
       }
       
@@ -1271,6 +1387,8 @@ ipcMain.handle('excel-open', async (_event, filePath) => {
         row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
           const r = rowNumber - 1
           const c = colNumber - 1
+          maxR = Math.max(maxR, r)
+          maxC = Math.max(maxC, c)
           
           // 提取样式
           const styleObj = {}
@@ -1405,6 +1523,13 @@ ipcMain.handle('excel-open', async (_event, filePath) => {
           })
         })
       })
+
+      // 修正 range：使用真实 used-range，避免 rowCount/columnCount 造成超大范围
+      if (maxR >= 0 && maxC >= 0) {
+        sheetData.range.e = { r: maxR, c: maxC }
+      } else {
+        sheetData.range.e = { r: 0, c: 0 }
+      }
       
       sheets.push(sheetData)
     })
@@ -4525,6 +4650,94 @@ ipcMain.handle('get-file-info', async (event, filePath) => {
   }
 })
 
+// ==================== 环境变量配置读写 ====================
+
+// 读取 .env 文件中的设置
+ipcMain.handle('get-env-settings', async () => {
+  const envPath = path.join(__dirname, '..', '.env')
+  const result = {}
+  try {
+    if (fs.existsSync(envPath)) {
+      const envContent = fs.readFileSync(envPath, 'utf-8')
+      const parsed = dotenv.parse(envContent)
+      // 映射 env 变量到设置对象
+      if (parsed.API_KEY) result.apiKey = parsed.API_KEY
+      if (parsed.BASE_URL) result.baseUrl = parsed.BASE_URL
+      if (parsed.MODEL) result.model = parsed.MODEL
+      if (parsed.TEMPERATURE) result.temperature = parseFloat(parsed.TEMPERATURE)
+      if (parsed.MAX_TOKENS) result.maxTokens = parseInt(parsed.MAX_TOKENS, 10)
+      if (parsed.DASHSCOPE_API_KEY) result.dashscopeApiKey = parsed.DASHSCOPE_API_KEY
+      if (parsed.OPENROUTER_API_KEY) result.openRouterApiKey = parsed.OPENROUTER_API_KEY
+      if (parsed.PPT_IMAGE_MODEL) result.pptImageModel = parsed.PPT_IMAGE_MODEL
+      if (parsed.BRAVE_API_KEY) result.braveApiKey = parsed.BRAVE_API_KEY
+      // 本地模型
+      const hasLocal = parsed.LOCAL_MODEL_BASE_URL || parsed.LOCAL_MODEL_NAME
+      if (hasLocal) {
+        result.localModel = {
+          enabled: parsed.LOCAL_MODEL_ENABLED !== 'false',
+          baseUrl: parsed.LOCAL_MODEL_BASE_URL || '',
+          model: parsed.LOCAL_MODEL_NAME || '',
+          apiKey: parsed.LOCAL_MODEL_API_KEY || '',
+        }
+      }
+      // 记忆系统
+      if (parsed.MEMORY_ENABLED !== undefined) result.memoryEnabled = parsed.MEMORY_ENABLED !== 'false'
+      if (parsed.MEMORY_TOP_K) result.memoryTopK = parseInt(parsed.MEMORY_TOP_K, 10)
+      if (parsed.MEMORY_MAX_CHARS) result.memoryMaxChars = parseInt(parsed.MEMORY_MAX_CHARS, 10)
+      if (parsed.MEMORY_FLUSH_THRESHOLD) result.memoryFlushThresholdChars = parseInt(parsed.MEMORY_FLUSH_THRESHOLD, 10)
+    }
+  } catch (e) {
+    console.warn('读取 .env 设置失败:', e)
+  }
+  return result
+})
+
+// 保存设置到 .env 文件
+ipcMain.handle('save-env-settings', async (_event, settings) => {
+  const envPath = path.join(__dirname, '..', '.env')
+  try {
+    const lines = [
+      '# Word-Cursor 配置文件（由设置界面自动生成）',
+      '# 复制到新电脑即可直接使用，无需重新配置',
+      '',
+      '# ===== LLM 主模型 =====',
+      `API_KEY=${settings.apiKey || ''}`,
+      `BASE_URL=${settings.baseUrl || ''}`,
+      `MODEL=${settings.model || ''}`,
+      `TEMPERATURE=${settings.temperature ?? 1}`,
+      `MAX_TOKENS=${settings.maxTokens ?? 4096}`,
+      '',
+      '# ===== PPT 图像生成 =====',
+      `DASHSCOPE_API_KEY=${settings.dashscopeApiKey || ''}`,
+      `OPENROUTER_API_KEY=${settings.openRouterApiKey || ''}`,
+      `PPT_IMAGE_MODEL=${settings.pptImageModel || 'gemini-image'}`,
+      '',
+      '# ===== 联网搜索 =====',
+      `BRAVE_API_KEY=${settings.braveApiKey || ''}`,
+      '',
+      '# ===== 本地模型（Tab 补全）=====',
+      `LOCAL_MODEL_ENABLED=${settings.localModel?.enabled ?? true}`,
+      `LOCAL_MODEL_BASE_URL=${settings.localModel?.baseUrl || ''}`,
+      `LOCAL_MODEL_NAME=${settings.localModel?.model || ''}`,
+      `LOCAL_MODEL_API_KEY=${settings.localModel?.apiKey || ''}`,
+      '',
+      '# ===== 记忆系统 =====',
+      `MEMORY_ENABLED=${settings.memoryEnabled ?? true}`,
+      `MEMORY_TOP_K=${settings.memoryTopK ?? 5}`,
+      `MEMORY_MAX_CHARS=${settings.memoryMaxChars ?? 2000}`,
+      `MEMORY_FLUSH_THRESHOLD=${settings.memoryFlushThresholdChars ?? 12000}`,
+      '',
+    ]
+    fs.writeFileSync(envPath, lines.join('\n'), 'utf-8')
+    // 同步更新当前进程环境变量
+    dotenv.config({ path: envPath, override: true })
+    return { success: true }
+  } catch (e) {
+    console.warn('保存 .env 设置失败:', e)
+    return { success: false, error: e.message }
+  }
+})
+
 // ==================== 模板文档替换（保留完整格式）====================
 
 // 使用 docxtemplater 进行模板替换 - 完美保留所有格式
@@ -4639,6 +4852,189 @@ ipcMain.handle('web-search', async (event, options = {}) => {
   } catch (error) {
     console.error('Brave Web 搜索失败:', error)
     return { success: false, message: error.message || 'Brave Web 搜索失败，请在设置中配置 Brave Search API Key' }
+  }
+})
+
+// ==================== AI 请求代理（绕开渲染进程 HTTP/2） ====================
+// 说明：渲染进程使用浏览器 fetch（Chromium/HTTP2）时，部分网络环境会出现 ERR_HTTP2_PING_FAILED。
+// 将请求放到主进程使用 Node fetch（通常 HTTP/1.1）可显著提升稳定性，并且不受 CORS 影响。
+const aiAbortControllers = new Map() // requestId -> AbortController
+
+ipcMain.handle('ai-chat-completions', async (event, payload = {}) => {
+  const {
+    requestId,
+    baseUrl,
+    apiKey,
+    model,
+    messages,
+    temperature,
+    maxTokens,
+  } = payload || {}
+  if (!requestId) return { success: false, error: '缺少 requestId' }
+  if (!baseUrl) return { success: false, error: '缺少 baseUrl' }
+  if (!model) return { success: false, error: '缺少 model' }
+  if (!Array.isArray(messages) || messages.length === 0) return { success: false, error: '缺少 messages' }
+
+  const controller = new AbortController()
+  aiAbortControllers.set(requestId, controller)
+
+  const sendDelta = (contentDelta, reasoningDelta, fullContent, fullReasoning) => {
+    try {
+      if (event?.sender && !event.sender.isDestroyed()) {
+        event.sender.send('ai-stream-delta', { 
+          requestId, 
+          delta: contentDelta,           // 内容增量
+          reasoningDelta: reasoningDelta, // 思考增量（kimi-k2.5 等思考模型）
+          fullContent, 
+          fullReasoning 
+        })
+      }
+    } catch (e) {
+      // ignore send errors
+    }
+  }
+
+  try {
+    const headers = {
+      'Content-Type': 'application/json',
+    }
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
+
+    const url = `${baseUrl.replace(/\/$/, '')}/chat/completions`
+    console.log(`[AI API] 请求: ${url}, model=${model}, temperature=${temperature}, messages=${messages?.length}条`)
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers,
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature,
+        max_tokens: maxTokens,
+        stream: true,
+      }),
+    })
+
+    if (!resp.ok) {
+      const errorText = await resp.text().catch(() => '')
+      console.error(`[AI API] 请求失败: HTTP ${resp.status}, ${errorText?.slice(0, 200)}`)
+      return { success: false, error: errorText || `请求失败（HTTP ${resp.status}）` }
+    }
+    console.log(`[AI API] 请求成功，开始流式读取...`)
+
+    const reader = resp.body?.getReader?.()
+    if (!reader) {
+      const text = await resp.text().catch(() => '')
+      return { success: false, error: text || '无法读取响应流' }
+    }
+
+    const decoder = new TextDecoder()
+    let fullContent = ''
+    let fullReasoning = ''  // 思考内容（kimi-k2.5 等思考模型）
+    let buffer = ''
+
+    const extractStreamText = (value) => {
+      if (!value) return ''
+      if (typeof value === 'string') return value
+      if (Array.isArray(value)) {
+        return value.map(part => {
+          if (!part) return ''
+          if (typeof part === 'string') return part
+          if (typeof part.text === 'string') return part.text
+          if (typeof part.content === 'string') return part.content
+          return ''
+        }).join('')
+      }
+      if (typeof value === 'object') {
+        if (typeof value.text === 'string') return value.text
+        if (typeof value.content === 'string') return value.content
+      }
+      return ''
+    }
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        const data = line.slice(6).trim()
+        if (!data || data === '[DONE]') continue
+        try {
+          const json = JSON.parse(data)
+          const choice = json.choices?.[0] || {}
+          const delta = choice?.delta || {}
+          const message = choice?.message || {}
+          let contentDelta = delta?.content || delta?.text || ''
+          // 尝试多种可能的思考内容字段名
+          let reasoningDelta = delta?.reasoning_content || delta?.thinking_content || delta?.reasoning || delta?.thinking || delta?.thought || message?.reasoning_content || json?.reasoning_content || ''
+
+          if (!contentDelta) {
+            const messageContent = extractStreamText(message?.content ?? message?.text)
+            if (messageContent) {
+              contentDelta = messageContent
+            } else if (choice?.text) {
+              contentDelta = choice.text
+            }
+          }
+
+          if (contentDelta && fullContent && contentDelta.startsWith(fullContent)) {
+            contentDelta = contentDelta.slice(fullContent.length)
+          }
+
+          // 调试日志：记录收到的数据结构（首次 delta，便于确认 kimi-k2.5 等模型的字段名）
+          if (!fullContent && !fullReasoning && delta) {
+            const debugPayload = { deltaKeys: Object.keys(delta || {}), hasReasoning: !!reasoningDelta, sample: JSON.stringify(delta).slice(0, 300) }
+            console.log('[AI stream] delta structure:', debugPayload)
+            try { fs.appendFileSync(debugLogPath, JSON.stringify({location:'main.cjs:ai-stream-delta',message:'delta structure',data:debugPayload,timestamp:Date.now()}) + '\n') } catch {}
+          }
+          
+          // 只要有任何增量就发送
+          if (contentDelta || reasoningDelta) {
+            if (contentDelta) fullContent += contentDelta
+            if (reasoningDelta) fullReasoning += reasoningDelta
+            
+            // 从 fullContent 中提取 <think> 标签内的思考内容
+            const thinkMatch = fullContent.match(/<think>([\s\S]*?)<\/think>/g)
+            if (thinkMatch) {
+              const extractedThinking = thinkMatch.map(m => m.replace(/<\/?think>/g, '')).join('\n')
+              if (extractedThinking && extractedThinking !== fullReasoning) {
+                fullReasoning = extractedThinking
+              }
+            }
+            
+            sendDelta(contentDelta, reasoningDelta, fullContent, fullReasoning)
+          }
+        } catch {
+          // ignore parse errors
+        }
+      }
+    }
+
+    console.log(`[AI API] 流式完成: content=${fullContent.length}字, reasoning=${fullReasoning.length}字`)
+    return { success: true, content: fullContent }
+  } catch (error) {
+    console.error(`[AI API] 错误: ${error?.name} - ${error?.message}`)
+    console.error(error?.stack || error)
+    const msg = error?.name === 'AbortError' ? '请求已取消' : (error?.message || String(error))
+    return { success: false, error: msg }
+  } finally {
+    aiAbortControllers.delete(requestId)
+  }
+})
+
+ipcMain.handle('ai-cancel', async (_event, requestId) => {
+  try {
+    const controller = aiAbortControllers.get(requestId)
+    if (controller) controller.abort()
+    aiAbortControllers.delete(requestId)
+    return { success: true }
+  } catch (error) {
+    return { success: false, error: error?.message || String(error) }
   }
 })
 
@@ -6041,10 +6437,6 @@ ipcMain.handle('ppt-generate-deck', async (_event, options = {}) => {
     // 用于收集每页最终使用的 prompt（含修复后的）
     const finalSlidesPrompts = []
 
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/65f1d8ba-6206-43cb-9f6f-22f7361d7de4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'G',location:'electron/main.cjs:ppt-generate-deck:entry',message:'ppt-generate-deck entry',data:{hasOutputPath:!!outputPath,slidesCount:Array.isArray(slides)?slides.length:null,region:dashscope?.region,size:dashscope?.size,postprocessMode:postprocess?.mode,hasApiKey:!!dashscope?.apiKey},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion agent log
-
     if (!outputPath || typeof outputPath !== 'string') {
       return { success: false, error: '缺少 outputPath' }
     }
@@ -6166,16 +6558,9 @@ ipcMain.handle('ppt-generate-deck', async (_event, options = {}) => {
     if (saveImages && !fs.existsSync(assetsDir)) {
       fs.mkdirSync(assetsDir, { recursive: true })
     }
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/65f1d8ba-6206-43cb-9f6f-22f7361d7de4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'G',location:'electron/main.cjs:ppt-generate-deck:assets',message:'assets dir prepared',data:{saveImages,assetsDir},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion agent log
-
     const results = await Promise.all(
       slides.map((s, idx) =>
         limit(async () => {
-          // #region agent log
-          fetch('http://127.0.0.1:7242/ingest/65f1d8ba-6206-43cb-9f6f-22f7361d7de4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'G',location:'electron/main.cjs:ppt-generate-deck:slide-start',message:'slide generation start',data:{idx,promptLen:String(s?.prompt||s?.finalPrompt||'').length},timestamp:Date.now()})}).catch(()=>{});
-          // #endregion agent log
           let prompt = s.prompt || s.finalPrompt || s.finalPromptCNorEN || ''
           let negativePrompt = s.negativePrompt ?? negativePromptDefault
 
@@ -6341,18 +6726,9 @@ ipcMain.handle('ppt-generate-deck', async (_event, options = {}) => {
       })
     }
 
-    // #region agent log
-    let outSize = 0
-    try { outSize = fs.statSync(outputPath).size } catch {}
-    fetch('http://127.0.0.1:7242/ingest/65f1d8ba-6206-43cb-9f6f-22f7361d7de4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'G',location:'electron/main.cjs:ppt-generate-deck:done',message:'ppt-generate-deck done',data:{slideCount:slides.length,imagesCount:images.length,outSize},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion agent log
-
     return { success: true, path: outputPath, slideCount: slides.length }
   } catch (error) {
     console.error('ppt-generate-deck failed:', error)
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/65f1d8ba-6206-43cb-9f6f-22f7361d7de4',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:'debug-session',runId:'pre-fix',hypothesisId:'H',location:'electron/main.cjs:ppt-generate-deck:catch',message:'ppt-generate-deck failed',data:{errorMessage:error?.message||String(error)},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion agent log
     return { success: false, error: error.message || String(error) }
   }
 })
@@ -6778,3 +7154,68 @@ ipcMain.handle('ppt-edit-slides', async (_event, options = {}) => {
   }
 })
 
+// ===================== Fonts IPC =====================
+// 列出 Fonts/ 目录下可用字体文件
+ipcMain.handle('fonts-list', async () => {
+  try {
+    // Fonts 目录相对于项目根目录
+    const fontsDir = path.join(__dirname, '..', 'Fonts')
+    if (!fs.existsSync(fontsDir)) {
+      console.log('[fonts-list] Fonts/ 目录不存在:', fontsDir)
+      return { success: true, fonts: [] }
+    }
+
+    const entries = fs.readdirSync(fontsDir, { withFileTypes: true })
+    const fontFiles = []
+    const supportedExts = ['.ttf', '.otf', '.ttc', '.woff', '.woff2']
+
+    for (const entry of entries) {
+      if (!entry.isFile()) continue
+      const ext = path.extname(entry.name).toLowerCase()
+      if (supportedExts.includes(ext)) {
+        fontFiles.push({
+          name: entry.name,
+          ext,
+          // 文件大小（用于 UI 显示 / 优先加载小字体）
+          size: fs.statSync(path.join(fontsDir, entry.name)).size,
+        })
+      }
+    }
+
+    console.log(`[fonts-list] 找到 ${fontFiles.length} 个字体文件`)
+    return { success: true, fonts: fontFiles }
+  } catch (error) {
+    console.error('[fonts-list] 失败:', error)
+    return { success: false, error: error.message, fonts: [] }
+  }
+})
+
+// 读取单个字体文件为 base64（限制只能读 Fonts/ 下）
+ipcMain.handle('fonts-read', async (event, fileName) => {
+  try {
+    // 安全检查：只允许读取 Fonts/ 目录下的文件
+    const fontsDir = path.join(__dirname, '..', 'Fonts')
+    const safeName = path.basename(String(fileName || ''))
+    if (!safeName) {
+      return { success: false, error: '无效的文件名' }
+    }
+
+    const filePath = path.join(fontsDir, safeName)
+    // 确保路径没有逃逸出 Fonts 目录
+    if (!filePath.startsWith(fontsDir)) {
+      return { success: false, error: '路径不合法' }
+    }
+
+    if (!fs.existsSync(filePath)) {
+      return { success: false, error: '字体文件不存在: ' + safeName }
+    }
+
+    const buffer = fs.readFileSync(filePath)
+    const base64 = buffer.toString('base64')
+    // 日志已移除，减少控制台输出
+    return { success: true, base64, size: buffer.length }
+  } catch (error) {
+    console.error('[fonts-read] 失败:', safeName, error.message)
+    return { success: false, error: error.message }
+  }
+})

@@ -26,6 +26,17 @@ declare global {
       getDocumentText: () => Promise<string>
       // 获取文档结构信息（包含格式描述）
       getDocumentStructure: () => Promise<string>
+      // 获取文档 JSON 快照（包含 theme/sectPr/styles 等）
+      getDocumentJson: (options?: {
+        writeDefaultTextPr?: boolean
+        writeDefaultParaPr?: boolean
+        writeTheme?: boolean
+        writeSectionPr?: boolean
+        writeNumberings?: boolean
+        writeStyles?: boolean
+        includeContent?: boolean
+        maxContentElements?: number
+      }) => Promise<string>
       // 搜索并替换文本
       searchAndReplace: (searchText: string, replaceText: string, replaceAll?: boolean) => Promise<boolean>
       // 在光标位置插入文本
@@ -83,7 +94,7 @@ declare global {
 }
 
 export default function OnlyOfficeEditor() {
-  const { currentFile, isElectron, setDocument } = useDocument()
+  const { currentFile, isElectron, setDocument, setEditorMode } = useDocument()
   const editorContainerRef = useRef<HTMLDivElement>(null)
   const editorInstanceRef = useRef<any>(null)
   const connectorRef = useRef<any>(null)
@@ -294,6 +305,115 @@ export default function OnlyOfficeEditor() {
             resolve('');
           }
         });
+      },
+
+      // 获取文档 JSON 快照（更接近 DocumentServer 的 ToJSON 序列化）
+      getDocumentJson: async (options?: {
+        writeDefaultTextPr?: boolean
+        writeDefaultParaPr?: boolean
+        writeTheme?: boolean
+        writeSectionPr?: boolean
+        writeNumberings?: boolean
+        writeStyles?: boolean
+        includeContent?: boolean
+        maxContentElements?: number
+      }): Promise<string> => {
+        const connector = getConnector()
+        if (!connector) {
+          console.warn('connector 不可用')
+          return ''
+        }
+
+        const writeDefaultTextPr = options?.writeDefaultTextPr !== false
+        const writeDefaultParaPr = options?.writeDefaultParaPr !== false
+        const writeTheme = options?.writeTheme !== false
+        const writeSectionPr = options?.writeSectionPr !== false
+        const writeNumberings = options?.writeNumberings === true
+        const writeStyles = options?.writeStyles !== false
+        const includeContent = options?.includeContent === true
+        const maxContentElements = typeof options?.maxContentElements === 'number' ? options?.maxContentElements : 30
+
+        return new Promise((resolve) => {
+          try {
+            connector.callCommand(
+              function () {
+                // @ts-ignore
+                const oDoc = Api.GetDocument()
+                if (!oDoc) return ''
+
+                // 优先走 WriterToJSON（避免 ToJSON 强制序列化整篇 content 导致巨量 JSON）
+                try {
+                  // @ts-ignore
+                  const WriterToJSON = AscJsonConverter && AscJsonConverter.WriterToJSON
+                  if (WriterToJSON) {
+                    // @ts-ignore
+                    const oWriter = new WriterToJSON()
+                    const out: any = {
+                      type: 'document',
+                      textPr: writeDefaultTextPr ? oWriter.SerTextPr(oDoc.GetDefaultTextPr().TextPr) : undefined,
+                      paraPr: writeDefaultParaPr ? oWriter.SerParaPr(oDoc.GetDefaultParaPr().ParaPr) : undefined,
+                      theme: writeTheme ? oWriter.SerTheme(oDoc.Document.GetTheme()) : undefined,
+                      sectPr: writeSectionPr ? oWriter.SerSectionPr(oDoc.Document.SectPr) : undefined,
+                      numbering: writeNumberings ? oWriter.jsonWordNumberings : undefined,
+                      styles: writeStyles ? oWriter.SerWordStylesForWrite() : undefined,
+                      meta: {
+                        contentIncluded: !!includeContent,
+                        maxContentElements: maxContentElements,
+                      }
+                    }
+
+                    if (includeContent) {
+                      try {
+                        const contentArr = oDoc.Document && oDoc.Document.Content
+                        if (Array.isArray(contentArr)) {
+                          out.content = oWriter.SerContent(contentArr.slice(0, Math.max(0, maxContentElements)), undefined, undefined, undefined, true)
+                        } else {
+                          // fallback: try serializing full content if not an array
+                          out.content = oWriter.SerContent(oDoc.Document.Content, undefined, undefined, undefined, true)
+                        }
+                      } catch (e) {
+                        out.meta.contentError = '' + e
+                      }
+                    } else {
+                      out.meta.note = 'content omitted (use getDocumentStructure for text outline)'
+                    }
+
+                    return JSON.stringify(out)
+                  }
+                } catch (e) {
+                  // ignore and fallback
+                }
+
+                // fallback：ToJSON（可能很大），尽量裁剪 content
+                if (typeof oDoc.ToJSON !== 'function') return ''
+                const raw = oDoc.ToJSON(
+                  !!writeDefaultTextPr,
+                  !!writeDefaultParaPr,
+                  !!writeTheme,
+                  !!writeSectionPr,
+                  !!writeNumberings,
+                  !!writeStyles
+                )
+                try {
+                  const obj = JSON.parse(raw)
+                  if (!includeContent && obj && obj.content) delete obj.content
+                  obj.meta = obj.meta || {}
+                  obj.meta.contentIncluded = !!includeContent
+                  obj.meta.note = obj.meta.note || 'fallback ToJSON used'
+                  return JSON.stringify(obj)
+                } catch (e) {
+                  return raw
+                }
+              },
+              (result: any) => {
+                resolve(typeof result === 'string' ? result : '')
+              }
+            )
+          } catch (e) {
+            console.error('获取文档 JSON 失败:', e)
+            resolve('')
+          }
+        })
       },
 
       // 执行 Document Builder 脚本（创建/修改带格式的内容）
@@ -835,7 +955,7 @@ export default function OnlyOfficeEditor() {
     // 如果没有文件或没有文件 URL，显示提示
     if (!currentFile || !fileUrl) {
       container.innerHTML = `
-        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: #888;">
+        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--text-muted);">
           <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
             <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
             <polyline points="14 2 14 8 20 8"></polyline>
@@ -844,7 +964,7 @@ export default function OnlyOfficeEditor() {
             <polyline points="10 9 9 9 8 9"></polyline>
           </svg>
           <p style="margin-top: 16px; font-size: 16px;">请从左侧选择一个文档</p>
-          <p style="margin-top: 8px; font-size: 12px; color: #666;">支持 .docx, .xlsx, .pptx 格式</p>
+          <p style="margin-top: 8px; font-size: 12px; color: var(--text-dim);">支持 .docx, .xlsx, .pptx 格式</p>
         </div>
       `
       return
@@ -1047,8 +1167,8 @@ export default function OnlyOfficeEditor() {
   if (error) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center bg-background p-8">
-        <AlertCircle className="w-12 h-12 text-red-500 mb-4" />
-        <p className="text-red-400 mb-4 text-center">{error}</p>
+        <AlertCircle className="w-12 h-12 text-error mb-4" />
+        <p className="text-error mb-4 text-center">{error}</p>
         <button
           onClick={handleRetry}
           className="flex items-center gap-2 px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary-hover transition-colors"
@@ -1065,7 +1185,7 @@ export default function OnlyOfficeEditor() {
           </ul>
           <div className="mt-3 p-2 bg-background rounded text-xs font-mono">
             <p className="text-text-dim mb-1">启动命令：</p>
-            <code className="text-green-400">docker start onlyoffice-ds</code>
+            <code className="text-accent">docker start onlyoffice-ds</code>
           </div>
         </div>
       </div>
@@ -1076,24 +1196,37 @@ export default function OnlyOfficeEditor() {
     <div className="flex-1 flex flex-col bg-background overflow-hidden" style={{ height: '100%' }}>
       {/* 状态栏 */}
       {currentFile && fileUrl && (
-        <div className="px-4 py-2 bg-green-500/10 border-b border-green-500/20 flex items-center gap-2 flex-shrink-0">
-          <CheckCircle className="w-4 h-4 text-green-400" />
-          <span className="text-xs text-green-400">
-            ONLYOFFICE - {currentFile.name}
+        <div className="px-4 py-2 bg-surface border-b border-border-light flex items-center gap-2 flex-shrink-0">
+          <span className="inline-flex items-center justify-center w-6 h-6 rounded-md bg-success/10 border border-success/20">
+            <CheckCircle className="w-4 h-4 text-success" />
           </span>
-          {isEditorReady && (
-            <span className="ml-auto text-xs text-green-400/60">
-              AI 已就绪
-            </span>
-          )}
+          <span className="text-xs text-text-secondary">
+            ONLYOFFICE · {currentFile.name}
+          </span>
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              onClick={() => setEditorMode('tiptap')}
+              className="px-2.5 py-1 text-[11px] rounded-lg bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 text-text-muted hover:text-text hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
+              title="返回内置编辑器（Word Ribbon）"
+            >
+              返回内置编辑器
+            </button>
+            {isEditorReady && (
+              <span className="text-xs text-text-dim">
+                AI 已就绪
+              </span>
+            )}
+          </div>
         </div>
       )}
       
       {!currentFile && (
-        <div className="px-4 py-2 bg-blue-500/10 border-b border-blue-500/20 flex items-center gap-2 flex-shrink-0">
-          <FileText className="w-4 h-4 text-blue-400" />
-          <span className="text-xs text-blue-400">
-            ONLYOFFICE 编辑器 - 请选择一个文档
+        <div className="px-4 py-2 bg-surface border-b border-border-light flex items-center gap-2 flex-shrink-0">
+          <span className="inline-flex items-center justify-center w-6 h-6 rounded-md bg-accent/10 border border-accent/20">
+            <FileText className="w-4 h-4 text-accent" />
+          </span>
+          <span className="text-xs text-text-secondary">
+            ONLYOFFICE 编辑器 · 请选择一个文档
           </span>
         </div>
       )}

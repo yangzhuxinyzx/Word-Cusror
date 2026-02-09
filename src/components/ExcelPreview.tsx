@@ -61,6 +61,17 @@ type SheetMatrix = {
   rows: MatrixCell[][]
   rowCount: number
   colCount: number
+  meta?: {
+    rawRowCount: number
+    rawColCount: number
+    rowClamped: boolean
+    colClamped: boolean
+  }
+}
+
+type BuildMatrixOptions = {
+  minRows?: number
+  minCols?: number
 }
 
 // 编辑历史记录类型
@@ -266,14 +277,21 @@ function convertCellStyle(cell?: ExcelCell): CSSProperties {
   return style
 }
 
-function buildMatrix(sheet: ExcelSheet): SheetMatrix {
+function buildMatrix(sheet: ExcelSheet, options: BuildMatrixOptions = {}): SheetMatrix {
   // 计算实际数据范围
   const dataRowEnd = Math.max(sheet.range.e.r + 1, 1)
   const dataColEnd = Math.max(sheet.range.e.c + 1, 1)
   // 像 Excel 一样显示更多的行和列
   // 最少显示 100 行，26 列（A-Z），或者数据范围 + 额外空白
-  const rowCount = Math.max(dataRowEnd + 50, 100)
-  const colCount = Math.max(dataColEnd + 10, 26)
+  const rawRowCount = Math.max(dataRowEnd + 50, 100, options.minRows ?? 0)
+  const rawColCount = Math.max(dataColEnd + 10, 26, options.minCols ?? 0)
+
+  // 防御性上限：避免异常 used-range（例如模板/整表格式）导致矩阵超大 -> 白屏/卡死
+  const MAX_ROWS = 2000
+  const MAX_COLS = 200
+  const rowCount = Math.min(rawRowCount, MAX_ROWS)
+  const colCount = Math.min(rawColCount, MAX_COLS)
+
   const rows: MatrixCell[][] = Array.from({ length: rowCount }, () =>
     Array.from({ length: colCount }, () => ({} as MatrixCell))
   )
@@ -282,12 +300,16 @@ function buildMatrix(sheet: ExcelSheet): SheetMatrix {
 
   // 合并
   sheet.merges.forEach((m) => {
+    if (m.s.r >= rowCount || m.s.c >= colCount) return
+    const endR = Math.min(m.e.r, rowCount - 1)
+    const endC = Math.min(m.e.c, colCount - 1)
+
     rows[m.s.r][m.s.c].merge = {
-      rowSpan: m.e.r - m.s.r + 1,
-      colSpan: m.e.c - m.s.c + 1,
+      rowSpan: endR - m.s.r + 1,
+      colSpan: endC - m.s.c + 1,
     }
-    for (let r = m.s.r; r <= m.e.r; r++) {
-      for (let c = m.s.c; c <= m.e.c; c++) {
+    for (let r = m.s.r; r <= endR; r++) {
+      for (let c = m.s.c; c <= endC; c++) {
         if (r === m.s.r && c === m.s.c) continue
         skip.add(`${r}-${c}`)
       }
@@ -300,7 +322,17 @@ function buildMatrix(sheet: ExcelSheet): SheetMatrix {
     rows[cell.r][cell.c].cell = cell
   })
 
-  return { rows, rowCount, colCount }
+  return {
+    rows,
+    rowCount,
+    colCount,
+    meta: {
+      rawRowCount,
+      rawColCount,
+      rowClamped: rawRowCount !== rowCount,
+      colClamped: rawColCount !== colCount,
+    },
+  }
 }
 
 // 选区类型
@@ -328,6 +360,8 @@ function getCellAddress(r: number, c: number) {
 function ExcelPreview({ sheets, initialSheetIndex = 0, filePath, onRefresh }: ExcelPreviewProps) {
   const [activeIndex, setActiveIndex] = useState(initialSheetIndex)
   const [zoom, setZoom] = useState(100)
+  const [viewportSize, setViewportSize] = useState({ w: 0, h: 0 })
+  const [isRibbonCollapsed, setIsRibbonCollapsed] = useState(true)
   
   // 本地数据状态（用于编辑）
   const [localSheets, setLocalSheets] = useState<ExcelSheet[]>(sheets)
@@ -362,6 +396,7 @@ function ExcelPreview({ sheets, initialSheetIndex = 0, filePath, onRefresh }: Ex
   const editInputRef = useRef<HTMLInputElement>(null)
   const formulaInputRef = useRef<HTMLInputElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
+  const tableWrapperRef = useRef<HTMLDivElement>(null)
   
   const activeSheet = localSheets[activeIndex]
   
@@ -378,6 +413,22 @@ function ExcelPreview({ sheets, initialSheetIndex = 0, filePath, onRefresh }: Ex
       editInputRef.current.select()
     }
   }, [editingCell])
+
+  // 监听表格视口尺寸（用于“填满可视区”的空行/空列计算，避免出现大片空白）
+  useEffect(() => {
+    const el = tableWrapperRef.current
+    if (!el) return
+
+    const update = () => {
+      const rect = el.getBoundingClientRect()
+      setViewportSize({ w: Math.round(rect.width), h: Math.round(rect.height) })
+    }
+
+    update()
+    const ro = new ResizeObserver(() => update())
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
   
   const handleZoomChange = (delta: number) => {
     setZoom((prev) => Math.min(200, Math.max(25, prev + delta)))
@@ -1820,11 +1871,40 @@ function ExcelPreview({ sheets, initialSheetIndex = 0, filePath, onRefresh }: Ex
     ]
   )
 
-  const matrix = useMemo(() => (activeSheet ? buildMatrix(activeSheet) : null), [activeSheet])
+  const matrix = useMemo(() => {
+    if (!activeSheet) return null
+    const zoomRatioLocal = zoom / 100
+    const baseRowH = 20
+    const baseColW = 72
+    const headerW = 40
+    const safeW = Math.max(0, viewportSize.w - headerW)
+    const safeH = Math.max(0, viewportSize.h - 28) // 预留表头高度
+
+    // 让“空表区域”也填满可视区：按视口/缩放计算最少行列数
+    const minRowsForView = Math.max(
+      100,
+      Math.ceil(safeH / Math.max(1, baseRowH * zoomRatioLocal)) + 10
+    )
+    const minColsForView = Math.max(
+      26,
+      Math.ceil(safeW / Math.max(1, baseColW * zoomRatioLocal)) + 6
+    )
+
+    return buildMatrix(activeSheet, { minRows: minRowsForView, minCols: minColsForView })
+  }, [activeSheet, viewportSize.w, viewportSize.h, zoom])
 
   if (!activeSheet || !matrix) {
-    return <div style={{ padding: 16, color: '#666' }}>暂无可预览的工作表</div>
+    return <div style={{ padding: 16, color: 'var(--text-muted)' }}>暂无可预览的工作表</div>
   }
+
+  // 缩放策略：
+  // - Chromium/Electron 支持非标准 CSS `zoom`，它会影响布局尺寸与滚动尺寸，更接近 Excel 的缩放体验
+  // - 非支持环境回退到 transform scale（可能出现“滚动尺寸与显示不一致”的空白区）
+  const zoomRatio = zoom / 100
+  const canUseCssZoom = typeof document !== 'undefined' && 'zoom' in document.documentElement.style
+  const tableScalerStyle = canUseCssZoom
+    ? ({ zoom: zoomRatio } as React.CSSProperties)
+    : ({ transform: `scale(${zoomRatio})`, transformOrigin: 'top left' } as React.CSSProperties)
 
   const colWidths = activeSheet.colWidths || []
   const rowHeights = activeSheet.rowHeights || []
@@ -1883,21 +1963,33 @@ function ExcelPreview({ sheets, initialSheetIndex = 0, filePath, onRefresh }: Ex
       {/* 顶部 Ribbon 占位 */}
       <div className="excel-ribbon">
         <div className="excel-ribbon-tabs">
-          {['开始', '插入', '页面布局', '公式', '数据', '审阅', '视图'].map((tab) => (
-            <div key={tab} className="excel-ribbon-tab">
-              {tab}
-            </div>
-          ))}
+          <div className="excel-ribbon-tabs-inner">
+            {['开始', '插入', '页面布局', '公式', '数据', '审阅', '视图'].map((tab) => (
+              <div key={tab} className="excel-ribbon-tab">
+                {tab}
+              </div>
+            ))}
+          </div>
+          <button
+            type="button"
+            className="excel-ribbon-collapse"
+            onClick={() => setIsRibbonCollapsed(v => !v)}
+            title={isRibbonCollapsed ? '展开功能区' : '收起功能区'}
+          >
+            {isRibbonCollapsed ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+          </button>
         </div>
-        <div className="excel-ribbon-tools">
-          {ribbonGroups.map((group, idx) => (
-            <div key={group.title} className="excel-tool-group">
-              {group.layout}
-              <div className="tool-title">{group.title}</div>
-              {idx < ribbonGroups.length - 1 && <div className="ribbon-divider" />}
-            </div>
-          ))}
-        </div>
+        {!isRibbonCollapsed && (
+          <div className="excel-ribbon-tools">
+            {ribbonGroups.map((group, idx) => (
+              <div key={group.title} className="excel-tool-group">
+                {group.layout}
+                <div className="tool-title">{group.title}</div>
+                {idx < ribbonGroups.length - 1 && <div className="ribbon-divider" />}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* 顶部公式栏模拟 */}
@@ -1947,11 +2039,17 @@ function ExcelPreview({ sheets, initialSheetIndex = 0, filePath, onRefresh }: Ex
 
       {/* 主表格区域 */}
       <div 
+        ref={tableWrapperRef}
         className="excel-table-wrapper"
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
       >
-        <div className="excel-table-scaler" style={{ transform: `scale(${zoom / 100})`, transformOrigin: 'top left' }}>
+        {(matrix.meta?.rowClamped || matrix.meta?.colClamped) && (
+          <div className="sticky top-0 z-20 px-3 py-2 text-xs bg-black/5 dark:bg-white/5 border-b border-black/10 dark:border-white/10 text-text-muted backdrop-blur">
+            工作表范围过大：已仅渲染前 {matrix.rowCount} 行 / {matrix.colCount} 列（原始 {matrix.meta?.rawRowCount} 行 / {matrix.meta?.rawColCount} 列），防止卡死。
+          </div>
+        )}
+        <div className="excel-table-scaler" style={tableScalerStyle}>
         <table className="excel-table" ref={tableRef}>
           <colgroup>{colGroup}</colgroup>
           <thead>

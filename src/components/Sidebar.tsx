@@ -3,16 +3,21 @@ import {
   ChevronRight, 
   ChevronDown, 
   FileText, 
+  FileCode,
+  FileImage,
+  FileSpreadsheet,
   Folder, 
   FolderOpen,
   Plus,
   Search,
-  MoreHorizontal,
   Upload,
   FilePlus,
   FolderPlus,
   RefreshCw,
-  ExternalLink
+  Settings,
+  Image,
+  Clock,
+  Pencil
 } from 'lucide-react'
 import { useDocument } from '../context/DocumentContext'
 import { FileItem } from '../types'
@@ -38,17 +43,45 @@ function FileTreeItem({ item, level, onSelect, onDragStart, selectedPath }: File
     }
   }
 
+  // Finder 风格：按文件类型给 icon 轻量点缀色（避免整体太单一）
+  const getFileVisual = (name: string): { Icon: React.ElementType; fg: string; bg: string } => {
+    const lower = name.toLowerCase()
+
+    // Images
+    if (/\.(png|jpg|jpeg|gif|webp|svg)$/.test(lower)) {
+      return { Icon: FileImage, fg: 'text-system-purple', bg: 'bg-system-purple/12' }
+    }
+    // PDF
+    if (lower.endsWith('.pdf')) {
+      return { Icon: FileText, fg: 'text-error', bg: 'bg-error/12' }
+    }
+    // PPT
+    if (/\.(pptx|ppt)$/.test(lower)) {
+      return { Icon: Image, fg: 'text-warning', bg: 'bg-warning/12' }
+    }
+    // Excel
+    if (/\.(xlsx|xls|csv)$/.test(lower)) {
+      return { Icon: FileSpreadsheet, fg: 'text-success', bg: 'bg-success/12' }
+    }
+    // Code-like
+    if (/\.(ts|tsx|js|jsx|json|yml|yaml|py|go|rs|java|md|txt)$/.test(lower)) {
+      return { Icon: FileCode, fg: 'text-system-gray', bg: 'bg-system-gray/12' }
+    }
+    // Default docs
+    return { Icon: FileText, fg: 'text-accent', bg: 'bg-accent/12' }
+  }
+
   return (
     <div>
       <div
         draggable={item.type === 'file'}
         onDragStart={handleDragStart}
-        className={`group flex items-center gap-1.5 px-2 py-1.5 mx-2 cursor-pointer rounded-md transition-all select-none ${
+        className={`group flex items-center gap-2 px-3 py-2 mx-2 cursor-pointer rounded-lg transition-all duration-200 select-none ${
           isSelected 
-            ? 'bg-primary/15 text-primary border border-primary/20' 
-            : 'text-text-muted hover:bg-surface-hover hover:text-text border border-transparent'
+            ? 'bg-accent/18 text-text border border-accent/25 shadow-sm' 
+            : 'text-text-secondary hover:bg-black/5 dark:hover:bg-white/10 hover:text-text'
         } ${item.type === 'file' ? 'cursor-grab active:cursor-grabbing' : ''}`}
-        style={{ paddingLeft: `${level * 12 + 8}px` }}
+        style={{ paddingLeft: `${level * 12 + 12}px` }}
         onClick={() => {
           if (isFolder) {
             setIsExpanded(!isExpanded)
@@ -57,34 +90,44 @@ function FileTreeItem({ item, level, onSelect, onDragStart, selectedPath }: File
           }
         }}
       >
-        <div className="flex items-center justify-center w-4 h-4 shrink-0 text-text-dim group-hover:text-text-muted transition-colors">
+        <div className={`flex items-center justify-center w-4 h-4 shrink-0 transition-colors ${isSelected ? 'text-white' : 'text-text-muted group-hover:text-text-secondary'}`}>
           {isFolder && (
-            isExpanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />
+            <ChevronRight className={`w-3.5 h-3.5 transition-transform duration-200 ${isExpanded ? 'rotate-90' : ''}`} />
           )}
         </div>
         
         {isFolder ? (
-          isExpanded ? 
-            <FolderOpen className={`w-4 h-4 ${isSelected ? 'text-primary' : 'text-amber-500/70'}`} /> : 
-            <Folder className={`w-4 h-4 ${isSelected ? 'text-primary' : 'text-amber-500/70'}`} />
+          <div
+            className={`w-6 h-6 rounded-lg flex items-center justify-center ${
+              isSelected ? 'bg-white/18 text-white' : 'bg-accent/12 text-accent'
+            }`}
+          >
+            {isExpanded ? <FolderOpen className="w-4 h-4" /> : <Folder className="w-4 h-4" />}
+          </div>
         ) : (
-          <FileText className={`w-4 h-4 ${isSelected ? 'text-primary' : 'text-blue-400/70'}`} />
+          (() => {
+            const { Icon, fg, bg } = getFileVisual(item.name)
+            return (
+              <div
+                className={`w-6 h-6 rounded-lg flex items-center justify-center ${
+                  isSelected ? 'bg-white/18 text-white' : `${bg} ${fg}`
+                }`}
+              >
+                <Icon className="w-4 h-4" />
+              </div>
+            )
+          })()
         )}
         
-        <span className="text-xs truncate flex-1 font-medium">{item.name}</span>
-        
-        {item.type === 'file' && (
-          <span className="text-[10px] text-text-dim opacity-0 group-hover:opacity-100 transition-opacity">
-            拖拽
-          </span>
-        )}
+        <span className="text-[13px] truncate flex-1 font-medium">{item.name}</span>
       </div>
       
       {isFolder && isExpanded && item.children && (
         <div className="relative">
+          {/* 连接线 - 更淡更细 */}
           <div 
-            className="absolute left-[15px] top-0 bottom-0 w-px bg-border/30" 
-            style={{ left: `${level * 12 + 15}px` }}
+            className="absolute left-[19px] top-0 bottom-0 w-px bg-border-light" 
+            style={{ left: `${level * 12 + 19}px` }}
           />
           {item.children.map((child, index) => (
             <FileTreeItem
@@ -119,7 +162,13 @@ export default function Sidebar() {
   const [isCollapsed, setIsCollapsed] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
   const [draggedFile, setDraggedFile] = useState<FileItem | null>(null)
+  const [activeSection, setActiveSection] = useState<'workspace' | 'recent'>('workspace')
   const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // 打开设置（由 App.tsx 监听 open-settings 事件来弹出 SettingsModal）
+  const openSettings = () => {
+    window.dispatchEvent(new CustomEvent('open-settings'))
+  }
 
   const handleSelectFile = async (item: FileItem) => {
     if (item.type === 'file') {
@@ -192,18 +241,18 @@ export default function Sidebar() {
 
   if (isCollapsed) {
     return (
-      <div className="w-12 bg-background border-r border-border flex flex-col items-center py-4 gap-4">
+      <div className="w-16 glass border-r border-border flex flex-col items-center py-4 gap-2">
         <button
           onClick={() => setIsCollapsed(false)}
-          className="p-2 rounded-md text-text-muted hover:text-text hover:bg-surface-hover transition-all"
+          className="p-2.5 rounded-xl text-text-muted hover:text-text hover:bg-white/5 transition-all"
         >
           <ChevronRight className="w-4 h-4" />
         </button>
-        <div className="w-6 h-px bg-border" />
+        <div className="w-8 h-px bg-white/10 my-2" />
         {isElectron && (
           <button 
             onClick={openFolder}
-            className="p-2 rounded-md text-text-muted hover:text-primary hover:bg-primary/10 transition-all"
+            className="p-2.5 rounded-xl text-text-muted hover:text-accent hover:bg-accent/10 transition-all"
             title="打开文件夹"
           >
             <FolderPlus className="w-4 h-4" />
@@ -212,18 +261,28 @@ export default function Sidebar() {
         {isElectron && (
           <button 
             onClick={handleNewPpt}
-            className="p-2 rounded-md text-text-muted hover:text-text hover:bg-surface-hover transition-all"
-            title="新建 PPT（AI 海报式生成）"
+            className="p-2.5 rounded-xl text-text-muted hover:text-accent hover:bg-accent/10 transition-all"
+            title="新建 PPT"
           >
-            <FileText className="w-4 h-4" />
+            <Image className="w-4 h-4" />
           </button>
         )}
         <button 
           onClick={handleNewDocument}
-          className="p-2 rounded-md text-text-muted hover:text-text hover:bg-surface-hover transition-all"
+          className="p-2.5 rounded-xl text-text-muted hover:text-accent hover:bg-accent/10 transition-all"
           title="新建文档"
         >
           <FilePlus className="w-4 h-4" />
+        </button>
+
+        <div className="flex-1" />
+
+        <button 
+          onClick={openSettings}
+          className="p-2.5 rounded-xl text-text-muted hover:text-text hover:bg-white/5 transition-all"
+          title="设置"
+        >
+          <Settings className="w-4 h-4" />
         </button>
       </div>
     )
@@ -231,8 +290,8 @@ export default function Sidebar() {
 
   return (
     <div 
-      className={`w-64 bg-background border-r border-border flex flex-col transition-all duration-300 ease-in-out ${
-        isDragging ? 'ring-2 ring-primary ring-inset' : ''
+      className={`w-64 glass-panel flex flex-col transition-all duration-300 ease-out z-20 ${
+        isDragging ? 'ring-2 ring-accent/40 ring-inset bg-accent/5' : ''
       }`}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -246,98 +305,74 @@ export default function Sidebar() {
         onChange={handleFileUpload}
       />
 
-      {/* 头部 */}
-      <div className="p-3 space-y-3">
-        <div className="flex items-center justify-between px-2">
-          <span className="text-xs font-semibold text-text-muted uppercase tracking-wider">
-            {isElectron ? '工作区' : '文档'}
-          </span>
-          <div className="flex items-center gap-1">
-            {isElectron && (
-              <>
-                <button 
-                  onClick={openFolder}
-                  className="p-1.5 rounded text-text-muted hover:text-primary hover:bg-primary/10 transition-all"
-                  title="打开文件夹"
-                >
-                  <FolderPlus className="w-3.5 h-3.5" />
-                </button>
-                <button 
-                  onClick={refreshFiles}
-                  className="p-1.5 rounded text-text-muted hover:text-text hover:bg-surface-hover transition-all"
-                  title="刷新"
-                >
-                  <RefreshCw className="w-3.5 h-3.5" />
-                </button>
-              </>
-            )}
-            {!isElectron && (
-              <button 
-                onClick={() => fileInputRef.current?.click()}
-                className="p-1.5 rounded text-text-muted hover:text-primary hover:bg-primary/10 transition-all"
-                title="上传 Word 文档"
-              >
-                <Upload className="w-3.5 h-3.5" />
-              </button>
-            )}
-            <button 
-              onClick={handleNewDocument}
-              className="p-1.5 rounded text-text-muted hover:text-primary hover:bg-primary/10 transition-all"
-              title="新建文档"
-            >
-              <Plus className="w-3.5 h-3.5" />
-            </button>
-            {isElectron && (
-              <button 
-                onClick={handleNewPpt}
-                className="p-1.5 rounded text-text-muted hover:text-primary hover:bg-primary/10 transition-all"
-                title="新建 PPT（AI 海报式生成）"
-              >
-                <FileText className="w-3.5 h-3.5" />
-              </button>
-            )}
-            <button
-              onClick={() => setIsCollapsed(true)}
-              className="p-1.5 rounded text-text-muted hover:text-text hover:bg-surface-hover transition-all"
-              title="折叠"
-            >
-              <ChevronRight className="w-3.5 h-3.5 rotate-180" />
-            </button>
+      {/* Logo 和品牌 - 极简风格 */}
+      <div className="px-5 pt-5 pb-3">
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 rounded-lg bg-accent flex items-center justify-center shadow-md shadow-accent/20">
+            <Pencil className="w-4 h-4 text-white" strokeWidth={2.5} />
           </div>
+          <div>
+            <h1 className="text-sm font-bold text-text tracking-wide">Word Cursor</h1>
+          </div>
+          <button
+            onClick={() => setIsCollapsed(true)}
+            className="ml-auto p-1.5 rounded-md text-text-muted hover:text-text hover:bg-black/5 dark:hover:bg-white/10 transition-all"
+          >
+            <ChevronRight className="w-3.5 h-3.5 rotate-180" />
+          </button>
         </div>
+      </div>
 
-        {/* 工作区路径 */}
-        {isElectron && workspacePath && (
-          <div className="px-2 py-1.5 bg-surface rounded-md border border-border">
-            <p className="text-[10px] text-text-dim truncate" title={workspacePath}>
-              📁 {workspacePath.split(/[/\\]/).pop()}
-            </p>
-          </div>
-        )}
-        
-        {/* 搜索框 */}
-        <div className="relative px-2">
-          <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-text-muted" />
+      {/* 搜索框 */}
+      <div className="px-3 pb-2">
+        <div className="relative group">
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-text-muted group-focus-within:text-accent transition-colors" />
           <input
             type="text"
-            placeholder="搜索文档..."
+            placeholder="Search..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full bg-surface border border-border rounded-md pl-8 pr-3 py-1.5 text-xs text-text placeholder-text-dim focus:outline-none focus:border-primary/50 focus:bg-surface-hover transition-all"
+            className="w-full bg-black/5 dark:bg-white/10 hover:bg-black/10 dark:hover:bg-white/15 focus:bg-white dark:focus:bg-white/10 rounded-lg pl-8 pr-3 py-1.5 text-xs text-text placeholder-text-dim border border-transparent focus:border-accent/30 focus:ring-2 focus:ring-accent/10 transition-all outline-none"
           />
         </div>
       </div>
 
+      {/* 分区标题 - WORKSPACE */}
+      <div className="px-4 py-2 flex items-center justify-between group">
+        <span className="text-[10px] font-bold text-text-muted tracking-wider uppercase">
+          Workspace
+        </span>
+        <div className="flex opacity-0 group-hover:opacity-100 transition-opacity gap-0.5">
+          {isElectron && (
+             <button 
+               onClick={refreshFiles}
+               className="p-1 rounded hover:bg-black/5 dark:hover:bg-white/10 text-text-muted hover:text-text transition-colors"
+               title="Refresh"
+             >
+               <RefreshCw className="w-3 h-3" />
+             </button>
+          )}
+          <button 
+             onClick={handleNewDocument}
+             className="p-1 rounded hover:bg-black/5 dark:hover:bg-white/10 text-text-muted hover:text-text transition-colors"
+             title="New Document"
+           >
+             <Plus className="w-3 h-3" />
+           </button>
+        </div>
+      </div>
+
+
       {/* 拖放提示 */}
       {isDragging && !isElectron && (
-        <div className="mx-3 mb-3 p-4 border-2 border-dashed border-primary/50 rounded-lg bg-primary/5 flex flex-col items-center justify-center gap-2">
-          <Upload className="w-6 h-6 text-primary" />
-          <span className="text-xs text-primary font-medium">释放以上传文档</span>
+        <div className="mx-3 mb-3 p-6 border-2 border-dashed border-accent/40 rounded-xl bg-accent/5 flex flex-col items-center justify-center gap-2">
+          <Upload className="w-8 h-8 text-accent" />
+          <span className="text-sm text-accent font-medium">释放以上传文档</span>
         </div>
       )}
 
       {/* 文件列表 */}
-      <div className="flex-1 overflow-y-auto py-2 scrollbar-thin">
+      <div className="flex-1 overflow-y-auto py-1 chat-scrollbar">
         {files.length > 0 ? (
           files.map((item, index) => (
             <FileTreeItem
@@ -351,46 +386,36 @@ export default function Sidebar() {
           ))
         ) : (
           <div className="flex flex-col items-center justify-center h-full text-center px-6 py-8">
-            <FolderOpen className="w-10 h-10 text-text-dim mb-3" />
-            <p className="text-sm text-text-muted mb-2">
+            <div className="w-12 h-12 rounded-xl bg-black/5 dark:bg-white/5 flex items-center justify-center mb-3">
+              <FolderOpen className="w-6 h-6 text-text-dim" />
+            </div>
+            <p className="text-sm text-text-secondary mb-1 font-medium">
               {isElectron
                 ? (workspacePath ? '文件夹为空' : '没有打开的文件夹')
                 : '没有文档'}
             </p>
-            <p className="text-xs text-text-dim mb-4">
+            <p className="text-xs text-text-muted mb-4 leading-relaxed max-w-[180px]">
               {isElectron 
                 ? (workspacePath
-                    ? '该文件夹内暂无可用文件。你可以新建文档，或点击上方按钮切换到其它文件夹。'
+                    ? '该文件夹内暂无可用文件'
                     : '点击上方按钮打开一个本地文件夹')
                 : '上传一个 .docx 文件开始编辑'}
             </p>
             {isElectron ? (
-              <div className="flex items-center gap-2">
-                {workspacePath && (
-                  <button
-                    onClick={handleNewDocument}
-                    className="flex items-center gap-2 px-4 py-2 bg-primary text-white text-xs rounded-md hover:bg-primary-hover transition-all"
-                    title="在当前文件夹中新建文档"
-                  >
-                    <FilePlus className="w-4 h-4" />
-                    新建文档
-                  </button>
-                )}
               <button
                 onClick={openFolder}
-                  className="flex items-center gap-2 px-4 py-2 bg-surface border border-border text-text text-xs rounded-md hover:bg-surface-hover transition-all"
-                  title="打开/切换文件夹"
+                className="flex items-center justify-center gap-2 w-full px-3 py-2 bg-accent text-white text-xs font-medium rounded-lg hover:bg-accent-hover transition-colors shadow-sm"
+                title="打开文件夹"
               >
-                <FolderPlus className="w-4 h-4" />
+                <FolderPlus className="w-3.5 h-3.5" />
                 打开文件夹
               </button>
-              </div>
             ) : (
               <button
                 onClick={() => fileInputRef.current?.click()}
-                className="flex items-center gap-2 px-4 py-2 bg-primary text-white text-xs rounded-md hover:bg-primary-hover transition-all"
+                className="flex items-center justify-center gap-2 w-full px-3 py-2 bg-accent text-white text-xs font-medium rounded-lg hover:bg-accent-hover transition-colors shadow-sm"
               >
-                <Upload className="w-4 h-4" />
+                <Upload className="w-3.5 h-3.5" />
                 上传文档
               </button>
             )}
@@ -398,14 +423,45 @@ export default function Sidebar() {
         )}
       </div>
 
-      {/* 底部提示 */}
-      <div className="p-3 border-t border-border">
-        <p className="text-[10px] text-text-dim text-center">
-          {isElectron 
-            ? '拖拽文件到 AI 对话框进行分析' 
-            : '桌面版支持打开本地文件夹'}
-        </p>
+      {/* 分区标题 - RECENT */}
+      <div className="px-4 py-2 border-t border-border-light">
+        <span className="text-[10px] font-bold text-text-muted tracking-wider uppercase">
+          Recent
+        </span>
       </div>
+
+      {/* 最近文件列表 - 简化展示 */}
+      <div className="px-2 pb-2">
+        {currentFile && (
+          <div className="flex items-center gap-3 px-3 py-2 mx-1 rounded-lg bg-accent/10 border border-accent/20">
+            <FileText className="w-4 h-4 text-accent" />
+            <div className="flex-1 min-w-0">
+              <p className="text-[13px] font-medium text-text truncate">{currentFile.name}</p>
+              <p className="text-[10px] text-text-muted">刚刚编辑</p>
+            </div>
+            <div className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+          </div>
+        )}
+      </div>
+
+      {/* 底部用户信息 - 参考图一风格 */}
+      <div className="p-2 border-t border-border-light">
+        <div
+          className="flex items-center gap-3 p-2 rounded-lg hover:bg-black/5 dark:hover:bg-white/5 transition-all cursor-pointer group"
+          onClick={openSettings}
+          title="打开设置"
+        >
+          <div className="w-8 h-8 rounded-full bg-accent flex items-center justify-center shadow-sm text-white font-medium text-xs">
+            AC
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="text-xs font-medium text-text truncate">Alex Chen</p>
+            <p className="text-[10px] text-text-muted">Pro Workspace</p>
+          </div>
+          <Settings className="w-3.5 h-3.5 text-text-muted group-hover:text-text transition-colors" />
+        </div>
+      </div>
+
     </div>
   )
 }

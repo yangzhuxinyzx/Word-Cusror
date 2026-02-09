@@ -219,7 +219,7 @@ export default function Editor() {
   )
 
   return (
-    <div className="flex flex-col h-full bg-surface/30 relative group">
+    <div className="flex flex-col h-full bg-background relative group">
       {/* 悬浮式 AI 助手入口 */}
       <div className="absolute bottom-6 right-6 z-10">
         <button
@@ -238,9 +238,9 @@ export default function Editor() {
       {/* AI 快捷编辑框 */}
       {showAIHelper && (
         <div className="absolute bottom-20 right-6 left-6 z-20 animate-enter">
-          <div className="bg-surface/95 backdrop-blur-xl border border-primary/20 rounded-xl shadow-2xl p-4 ring-1 ring-primary/10">
+          <div className="glass-card border border-primary/20 rounded-xl shadow-2xl p-4 ring-1 ring-primary/10">
             <div className="flex gap-3 mb-3">
-              <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shrink-0">
+              <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-accent to-system-purple flex items-center justify-center shrink-0 shadow-sm shadow-accent/20">
                 <Sparkles className="w-4 h-4 text-white" />
               </div>
               <div className="flex-1">
@@ -271,19 +271,19 @@ export default function Editor() {
             </div>
 
             <div className="flex gap-2 mt-3 overflow-x-auto pb-1 scrollbar-none">
-              <button onClick={() => setAiPrompt('润色这段文字，使其更专业')} className="whitespace-nowrap px-3 py-1.5 bg-surface-hover hover:bg-primary/10 text-xs text-text-muted hover:text-primary rounded-full transition-colors border border-border/50">
+              <button onClick={() => setAiPrompt('润色这段文字，使其更专业')} className="whitespace-nowrap px-3 py-1.5 bg-surface-hover hover:bg-primary/10 text-xs text-text-muted hover:text-primary rounded-full transition-colors border border-black/10 dark:border-white/10">
                 ✨ 润色
               </button>
-              <button onClick={() => setAiPrompt('扩展这部分内容，增加更多细节')} className="whitespace-nowrap px-3 py-1.5 bg-surface-hover hover:bg-primary/10 text-xs text-text-muted hover:text-primary rounded-full transition-colors border border-border/50">
+              <button onClick={() => setAiPrompt('扩展这部分内容，增加更多细节')} className="whitespace-nowrap px-3 py-1.5 bg-surface-hover hover:bg-primary/10 text-xs text-text-muted hover:text-primary rounded-full transition-colors border border-black/10 dark:border-white/10">
                 📝 扩展
               </button>
-              <button onClick={() => setAiPrompt('精简这段文字，保留核心内容')} className="whitespace-nowrap px-3 py-1.5 bg-surface-hover hover:bg-primary/10 text-xs text-text-muted hover:text-primary rounded-full transition-colors border border-border/50">
+              <button onClick={() => setAiPrompt('精简这段文字，保留核心内容')} className="whitespace-nowrap px-3 py-1.5 bg-surface-hover hover:bg-primary/10 text-xs text-text-muted hover:text-primary rounded-full transition-colors border border-black/10 dark:border-white/10">
                 📉 精简
               </button>
-              <button onClick={() => setAiPrompt('修正语法和拼写错误')} className="whitespace-nowrap px-3 py-1.5 bg-surface-hover hover:bg-primary/10 text-xs text-text-muted hover:text-primary rounded-full transition-colors border border-border/50">
+              <button onClick={() => setAiPrompt('修正语法和拼写错误')} className="whitespace-nowrap px-3 py-1.5 bg-surface-hover hover:bg-primary/10 text-xs text-text-muted hover:text-primary rounded-full transition-colors border border-black/10 dark:border-white/10">
                 🔍 纠错
               </button>
-              <button onClick={() => setAiPrompt('翻译成英文')} className="whitespace-nowrap px-3 py-1.5 bg-surface-hover hover:bg-primary/10 text-xs text-text-muted hover:text-primary rounded-full transition-colors border border-border/50">
+              <button onClick={() => setAiPrompt('翻译成英文')} className="whitespace-nowrap px-3 py-1.5 bg-surface-hover hover:bg-primary/10 text-xs text-text-muted hover:text-primary rounded-full transition-colors border border-black/10 dark:border-white/10">
                 🌐 翻译
               </button>
             </div>
@@ -292,14 +292,14 @@ export default function Editor() {
       )}
 
       {/* 工具栏 */}
-      <div className="flex items-center gap-1 px-4 py-2 border-b border-border bg-background/50 backdrop-blur-sm select-none">
+      <div className="flex items-center gap-1 px-4 py-2 border-b border-border bg-black/5 dark:bg-white/5 backdrop-blur-sm select-none">
         {/* 撤销/重做 */}
-        <div className="flex items-center bg-surface rounded-lg p-0.5 border border-border/50">
+        <div className="flex items-center bg-surface rounded-lg p-0.5 border border-black/10 dark:border-white/10">
           <ToolbarButton icon={Undo} onClick={handleUndo} title="撤销 (Ctrl+Z)" disabled={historyIndex <= 0} />
           <ToolbarButton icon={Redo} onClick={handleRedo} title="重做 (Ctrl+Y)" disabled={historyIndex >= history.length - 1} />
         </div>
         
-        <div className="w-px h-5 bg-border/50 mx-2" />
+        <div className="w-px h-5 bg-black/10 dark:bg-white/10 mx-2" />
         
         {/* 标题 */}
         <div className="flex items-center gap-0.5">
@@ -308,7 +308,7 @@ export default function Editor() {
           <ToolbarButton icon={Heading3} onClick={() => insertMarkdown('### ')} title="标题3" />
         </div>
         
-        <div className="w-px h-5 bg-border/50 mx-2" />
+        <div className="w-px h-5 bg-black/10 dark:bg-white/10 mx-2" />
         
         {/* 文本格式 */}
         <div className="flex items-center gap-0.5">
@@ -317,7 +317,7 @@ export default function Editor() {
           <ToolbarButton icon={Underline} onClick={() => insertMarkdown('<u>', '</u>')} title="下划线" />
         </div>
         
-        <div className="w-px h-5 bg-border/50 mx-2" />
+        <div className="w-px h-5 bg-black/10 dark:bg-white/10 mx-2" />
         
         {/* 对齐 */}
         <div className="flex items-center gap-0.5">
@@ -327,7 +327,7 @@ export default function Editor() {
           <ToolbarButton icon={AlignJustify} onClick={() => updateStyles({ textAlign: 'justify' })} title="两端对齐" active={document.styles.textAlign === 'justify'} />
         </div>
         
-        <div className="w-px h-5 bg-border/50 mx-2" />
+        <div className="w-px h-5 bg-black/10 dark:bg-white/10 mx-2" />
         
         {/* 列表 */}
         <div className="flex items-center gap-0.5">
@@ -387,7 +387,7 @@ export default function Editor() {
       </div>
 
       {/* 底部状态栏 */}
-      <div className="flex items-center justify-between px-4 py-1.5 border-t border-border bg-surface/30 text-[10px] text-text-dim select-none">
+      <div className="flex items-center justify-between px-4 py-1.5 border-t border-border bg-black/5 dark:bg-white/5 text-[10px] text-text-dim select-none">
         <div className="flex items-center gap-4">
           <span className="hover:text-text transition-colors">{document.content.length} 字符</span>
           <span className="hover:text-text transition-colors">{document.content.split(/\s+/).filter(Boolean).length} 词</span>
@@ -398,7 +398,7 @@ export default function Editor() {
         </div>
         <div className="flex items-center gap-4">
           {hasUnsavedChanges && (
-            <span className="text-amber-400">● 未保存</span>
+            <span className="text-warning">● 未保存</span>
           )}
           <span className="uppercase">Markdown</span>
           <span>Ctrl+S 保存</span>

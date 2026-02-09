@@ -1,9 +1,10 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, type ReactNode } from 'react'
 import { 
   Send, 
   Trash2, 
   FileText,
   X,
+  Settings,
   Paperclip,
   CheckCircle,
   FileEdit,
@@ -16,11 +17,20 @@ import {
   Table
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useAI, ToolResult } from '../context/AIContext'
 import { useDocument } from '../context/DocumentContext'
 import { FileItem, AgentStep, AgentFileChange } from '../types'
 import { runWebSearch, WebSearchResponse } from '../utils/webSearch'
+import { parseDocxToHtmlForAgent } from '../utils/docxParser'
+import { generateDocxAgentContextFromFilePath } from '../utils/docxAgentContext'
+import { extractTypographyProfileFromArrayBuffer, formatTypographyProfileForAgent } from '../utils/docxTypography'
+import { docxHtmlToElements, elementsToHtmlPreview } from '../utils/docxHtmlToElements'
+import { validateDocDsl, dslToHtml } from '../utils/docDsl'
+import { DOC_EDIT_START, DOC_EDIT_END, DOC_SUMMARY_START, DOC_SUMMARY_END } from '../utils/aiMarkers'
+import type { DocDsl } from '../types/docDsl'
+import JSZip from 'jszip'
 import CinematicTyper from './CinematicTyper'
 
 type PptOutlineSlideDraft = {
@@ -31,6 +41,106 @@ type PptOutlineSlideDraft = {
   bullets?: string[]
   footerNote?: string
   layoutIntent?: string
+}
+
+const TOOL_CALL_BLOCK_REGEX = /\[TOOL_CALL\][\s\S]*?\[\/TOOL_CALL\]/g
+const TOOL_RESULT_BLOCK_REGEX = /\[TOOL_RESULT\][\s\S]*?\[\/TOOL_RESULT\]/g
+
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const EDIT_START_REGEX = new RegExp(escapeRegExp(DOC_EDIT_START), 'g')
+const EDIT_END_REGEX = new RegExp(escapeRegExp(DOC_EDIT_END), 'g')
+const SUMMARY_BLOCK_REGEX = new RegExp(
+  `${escapeRegExp(DOC_SUMMARY_START)}[\\s\\S]*?(?:${escapeRegExp(DOC_SUMMARY_END)})?`,
+  'g'
+)
+
+const stripToolBlocks = (text: string) =>
+  text.replace(TOOL_CALL_BLOCK_REGEX, '').replace(TOOL_RESULT_BLOCK_REGEX, '')
+
+const stripMarkers = (text: string) =>
+  text
+    .replace(SUMMARY_BLOCK_REGEX, '')
+    .replace(EDIT_START_REGEX, '')
+    .replace(EDIT_END_REGEX, '')
+
+const sanitizeAssistantText = (text: string) =>
+  stripMarkers(stripToolBlocks(text)).replace(/\n{3,}/g, '\n\n').trim()
+
+type TableCardData = {
+  headers: string[]
+  rows: string[][]
+}
+
+const getMarkdownNodeText = (node: any): string => {
+  if (!node) return ''
+  if (node.type === 'text') return node.value || ''
+  if (Array.isArray(node.children)) return node.children.map(getMarkdownNodeText).join('')
+  return ''
+}
+
+const normalizeCellText = (text: string) => (text || '').replace(/\s+/g, ' ').trim()
+
+const extractTableCardData = (node: any): TableCardData | null => {
+  if (!node || node.type !== 'table' || !Array.isArray(node.children)) return null
+  const rows: string[][] = node.children
+    .filter((row: any) => row?.type === 'tableRow' && Array.isArray(row.children))
+    .map((row: any) =>
+      row.children.map((cell: any) => normalizeCellText(getMarkdownNodeText(cell)))
+    )
+
+  if (rows.length === 0) return null
+
+  const bodyRows: string[][] = rows.slice(1)
+  const maxCols = Math.max(0, ...rows.map((row) => row.length))
+  if (maxCols === 0) return null
+
+  let headers: string[] = rows[0] || []
+  if (headers.every((h) => !h)) {
+    headers = Array.from({ length: maxCols }, (_, i) => `字段${i + 1}`)
+  } else if (headers.length < maxCols) {
+    headers = headers.slice()
+    for (let i = headers.length; i < maxCols; i += 1) {
+      headers.push(`字段${i + 1}`)
+    }
+  }
+
+  const normalizedRows: string[][] = bodyRows.map((row) => {
+    const r = row.slice(0, maxCols)
+    while (r.length < maxCols) r.push('')
+    return r
+  })
+
+  return { headers, rows: normalizedRows }
+}
+
+const tryExtractDocDsl = (text: string): { dsl: DocDsl; sourceBlock: string } | null => {
+  const candidates: Array<{ json: string; sourceBlock: string }> = []
+  const trimmed = text.trim()
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    candidates.push({ json: trimmed, sourceBlock: trimmed })
+  }
+
+  const codeBlockRegex = /```(?:json)?\s*([\s\S]*?)```/g
+  let match: RegExpExecArray | null
+  while ((match = codeBlockRegex.exec(text)) !== null) {
+    const json = match[1]?.trim()
+    if (json) {
+      candidates.push({ json, sourceBlock: match[0] })
+    }
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const dslObj = JSON.parse(candidate.json)
+      const validation = validateDocDsl(dslObj)
+      if (validation.valid) {
+        return { dsl: dslObj, sourceBlock: candidate.sourceBlock }
+      }
+    } catch {
+      // ignore invalid JSON
+    }
+  }
+  return null
 }
 
 type PptOutlineDraft = {
@@ -260,10 +370,12 @@ const formatSearchResults = (response: WebSearchResponse, query: string) => {
 }
 
 export default function ChatPanel() {
-  const { messages, isLoading, streamingContent, settings, addMessage, sendAgentMessage, clearMessages } = useAI()
+  const { messages, isLoading, streamingContent, streamingReasoning, editPhase, streamingSummary, settings, addMessage, sendAgentMessage, clearMessages } = useAI()
+
   const { 
     document, 
-    createNewDocument, 
+    createNewDocument,
+    createDocumentFromDsl,
     isElectron, 
     currentFile, 
     replaceInDocument, 
@@ -275,6 +387,7 @@ export default function ChatPanel() {
     editorMode,
     setEditorMode,
     refreshFiles,
+    silentSaveToFile,
     getTiptapDocumentStructure,
     replaceWithFormat,
     excelData,
@@ -301,6 +414,11 @@ export default function ChatPanel() {
   } | null>(null)
   const [wordOpsApplying, setWordOpsApplying] = useState(false)
   const [pptGenerating, setPptGenerating] = useState(false)
+
+  // 打开设置（由 App.tsx 监听 open-settings 事件来弹出 SettingsModal）
+  const openSettings = useCallback(() => {
+    window.dispatchEvent(new CustomEvent('open-settings'))
+  }, [])
   
   // ========== PPT 编辑上下文（拖拽/框选嵌入） ==========
   const [pptEditContext, setPptEditContext] = useState<{
@@ -843,7 +961,8 @@ export default function ChatPanel() {
     const editKeywords = [
       '修改', '编辑', '润色', '优化', '改成', '替换', '删除', '添加', '扩展', '精简', '翻译', '重写',
       '格式化', '统一格式', '编号', '标题编号', '公文格式', '转换为公文',
-      '/润色', '/精简', '/翻译', '/格式化', '/编号', '/公文', '/总结'
+      '审查', '校对', '纠错', '检查文档', '审阅',
+      '/润色', '/精简', '/翻译', '/格式化', '/编号', '/公文', '/总结', '/审查', '/校对'
     ]
     const analyzeKeywords = ['分析', '解释', '什么意思', '有哪些', '告诉我', '是什么', '检查', '论文检查']
     
@@ -854,27 +973,526 @@ export default function ChatPanel() {
     return 'chat'
   }
 
+  const DOCX_AGENT_MAX_CHARS = 80_000
+  const FILES_CONTEXT_MAX_CHARS = 160_000
+  const WORKSPACE_CONTEXT_MAX_CHARS = 60_000
+  const WORKSPACE_INDEX_MAX_ITEMS = 200
+  const WORKSPACE_AUTO_SUMMARY_MAX_FILES = 3
+  const WORKSPACE_SUMMARY_MAX_CHARS = 1600
+  const WORKSPACE_READ_MAX_CHARS = 8000
+  const WORKSPACE_PPTX_MAX_SLIDES = 6
+
+  const docxAttachmentCacheRef = useRef<Map<string, { key: string; content: string }>>(new Map())
+  const workspaceIndexCacheRef = useRef<{
+    folderPath: string
+    flatFiles: FileItem[]
+    updatedAt: number
+  } | null>(null)
+  const workspaceSummaryCacheRef = useRef<Map<string, { key: string; summary: string }>>(new Map())
+
+  const truncateWithNote = useCallback((text: string, maxLen: number, note: string) => {
+    if (!text) return ''
+    if (text.length <= maxLen) return text
+    const suffix = `\n\n... (${note}，已截断，建议指定章节/标题再问)`
+    const keep = Math.max(0, maxLen - suffix.length)
+    return text.slice(0, keep) + suffix
+  }, [])
+
+  const fetchArrayBufferFromLocalFile = useCallback(async (filePath: string): Promise<ArrayBuffer> => {
+    if (!window.electronAPI?.getLocalFileUrl) {
+      throw new Error('getLocalFileUrl 不可用')
+    }
+    const url = await window.electronAPI.getLocalFileUrl(filePath)
+    const resp = await fetch(url)
+    if (!resp.ok) throw new Error(`读取文件失败（HTTP ${resp.status}）`)
+    return await resp.arrayBuffer()
+  }, [])
+
+  const splitPath = (fullPath: string) => {
+    const sep = fullPath.includes('\\') ? '\\' : '/'
+    const idx = fullPath.lastIndexOf(sep)
+    return {
+      dir: idx >= 0 ? fullPath.slice(0, idx) : '',
+      base: idx >= 0 ? fullPath.slice(idx + 1) : fullPath,
+      sep,
+    }
+  }
+
+  const createTemplateCopy = useCallback(async (outputName?: string) => {
+    if (!isElectron || !window.electronAPI?.readFile || !window.electronAPI?.writeBinaryFile) {
+      return { success: false, message: '当前环境不支持模板复制' }
+    }
+    if (!currentFile?.path) {
+      return { success: false, message: '未找到当前文档路径' }
+    }
+    const ext = (currentFile.name.split('.').pop() || '').toLowerCase()
+    if (ext !== 'docx') {
+      return { success: false, message: '仅支持 .docx 模板自动填充' }
+    }
+
+    const { dir, base, sep } = splitPath(currentFile.path)
+    const baseName = base.replace(/\.[^.]+$/, '')
+    let fileName = (outputName || `${baseName}-已填充`).trim()
+    if (!fileName.toLowerCase().endsWith('.docx')) {
+      fileName = `${fileName}.docx`
+    }
+
+    let newPath = `${dir}${sep}${fileName}`
+    if (window.electronAPI.getFileInfo) {
+      try {
+        const info = await window.electronAPI.getFileInfo(newPath)
+        if (info?.success) {
+          fileName = `${baseName}-已填充-${Date.now()}.docx`
+          newPath = `${dir}${sep}${fileName}`
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    const readResult = await window.electronAPI.readFile(currentFile.path)
+    if (!readResult?.success || !readResult.data) {
+      return { success: false, message: '读取模板失败' }
+    }
+
+    const writeResult = await window.electronAPI.writeBinaryFile(newPath, readResult.data)
+    if (!writeResult?.success) {
+      return { success: false, message: '写入新文档失败' }
+    }
+
+    await refreshFiles()
+    return { success: true, file: { name: fileName, path: newPath, type: 'file' as const } }
+  }, [currentFile, isElectron, refreshFiles])
+
+  const prepareTemplateFillOutput = useCallback(async (ops: any[]) => {
+    const templateOp = ops.find((op) => op?.type === 'template_fill' && String(op.params?.output || '').toLowerCase() === 'new_doc')
+    if (!templateOp) return { success: true }
+
+    if (editorMode === 'onlyoffice') {
+      setEditorMode('tiptap')
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+
+    const outputName = templateOp.params?.outputName || templateOp.params?.fileName || templateOp.params?.title
+    const created = await createTemplateCopy(typeof outputName === 'string' ? outputName : undefined)
+    if (!created.success || !created.file) {
+      return { success: false, message: created.message || '创建新文档失败' }
+    }
+
+    await openFile(created.file as FileItem)
+    await new Promise(resolve => setTimeout(resolve, 100))
+    return { success: true, file: created.file }
+  }, [createTemplateCopy, editorMode, openFile, setEditorMode])
+
   // 获取文件内容
   const getFileContent = useCallback(async (file: FileItem): Promise<string> => {
     if (isElectron && window.electronAPI) {
       const result = await window.electronAPI.readFile(file.path)
       if (result.success && result.data) {
-        return result.type === 'docx' ? `[Word文档: ${file.name}]` : result.data
+        if (result.type === 'docx') {
+          // 让 Agent 读取 DOCX 全文与格式（不内联图片，避免 base64 过大）
+          const cacheKey = `${file.path}:${result.data.length}`
+          const cached = docxAttachmentCacheRef.current.get(file.path)
+          if (cached?.key === cacheKey) {
+            return cached.content
+          }
+
+          try {
+            const parsed = await parseDocxToHtmlForAgent(result.data)
+
+            // Typography profile（主题字体/Normal/Heading 等摘要）
+            let typographyText = ''
+            try {
+              const ab = await fetchArrayBufferFromLocalFile(file.path)
+              const { profile, outline } = await extractTypographyProfileFromArrayBuffer(ab)
+              typographyText = formatTypographyProfileForAgent(profile, outline)
+            } catch (e) {
+              // ignore
+            }
+
+            const ps = parsed.pageSettings
+            const pageLines: string[] = []
+            if (ps) {
+              pageLines.push(
+                `页面: ${ps.orientation || 'portrait'}, size(pt)=${ps.width}×${ps.height}, margin(pt)=T${ps.marginTop}/B${ps.marginBottom}/L${ps.marginLeft}/R${ps.marginRight}, header=${ps.headerHeight}, footer=${ps.footerHeight}`
+              )
+            }
+
+            const images = parsed.images || []
+            const imageLines = images.slice(0, 200).map((img, idx) => {
+              const size = img.widthPx || img.heightPx ? `${img.widthPx || '?'}x${img.heightPx || '?'}` : '?'
+              const target = img.target ? ` target=${img.target}` : ''
+              const alt = img.alt ? ` alt=${img.alt}` : ''
+              const floating = img.floating ? ' floating=1' : ''
+              return `- #${idx + 1} rid=${img.rId}${target} size=${size}${floating}${alt}`
+            })
+
+            const sections: string[] = []
+            sections.push(`【Word DOCX】${file.name}`)
+            if (pageLines.length) {
+              sections.push('')
+              sections.push('【页面设置】')
+              sections.push(pageLines.join('\n'))
+            }
+            if (typographyText) {
+              sections.push('')
+              sections.push('【字体/排版摘要】')
+              sections.push(typographyText)
+            }
+            sections.push('')
+            sections.push(`【图片】${images.length} 张（仅元信息，不含二进制）`)
+            if (imageLines.length) sections.push(imageLines.join('\n'))
+            sections.push('')
+            sections.push('【全文 HTML】')
+            sections.push(parsed.html || '<p></p>')
+
+            const combined = sections.join('\n')
+            const truncated = truncateWithNote(combined, DOCX_AGENT_MAX_CHARS, `Word 附件 ${file.name}`)
+            docxAttachmentCacheRef.current.set(file.path, { key: cacheKey, content: truncated })
+            return truncated
+          } catch (e) {
+            return `【Word DOCX】${file.name}\n\n⚠️ 解析失败：${String(e)}`
+          }
+        }
+
+        return result.data
       }
     }
     return file.content || `[文件: ${file.name}]`
+  }, [isElectron, fetchArrayBufferFromLocalFile, truncateWithNote])
+
+  const normalizePath = (value: string) => value.replace(/\\/g, '/').toLowerCase()
+
+  const getParentDir = (filePath: string) => {
+    const normalized = filePath.replace(/\\/g, '/')
+    const idx = normalized.lastIndexOf('/')
+    if (idx <= 0) return filePath
+    const dir = normalized.slice(0, idx)
+    return filePath.includes('\\') ? dir.replace(/\//g, '\\') : dir
+  }
+
+  const flattenFileTree = (items: FileItem[]) => {
+    const out: FileItem[] = []
+    const walk = (nodes: FileItem[]) => {
+      for (const node of nodes) {
+        if (node.type === 'file') {
+          out.push(node)
+        } else if (node.children?.length) {
+          walk(node.children)
+        }
+      }
+    }
+    walk(items)
+    return out
+  }
+
+  const formatWorkspaceIndex = (flatFiles: FileItem[], folderPath: string) => {
+    const counts = new Map<string, number>()
+    for (const file of flatFiles) {
+      const ext = (file.extension || file.name.split('.').pop() || '').toLowerCase()
+      const key = ext || 'unknown'
+      counts.set(key, (counts.get(key) || 0) + 1)
+    }
+
+    const countLines = Array.from(counts.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([ext, count]) => `${ext}: ${count}`)
+
+    const displayFiles = flatFiles.slice(0, WORKSPACE_INDEX_MAX_ITEMS)
+    const fileLines = displayFiles.map((file) => {
+      const rel = file.relativePath
+        ? file.relativePath
+        : file.path && normalizePath(file.path).startsWith(normalizePath(folderPath))
+          ? file.path.slice(folderPath.length).replace(/^[/\\]/, '')
+          : file.name
+      const ext = (file.extension || file.name.split('.').pop() || '').toLowerCase() || 'file'
+      return `- [${ext}] ${rel}`
+    })
+
+    if (flatFiles.length > displayFiles.length) {
+      fileLines.push(`... (${flatFiles.length - displayFiles.length} 个文件未显示，使用 workspace_list 查看更多)`)
+    }
+
+    const sections: string[] = []
+    sections.push(`【文件统计】${flatFiles.length} 个文件`)
+    if (countLines.length) {
+      sections.push(countLines.join(', '))
+    }
+    sections.push('')
+    sections.push('【文件清单】')
+    sections.push(fileLines.join('\n'))
+    return sections.join('\n')
+  }
+
+  const getWorkspaceFolderPath = useCallback(() => {
+    if (currentFile?.path) {
+      return getParentDir(currentFile.path)
+    }
+    return workspacePath || null
+  }, [currentFile, workspacePath])
+
+  const buildWorkspaceIndex = useCallback(async (folderPath: string, refresh = false) => {
+    if (!isElectron || !window.electronAPI?.readFolder) return null
+    const cached = workspaceIndexCacheRef.current
+    if (!refresh && cached && normalizePath(cached.folderPath) === normalizePath(folderPath)) {
+      return cached
+    }
+    const result = await window.electronAPI.readFolder(folderPath)
+    if (!result?.success || !result.data) return null
+    const flatFiles = flattenFileTree(result.data)
+    const next = { folderPath, flatFiles, updatedAt: Date.now() }
+    workspaceIndexCacheRef.current = next
+    return next
   }, [isElectron])
+
+  const resolveWorkspaceFile = useCallback(async (args: { path?: string; name?: string; relativePath?: string }) => {
+    const folderPath = getWorkspaceFolderPath()
+    if (!folderPath) return null
+    const index = await buildWorkspaceIndex(folderPath)
+    if (!index) return null
+
+    const targetPath = (args.path || args.relativePath || '').trim()
+    const targetName = (args.name || '').trim()
+
+    if (targetPath) {
+      const normalizedTarget = normalizePath(targetPath)
+      const matched = index.flatFiles.find((file) => {
+        const filePath = file.path ? normalizePath(file.path) : ''
+        const rel = file.relativePath ? normalizePath(file.relativePath) : ''
+        return filePath === normalizedTarget || rel === normalizedTarget
+      })
+      if (matched) return matched
+
+      // 兼容相对路径拼接
+      if (!normalizedTarget.includes('/') && !normalizedTarget.includes('\\')) {
+        const byName = index.flatFiles.find((file) => file.name === targetPath)
+        if (byName) return byName
+      }
+    }
+
+    if (targetName) {
+      const byName = index.flatFiles.find((file) => file.name === targetName)
+      if (byName) return byName
+    }
+
+    return null
+  }, [buildWorkspaceIndex, getWorkspaceFolderPath])
+
+  const htmlToPlainText = (html: string) => {
+    if (!html) return ''
+    let text = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    text = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    text = text.replace(/&nbsp;/g, ' ')
+    text = text.replace(/&amp;/g, '&')
+    text = text.replace(/&lt;/g, '<')
+    text = text.replace(/&gt;/g, '>')
+    text = text.replace(/&quot;/g, '"')
+    text = text.replace(/&#39;/g, "'")
+    text = text.replace(/<[^>]+>/g, ' ')
+    text = text.replace(/\s+/g, ' ').trim()
+    return text
+  }
+
+  const extractPptxTextSummary = async (base64: string, maxSlides: number, maxChars: number) => {
+    const zip = await JSZip.loadAsync(base64, { base64: true })
+    const slidePaths = Object.keys(zip.files)
+      .filter((name) => name.startsWith('ppt/slides/slide') && name.endsWith('.xml'))
+      .sort((a, b) => {
+        const getNum = (s: string) => parseInt(s.match(/slide(\d+)\.xml/)?.[1] || '0', 10)
+        return getNum(a) - getNum(b)
+      })
+
+    const lines: string[] = []
+    lines.push(`页数: ${slidePaths.length}`)
+
+    const decodeXml = (input: string) =>
+      input
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+
+    for (let i = 0; i < Math.min(maxSlides, slidePaths.length); i++) {
+      const slideXml = await zip.file(slidePaths[i])!.async('string')
+      const texts = Array.from(slideXml.matchAll(/<a:t>([\s\S]*?)<\/a:t>/g)).map((m) => decodeXml(m[1]))
+      const combined = texts.join(' ').replace(/\s+/g, ' ').trim()
+      if (combined) {
+        lines.push(`- 第 ${i + 1} 页：${combined.slice(0, 200)}`)
+      }
+    }
+
+    const result = lines.join('\n')
+    return truncateWithNote(result, maxChars, 'PPT 摘要')
+  }
+
+  const summarizeExcelFile = async (filePath: string, maxChars: number) => {
+    if (!window.electronAPI?.excelListSheets || !window.electronAPI?.excelReadCells) {
+      return '⚠️ Excel 工具不可用'
+    }
+    const list = await window.electronAPI.excelListSheets(filePath)
+    if (!list.success || !list.sheets?.length) {
+      return `⚠️ 无法读取工作表：${list.error || '未知错误'}`
+    }
+    const sheetNames = list.sheets.map((s) => `${s.name}(${s.rowCount}x${s.columnCount})`).join(', ')
+    const firstSheet = list.sheets[0]?.name
+    const lines: string[] = []
+    lines.push(`【工作表】${sheetNames}`)
+    if (firstSheet) {
+      const preview = await window.electronAPI.excelReadCells(filePath, firstSheet, 'A1:E8')
+      if (preview.success && preview.cells?.length) {
+        const maxRows = 6
+        const maxCols = 5
+        const cellMap = new Map<string, string>()
+        for (const cell of preview.cells) {
+          if (cell.r < maxRows && cell.c < maxCols) {
+            cellMap.set(`${cell.r}-${cell.c}`, String(cell.text || cell.value || ''))
+          }
+        }
+        const rows: string[] = []
+        for (let r = 0; r < maxRows; r++) {
+          const cols: string[] = []
+          for (let c = 0; c < maxCols; c++) {
+            cols.push(cellMap.get(`${r}-${c}`) || '')
+          }
+          if (cols.some((val) => val)) {
+            rows.push(cols.join('\t'))
+          }
+        }
+        if (rows.length) {
+          lines.push(`【${firstSheet} 预览】`)
+          lines.push(rows.join('\n'))
+        }
+      }
+    }
+    return truncateWithNote(lines.join('\n'), maxChars, 'Excel 摘要')
+  }
+
+  const summarizeWorkspaceFile = useCallback(async (file: FileItem, options?: { maxChars?: number; maxSlides?: number }) => {
+    if (!isElectron || !window.electronAPI) {
+      return '⚠️ 当前环境不支持读取工作夹文件'
+    }
+    const maxChars = options?.maxChars || WORKSPACE_SUMMARY_MAX_CHARS
+    const maxSlides = options?.maxSlides || WORKSPACE_PPTX_MAX_SLIDES
+
+    let cacheKey = `${file.path}:${maxChars}:${maxSlides}`
+    if (window.electronAPI.getFileInfo) {
+      try {
+        const infoResult = await window.electronAPI.getFileInfo(file.path)
+        const info = infoResult?.data
+        if (infoResult?.success && info) {
+          cacheKey = `${file.path}:${String(info.modified || '')}:${info.size || ''}:${maxChars}:${maxSlides}`
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    const cached = workspaceSummaryCacheRef.current.get(file.path)
+    if (cached?.key === cacheKey) {
+      return cached.summary
+    }
+
+    const ext = (file.extension || file.name.split('.').pop() || '').toLowerCase()
+    let summary = ''
+
+    if (ext === 'docx') {
+      summary = await generateDocxAgentContextFromFilePath(file.name, file.path, {
+        maxLength: maxChars,
+        maxParagraphs: 30,
+        maxParagraphLength: 120,
+      })
+    } else if (ext === 'doc') {
+      const result = await window.electronAPI.readFile(file.path)
+      if (result.success && result.data) {
+        summary = truncateWithNote(htmlToPlainText(result.data), maxChars, `${file.name} 摘要`)
+      } else {
+        summary = `⚠️ 无法读取 .doc：${result.error || '未知错误'}`
+      }
+    } else if (ext === 'xlsx' || ext === 'xls') {
+      summary = await summarizeExcelFile(file.path, maxChars)
+    } else if (ext === 'pptx' || ext === 'ppt') {
+      const result = await window.electronAPI.readFile(file.path)
+      if (result.success && result.data && result.type === 'pptx') {
+        summary = await extractPptxTextSummary(result.data, maxSlides, maxChars)
+      } else {
+        summary = `⚠️ 无法读取 PPT：${result.error || '未知错误'}`
+      }
+    } else {
+      const result = await window.electronAPI.readFile(file.path)
+      if (result.success && result.data) {
+        summary = truncateWithNote(result.data, maxChars, `${file.name} 摘要`)
+      } else {
+        summary = `⚠️ 无法读取文件：${result.error || '未知错误'}`
+      }
+    }
+
+    workspaceSummaryCacheRef.current.set(file.path, { key: cacheKey, summary })
+    return summary
+  }, [isElectron, truncateWithNote])
+
+  const buildWorkspaceAutoSummaries = useCallback(async (flatFiles: FileItem[]) => {
+    if (!flatFiles.length) return ''
+    const currentPath = currentFile?.path
+    const candidates = flatFiles.filter((file) => file.type === 'file' && file.path !== currentPath)
+    if (!candidates.length) return ''
+
+    const priority = (file: FileItem) => {
+      const ext = (file.extension || file.name.split('.').pop() || '').toLowerCase()
+      if (ext === 'docx') return 1
+      if (ext === 'xlsx' || ext === 'xls') return 2
+      if (ext === 'pptx' || ext === 'ppt') return 3
+      if (ext === 'md' || ext === 'txt') return 4
+      return 9
+    }
+    const selected = candidates.sort((a, b) => priority(a) - priority(b)).slice(0, WORKSPACE_AUTO_SUMMARY_MAX_FILES)
+    if (!selected.length) return ''
+
+    const summaries = await Promise.all(
+      selected.map(async (file) => {
+        const summary = await summarizeWorkspaceFile(file, { maxChars: WORKSPACE_SUMMARY_MAX_CHARS })
+        return `【${file.name}】\n${summary}`
+      })
+    )
+    return `【自动摘要】\n${summaries.join('\n\n')}`
+  }, [currentFile, summarizeWorkspaceFile])
+
+  const buildWorkspaceContext = useCallback(async () => {
+    const folderPath = getWorkspaceFolderPath()
+    if (!folderPath) return ''
+    const index = await buildWorkspaceIndex(folderPath)
+    if (!index) return ''
+    const indexText = formatWorkspaceIndex(index.flatFiles, folderPath)
+    const summaryText = await buildWorkspaceAutoSummaries(index.flatFiles)
+    const blocks = [`=== 工作夹目录（${folderPath}）===`, indexText]
+    if (summaryText) {
+      blocks.push('')
+      blocks.push(summaryText)
+    }
+    return truncateWithNote(blocks.join('\n'), WORKSPACE_CONTEXT_MAX_CHARS, '工作夹上下文')
+  }, [buildWorkspaceAutoSummaries, buildWorkspaceIndex, getWorkspaceFolderPath, truncateWithNote])
 
   // 构建文件上下文
   const buildFilesContext = useCallback(async () => {
     if (attachedFiles.length === 0) return ''
     const contents: string[] = []
+    let totalLen = 0
     for (const file of attachedFiles) {
       const content = await getFileContent(file)
-      contents.push(`=== ${file.name} ===\n${content}`)
+      const block = `=== ${file.name} ===\n${content}`
+      const remaining = FILES_CONTEXT_MAX_CHARS - totalLen
+      if (remaining <= 0) {
+        break
+      }
+      const out = block.length > remaining
+        ? truncateWithNote(block, remaining, '附加文件上下文总长度')
+        : block
+      contents.push(out)
+      totalLen += out.length
+      if (block.length > remaining) break
     }
     return contents.join('\n\n')
-  }, [attachedFiles, getFileContent])
+  }, [attachedFiles, getFileContent, truncateWithNote])
 
   const handleSend = useCallback(async () => {
     if (!input.trim() || isLoading) return
@@ -921,6 +1539,8 @@ export default function ChatPanel() {
     // 1. 当前编辑器中的文档内容（默认始终包含）
     // 2. 用户拖拽的附加文件内容
     let fullContext = attachedContext || ''
+    // 给 Agent 的“当前文档内容”（由 AIContext 附加到 user 消息）；需要严格控大小，避免图片 base64 撑爆上下文
+    let documentContextForAI: string | undefined
     
     // 检查是否是 Excel 文件
     const isExcelFile = currentFile?.name?.toLowerCase().endsWith('.xlsx') || currentFile?.name?.toLowerCase().endsWith('.xls')
@@ -983,6 +1603,42 @@ export default function ChatPanel() {
         // Word/文本文档处理
         let docContent = document.content
         let docStructure = ''
+        let onlyOfficeExtra = ''
+
+        // 给 AI 的文档内容：移除图片 base64（否则会把 prompt 撑爆导致超时/失败）
+        const sanitizeHtmlForAI = (html: string) => {
+          const input = html || ''
+          if (!input) return input
+
+          // 1) 先把 data:image base64 替换掉（避免后续 <img> 标签匹配时字符串过大）
+          let out = input.replace(
+            /data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/gi,
+            '[omitted:data-image]'
+          )
+
+          // 2) 把 img 变成可读占位，保留少量元信息（rid/尺寸/alt）
+          out = out.replace(/<img\b[^>]*>/gi, (tag) => {
+            const getAttr = (name: string) => {
+              const m =
+                tag.match(new RegExp(`${name}=\"([^\"]*)\"`, 'i')) ||
+                tag.match(new RegExp(`${name}='([^']*)'`, 'i'))
+              return m?.[1] || ''
+            }
+            const rid = getAttr('data-rid')
+            const w = getAttr('data-w')
+            const h = getAttr('data-h')
+            const alt = getAttr('alt')
+            const floating = getAttr('data-floating')
+            const parts: string[] = ['[图片]']
+            if (rid) parts.push(`rid=${rid}`)
+            if (w || h) parts.push(`size=${w || '?'}x${h || '?'}`)
+            if (floating === '1') parts.push('floating=1')
+            if (alt) parts.push(`alt=${alt}`)
+            return parts.join(' ')
+          })
+
+          return out
+        }
         
         // AI 始终使用内置编辑器（Tiptap）的内容和结构
         // 这样可以保证 AI 编辑功能的稳定性
@@ -994,18 +1650,49 @@ export default function ChatPanel() {
         } catch (e) {
           console.log('获取文档结构失败')
         }
+
+        // ONLYOFFICE 预览模式下：补充主题/分节/样式 JSON（默认不包含全文 content，避免超大）
+        if (editorMode === 'onlyoffice' && window.onlyOfficeConnector?.getDocumentJson) {
+          try {
+            const json = await window.onlyOfficeConnector.getDocumentJson({
+              writeDefaultTextPr: true,
+              writeDefaultParaPr: true,
+              writeTheme: true,
+              writeSectionPr: true,
+              writeNumberings: false,
+              writeStyles: true,
+              includeContent: false
+            })
+            if (json && json.trim()) {
+              const clipped = truncateWithNote(json, 50_000, 'ONLYOFFICE 文档 JSON')
+              onlyOfficeExtra = `\n\n【ONLYOFFICE 文档 JSON（主题/分节/样式）】\n${clipped}`
+            }
+          } catch (e) {
+            // ignore
+          }
+        }
         
         if (docContent) {
-          // 发送内容，让 AI 能看到原文档
-          // AI 编辑始终使用内置编辑器，ONLYOFFICE 仅用于预览
+          // 给 AI：文档正文走 documentContext（更符合 Agent prompt 的 [当前文档内容]），fullContext 里只放结构/元信息，避免重复与超大 payload
+          documentContextForAI = truncateWithNote(
+            sanitizeHtmlForAI(docContent),
+            120_000,
+            '当前文档 HTML（已移除图片 base64）'
+          )
+
           const formatNote = '\n\n[提示：AI 编辑使用内置编辑器。支持 HTML 格式，可使用 <h1>/<h2>/<strong>/<em> 等标签。' +
             (editorMode === 'onlyoffice' ? ' 当前预览模式为 ONLYOFFICE。]' : ']')
-          const currentFileContext = `=== ${currentFile.name} (当前编辑) ===\n${docContent}${docStructure}${formatNote}`
+          const currentFileContext = `=== ${currentFile.name} (当前编辑) ===\n${docStructure}${onlyOfficeExtra}${formatNote}`
           fullContext = fullContext ? `${currentFileContext}\n\n${fullContext}` : currentFileContext
         }
       }
     }
     
+    const workspaceContext = await buildWorkspaceContext()
+    if (workspaceContext) {
+      fullContext = fullContext ? `${fullContext}\n\n${workspaceContext}` : workspaceContext
+    }
+
     // 如果有 PPT 编辑上下文，添加到 fullContext 中
     if (currentPptEditContext) {
       const pptEditInfo = `
@@ -1024,10 +1711,17 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
       fullContext = fullContext ? `${pptEditInfo}\n\n${fullContext}` : pptEditInfo
     }
 
+    const memoryWorkspaceKey = currentFile?.path
+      ? getParentDir(currentFile.path)
+      : (workspacePath || '')
+    const memoryWorkspaceSummary = workspaceContext
+      ? truncateWithNote(workspaceContext, 1200, '工作夹摘要')
+      : ''
+
     // 使用 Agent 模式发送消息
     await sendAgentMessage(
       userMessage,
-      document.content,
+      documentContextForAI,
       fullContext || undefined,
       {
         // 工具调用处理
@@ -1080,6 +1774,12 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             if (result.success && result.count > 0) {
               totalReplacements += result.count
               updateAgentFile({ additions: result.count, status: 'writing', name: fileName })
+              
+              // 自动保存到磁盘
+              if (isElectron && currentFile) {
+                silentSaveToFile().catch(() => {})
+              }
+              
               completeToolActivity(activityId, 'success', `${result.count} 处`)
               return { 
                 tool, 
@@ -1098,6 +1798,80 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                 tool, 
                 success: false, 
                 message: `未找到「${search}」，请检查是否与文档内容完全匹配` 
+              }
+            }
+          }
+
+          if (tool === 'review') {
+            // 文档审查工具：原位替换 + 审查元数据（reason/type）+ DSL 格式参数
+            const search = args.search || ''
+            const replaceText = args.replace || ''
+            const reason = args.reason || ''
+            const reviewType = args.type || 'style'
+
+            if (!search) {
+              return { tool, success: false, message: '缺少 search 参数' }
+            }
+
+            const reviewTypeLabels: Record<string, string> = {
+              grammar: '语法', logic: '逻辑', style: '措辞', typo: '错别字', format: '格式'
+            }
+            const typeLabel = reviewTypeLabels[reviewType] || reviewType
+
+            const activityId = registerToolActivity('review', `[${typeLabel}] ${truncateLabel(reason || search, 30)}`)
+
+            // 如果当前是 ONLYOFFICE 模式，自动切换到内置编辑器以显示 diff 标记
+            if (editorMode === 'onlyoffice') {
+              setEditorMode('tiptap')
+              await new Promise(resolve => setTimeout(resolve, 100))
+            }
+
+            // 解析 DSL 格式参数
+            const format = {
+              bold: args.bold === 'true',
+              italic: args.italic === 'true',
+              underline: args.underline === 'true',
+              color: args.color || undefined,
+              backgroundColor: args.backgroundColor || undefined,
+              fontSize: args.fontSize || undefined,
+              fontFamily: args.fontFamily || undefined,
+            }
+            const hasFormat = format.bold || format.italic || format.underline ||
+                             format.color || format.backgroundColor || format.fontSize || format.fontFamily
+
+            updateAgentAction(`[${typeLabel}] 审查：${search.slice(0, 20)}${search.length > 20 ? '...' : ''}`)
+            completeAgentStep()
+            updateAgentFile({ status: 'writing', name: fileName })
+            addAgentFileOperation(`审查: [${typeLabel}] "${search.slice(0, 15)}..." → "${replaceText.slice(0, 15)}..."`)
+
+            // 执行替换（传入审查元数据）
+            const reviewMeta = { reason, type: reviewType }
+            const result = hasFormat
+              ? replaceWithFormat(search, replaceText, format, reviewMeta)
+              : replaceInDocument(search, replaceText, reviewMeta)
+
+            if (result.success && result.count > 0) {
+              totalReplacements += result.count
+              updateAgentFile({ additions: result.count, status: 'writing', name: fileName })
+
+              // 自动保存到磁盘
+              if (isElectron && currentFile) {
+                silentSaveToFile().catch(() => {})
+              }
+
+              completeToolActivity(activityId, 'success', `[${typeLabel}] ${result.count} 处`)
+              return {
+                tool,
+                success: true,
+                message: `[${typeLabel}] ${reason}\n替换 ${result.count} 处：「${search}」→「${replaceText}」`,
+                data: { count: result.count, reason, type: reviewType }
+              }
+            } else {
+              completeToolActivity(activityId, 'error', '未找到匹配')
+              return {
+                tool,
+                success: false,
+                message: `未找到「${search}」，请检查是否与文档内容完全匹配`
               }
             }
           }
@@ -1141,6 +1915,11 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               }
             }
 
+            const prep = await prepareTemplateFillOutput(ops)
+            if (!prep.success) {
+              return { tool, success: false, message: prep.message || '模板填充准备失败' }
+            }
+
             const result = applyWordOps(ops)
             return {
               tool,
@@ -1154,6 +1933,8 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             const title = args.title || '新文档'
             const content = args.content || ''
             const activityId = registerToolActivity('create', `创建：${truncateLabel(title, 24)}`)
+            const styleRefPathArg = args.styleRefPath || args.styleRefFileName || args.styleRefName || ''
+            const contentRefPathArg = args.contentRefPath || args.contentRefFileName || args.contentRefName || ''
             
             // 检查是否有 elements 参数（带格式创建）
             let elements: Array<{
@@ -1169,6 +1950,27 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               data?: string[][]
             }> = []
             
+            // 检查是否有 DSL 参数（最高优先级）
+            const dslProvided = !!args.dsl
+            let parsedDsl: DocDsl | null = null
+            let dslError: string | null = null
+            if (args.dsl) {
+              try {
+                const dslObj = JSON.parse(args.dsl)
+                const validation = validateDocDsl(dslObj)
+                if (validation.valid) {
+                  parsedDsl = dslObj
+                  console.log('解析到 DSL:', { blocksCount: parsedDsl?.blocks?.length })
+                } else {
+                  dslError = validation.errors.map(e => `${e.path}: ${e.message}`).join('\n')
+                  console.error('DSL 校验失败:', validation.errors)
+                }
+              } catch (e) {
+                dslError = `DSL 解析失败: ${(e as Error).message}`
+                console.error('解析 DSL 失败:', e)
+              }
+            }
+
             if (args.elements) {
               try {
                 elements = JSON.parse(args.elements)
@@ -1184,34 +1986,181 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             updateAgentFile({ status: 'writing', name: `${title}.docx` })
 
             try {
-              console.log('create 工具参数:', { title, content: content.slice(0, 100), elements, rawArgs: args })
+              const resolveRefPath = (maybePathOrName: string): string => {
+                if (!maybePathOrName) return ''
+                // Heuristic: absolute Windows path or UNC path
+                if (/[A-Za-z]:\\/.test(maybePathOrName) || maybePathOrName.startsWith('\\\\')) return maybePathOrName
+                const byAttached = attachedFiles.find((f) => f.name === maybePathOrName)
+                if (byAttached?.path) return byAttached.path
+                if (currentFile?.name === maybePathOrName) return currentFile.path
+                return ''
+              }
+
+              const styleRefPath = resolveRefPath(String(styleRefPathArg || ''))
+              const contentRefPath = resolveRefPath(String(contentRefPathArg || ''))
+
+              if (styleRefPathArg && !styleRefPath) {
+                completeToolActivity(activityId, 'error', '缺少样式参考')
+                return {
+                  tool,
+                  success: false,
+                  message: `找不到样式参考文件：${styleRefPathArg}。请把“格式参考.docx”拖拽为附件，或提供绝对路径（如 C:\\...\\格式参考.docx）。`,
+                }
+              }
+              if (contentRefPathArg && !contentRefPath) {
+                completeToolActivity(activityId, 'error', '缺少内容参考')
+                return {
+                  tool,
+                  success: false,
+                  message: `找不到内容参考文件：${contentRefPathArg}。请把“内容参考.docx”拖拽为附件，或提供绝对路径（如 C:\\...\\内容参考.docx）。`,
+                }
+              }
+
+              // 如果提供了“内容参考 docx”，自动解析为 elements（优先级：args.elements > contentRefPath > content）
+              let previewHtml = content
+              if (elements.length === 0 && contentRefPath) {
+                if (!isElectron || !window.electronAPI?.readFile) {
+                  completeToolActivity(activityId, 'error', '不支持')
+                  return { tool, success: false, message: 'contentRefPath 需要桌面版（Electron）才能读取本地文件' }
+                }
+
+                const read = await window.electronAPI.readFile(contentRefPath)
+                if (!read.success || !read.data) {
+                  completeToolActivity(activityId, 'error', '读取失败')
+                  return { tool, success: false, message: `读取内容参考失败：${read.error || '未知错误'}` }
+                }
+                if (read.type !== 'docx') {
+                  completeToolActivity(activityId, 'error', '类型不匹配')
+                  return { tool, success: false, message: 'contentRefPath 必须是 .docx 文件' }
+                }
+
+                const parsed = await parseDocxToHtmlForAgent(read.data)
+                const parsedElements = docxHtmlToElements(parsed.html || '')
+                if (parsedElements.length > 0) {
+                  elements = parsedElements as any
+                  previewHtml = elementsToHtmlPreview(parsedElements)
+                } else {
+                  previewHtml = parsed.html || content
+                }
+              }
+
+              console.log('create 工具参数:', {
+                title,
+                content: content.slice(0, 100),
+                elementsCount: elements.length,
+                hasDsl: !!parsedDsl,
+                styleRefPath,
+                contentRefPath,
+                rawArgs: args
+              })
               
+              if (dslProvided && !parsedDsl) {
+                completeToolActivity(activityId, 'error', 'DSL 校验失败')
+                finishAgentProgress()
+                return {
+                  tool,
+                  success: false,
+                  message: dslError || 'DSL 校验失败，请检查 DSL 结构是否正确'
+                }
+              }
+
+              // 如果有 DSL，使用 DSL 方式创建（最高优先级）
+              if (parsedDsl) {
+                console.log('使用 DSL 创建文档:', parsedDsl.blocks?.length, '个块')
+                const result = await createDocumentFromDsl(title, parsedDsl)
+                if (result.success) {
+                  completeToolActivity(activityId, 'success', `${parsedDsl.blocks?.length || 0} 块`)
+                  finishAgentProgress()
+                  return {
+                    tool,
+                    success: true,
+                    message: result.message,
+                    data: { fileName: `${title}.docx`, blockCount: parsedDsl.blocks?.length, filePath: result.filePath }
+                  }
+                } else {
+                  completeToolActivity(activityId, 'error', 'DSL 错误')
+                  finishAgentProgress()
+                  return { tool, success: false, message: result.message }
+                }
+              }
+
               // 如果有 elements，使用带格式创建（直接用 docx 库生成文件）
               if (elements.length > 0) {
                 console.log('使用 elements 创建带格式文档:', elements)
-                await createNewDocument(title, content, elements)
+                await createNewDocument(title, previewHtml || content, elements as any, styleRefPath || undefined)
+
+                // 轻量验证：确保文件真实落盘，并包含关键样式（字体/缩进）
+                if (isElectron && window.electronAPI?.readFile && workspacePath) {
+                  const safeTitle = String(title).replace(/[<>:"/\\|?*]/g, '_').slice(0, 50)
+                  const finalTitle = safeTitle.toLowerCase().endsWith('.docx') ? safeTitle.slice(0, -5) : safeTitle
+                  const outPath = `${workspacePath}\\${finalTitle}.docx`
+                  const out = await window.electronAPI.readFile(outPath)
+                  if (!out.success || !out.data) {
+                    completeToolActivity(activityId, 'error', '未写入')
+                    finishAgentProgress()
+                    return { tool, success: false, message: `文档创建后读取失败，可能未写入成功：${out.error || outPath}` }
+                  }
+                  if (out.type === 'docx') {
+                    try {
+                      const bin = atob(out.data)
+                      const bytes = new Uint8Array(bin.length)
+                      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+                      const zip = await JSZip.loadAsync(bytes)
+                      const stylesXml = await zip.file('word/styles.xml')?.async('string')
+                      const hasRFonts = !!stylesXml && /<w:rFonts\b/.test(stylesXml)
+                      const hasIndent = !!stylesXml && /<w:ind\b[^>]*w:firstLine=/.test(stylesXml)
+                      // eslint-disable-next-line no-console
+                      console.log('[create.verify] styles:', { hasRFonts, hasIndent })
+                    } catch (e) {
+                      // ignore
+                    }
+                  }
+                }
+                const elemSavedToDisk = !!(isElectron && window.electronAPI && workspacePath)
                  completeToolActivity(activityId, 'success', `${elements.length} 段`)
                 finishAgentProgress()
                 return {
                   tool,
                   success: true,
-                  message: `已创建文档：${title}.docx（包含 ${elements.length} 个格式化元素）`,
-                  data: { fileName: `${title}.docx`, elementCount: elements.length }
+                  message: elemSavedToDisk
+                    ? `已创建并保存文档：${title}.docx（包含 ${elements.length} 个格式化元素）`
+                    : `已在编辑器中创建文档：${title}.docx（包含 ${elements.length} 个格式化元素，尚未保存到磁盘，请用户点击保存）`,
+                  data: { fileName: `${title}.docx`, elementCount: elements.length, styleRefPath, contentRefPath, savedToDisk: elemSavedToDisk }
                 }
               }
               
               // 普通方式创建（纯文本内容）
-              console.log('使用纯文本创建文档')
-              await createNewDocument(title, content)
+              console.log('使用纯文本创建文档:', { title, contentLen: content.length, workspacePath })
+              await createNewDocument(title, content, undefined, styleRefPath || undefined)
               const lineCount = content.split('\n').length
-              completeToolActivity(activityId, 'success', `${lineCount} 行`)
+
+              // 验证文件是否真正写入磁盘
+              let savedToDisk = false
+              if (isElectron && window.electronAPI?.readFile && workspacePath) {
+                const safeT = String(title).replace(/[<>:"/\\|?*]/g, '_').slice(0, 50)
+                const finalT = safeT.toLowerCase().endsWith('.docx') ? safeT.slice(0, -5) : safeT
+                const outPath = `${workspacePath}\\${finalT}.docx`
+                try {
+                  const verify = await window.electronAPI.readFile(outPath)
+                  savedToDisk = !!(verify.success && verify.data)
+                  if (!savedToDisk) {
+                    console.warn('[create] 文件验证失败:', outPath, verify.error)
+                  }
+                } catch (verifyErr) {
+                  console.warn('[create] 文件验证异常:', verifyErr)
+                }
+              }
+
+              completeToolActivity(activityId, savedToDisk ? 'success' : 'error', `${lineCount} 行`)
               finishAgentProgress()
               
               return { 
                 tool, 
                 success: true, 
-                message: `已创建文档：${title}.docx`,
-                data: { fileName: `${title}.docx`, lines: lineCount }
+                message: savedToDisk
+                  ? `已创建并保存文档：${title}.docx（${lineCount} 行内容）。现在可以用 replace 工具继续填充内容。`
+                  : `文档已在编辑器中打开但未保存到磁盘（${lineCount} 行内容）。请用户先 Ctrl+S 保存，然后再继续用 replace 填充内容。`,
+                data: { fileName: `${title}.docx`, lines: lineCount, styleRefPath, contentRefPath, savedToDisk }
               }
             } catch (e) {
               console.error('创建文档失败:', e)
@@ -1466,10 +2415,28 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
           
           if (tool === 'insert') {
             const position = args.position || 'end'
-            const content = args.content || ''
-            
+            let content = args.content || ''
+
+            // 支持 DSL 参数：解析为带格式的 HTML 后插入
+            let dslBlockCount = 0
+            if (args.dsl) {
+              try {
+                const dslObj: DocDsl = JSON.parse(args.dsl)
+                const validation = validateDocDsl(dslObj)
+                if (!validation.valid) {
+                  const errMsg = validation.errors.map((e: any) => `${e.path}: ${e.message}`).join('; ')
+                  return { tool, success: false, message: `DSL 校验失败: ${errMsg}` }
+                }
+                content = dslToHtml(dslObj)
+                dslBlockCount = dslObj.blocks?.length || 0
+                console.log('[insert] DSL → HTML:', { blocks: dslBlockCount, htmlLen: content.length })
+              } catch (e) {
+                return { tool, success: false, message: `DSL 解析失败: ${(e as Error).message}` }
+              }
+            }
+
             if (!content) {
-              return { tool, success: false, message: '缺少 content 参数' }
+              return { tool, success: false, message: '缺少 content 或 dsl 参数' }
             }
 
             const activityId = registerToolActivity('insert', `插入：${position}`)
@@ -1483,19 +2450,29 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             // 更新 Agent 进度
             updateAgentAction(`正在插入内容到 ${position === 'start' ? '开头' : position === 'end' ? '末尾' : position}`)
             completeAgentStep()
-            addAgentFileOperation(`插入: ${content.slice(0, 30)}...`)
+            addAgentFileOperation(`插入: ${dslBlockCount ? `${dslBlockCount} 个 DSL 块` : content.slice(0, 30) + '...'}`)
             
             // AI 编辑始终使用内置编辑器（Tiptap）的方法
             const result = insertInDocument(position, content)
             
             if (result.success) {
               updateAgentFile({ additions: 1, status: 'writing', name: fileName })
-              completeToolActivity(activityId, 'success')
+              
+              // 自动保存到磁盘（确保 .docx 文件包含插入的内容）
+              let savedMsg = ''
+              if (isElectron && currentFile) {
+                const saveResult = await silentSaveToFile()
+                savedMsg = saveResult.success ? '（已自动保存）' : `（保存失败: ${saveResult.error}）`
+              }
+              
+              completeToolActivity(activityId, 'success', dslBlockCount ? `${dslBlockCount} 块` : undefined)
               return { 
                 tool, 
                 success: true, 
-                message: result.message,
-                data: { position, contentLength: content.length }
+                message: (dslBlockCount
+                  ? `已插入 ${dslBlockCount} 个 DSL 格式块到${position === 'end' ? '末尾' : position === 'start' ? '开头' : position}`
+                  : result.message) + savedMsg,
+                data: { position, contentLength: content.length, dslBlocks: dslBlockCount || undefined }
               }
             } else {
               completeToolActivity(activityId, 'error', result.message)
@@ -1687,6 +2664,69 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               console.error('复制模板失败:', e)
               completeToolActivity(activityId, 'error', '复制失败')
               return { tool, success: false, message: `复制模板失败: ${e}` }
+            }
+          }
+
+          if (tool === 'workspace_list') {
+            const folderArg = (args.folder || args.path || '').trim()
+            const refresh = (args.refresh || '').toLowerCase() === 'true'
+            const folderPath = folderArg || getWorkspaceFolderPath()
+            if (!folderPath) {
+              return { tool, success: false, message: '无法确定工作夹目录，请先打开一个文件' }
+            }
+            const activityId = registerToolActivity('workspace_list', `索引：${truncateLabel(folderPath, 24)}`)
+            updateAgentAction('正在读取工作夹文件清单')
+            const index = await buildWorkspaceIndex(folderPath, refresh)
+            if (!index) {
+              completeToolActivity(activityId, 'error', '读取失败')
+              return { tool, success: false, message: '读取工作夹失败，请稍后重试' }
+            }
+            const indexText = formatWorkspaceIndex(index.flatFiles, folderPath)
+            completeToolActivity(activityId, 'success', `${index.flatFiles.length} 个文件`)
+            return {
+              tool,
+              success: true,
+              message: `=== 工作夹目录（${folderPath}）===\n${indexText}`,
+              data: { folderPath, total: index.flatFiles.length }
+            }
+          }
+
+          if (tool === 'workspace_open') {
+            const targetPath = (args.path || args.file || args.filePath || '').trim()
+            const targetName = (args.name || '').trim()
+            const targetRel = (args.relativePath || '').trim()
+            const file = await resolveWorkspaceFile({ path: targetPath || targetRel, name: targetName, relativePath: targetRel })
+            if (!file) {
+              return { tool, success: false, message: '未找到指定文件，请先使用 workspace_list 查看路径' }
+            }
+            const activityId = registerToolActivity('workspace_open', `打开：${truncateLabel(file.name, 24)}`)
+            updateAgentAction(`正在打开 ${file.name}`)
+            await openFile(file)
+            completeToolActivity(activityId, 'success')
+            return { tool, success: true, message: `已打开文件：${file.name}`, data: { filePath: file.path } }
+          }
+
+          if (tool === 'workspace_summarize' || tool === 'workspace_read') {
+            const targetPath = (args.path || args.file || args.filePath || '').trim()
+            const targetName = (args.name || '').trim()
+            const targetRel = (args.relativePath || '').trim()
+            const file = await resolveWorkspaceFile({ path: targetPath || targetRel, name: targetName, relativePath: targetRel })
+            if (!file) {
+              return { tool, success: false, message: '未找到指定文件，请先使用 workspace_list 查看路径' }
+            }
+            const maxCharsArg = args.maxChars ? parseInt(args.maxChars, 10) : undefined
+            const maxSlidesArg = args.maxSlides ? parseInt(args.maxSlides, 10) : undefined
+            const maxChars = Math.min(Math.max(maxCharsArg || (tool === 'workspace_read' ? WORKSPACE_READ_MAX_CHARS : WORKSPACE_SUMMARY_MAX_CHARS), 500), 20000)
+            const maxSlides = Math.min(Math.max(maxSlidesArg || WORKSPACE_PPTX_MAX_SLIDES, 1), 20)
+            const activityId = registerToolActivity(tool, `读取：${truncateLabel(file.name, 24)}`)
+            updateAgentAction(`正在读取 ${file.name}`)
+            const content = await summarizeWorkspaceFile(file, { maxChars, maxSlides })
+            completeToolActivity(activityId, 'success')
+            return {
+              tool,
+              success: true,
+              message: content,
+              data: { filePath: file.path, fileName: file.name, maxChars }
             }
           }
 
@@ -2733,7 +3773,8 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
         getLatestDocument: () => {
           return getLatestContent()
         }
-      }
+      },
+      { workspaceKey: memoryWorkspaceKey, workspaceSummary: memoryWorkspaceSummary }
     )
   }, [
     input,
@@ -2744,7 +3785,9 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
     sendAgentMessage,
     document.content,
     buildFilesContext,
+    buildWorkspaceContext,
     createNewDocument,
+    createDocumentFromDsl,
     currentFile?.name,
     replaceInDocument,
     startAgentProgress,
@@ -2765,6 +3808,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
     refreshFiles,
     openFile,
     workspacePath,
+    prepareTemplateFillOutput,
     getLatestContent
   ])
 
@@ -2867,37 +3911,143 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
 
   const displayMessages = messages.filter(m => m.content.trim() !== '')
 
+  const markdownComponents: any = {
+    h1: ({ children }: { children?: ReactNode }) => (
+      <h1 className="text-[15px] font-semibold text-text mt-3 mb-2 pb-1 border-b border-border">{children}</h1>
+    ),
+    h2: ({ children }: { children?: ReactNode }) => (
+      <h2 className="text-[14px] font-semibold text-text mt-3 mb-1.5 flex items-center gap-1.5">{children}</h2>
+    ),
+    h3: ({ children }: { children?: ReactNode }) => (
+      <h3 className="text-[13px] font-medium text-text-secondary mt-2 mb-1">{children}</h3>
+    ),
+    p: ({ children }: { children?: ReactNode }) => <p className="mb-2 last:mb-0">{children}</p>,
+    ul: ({ children }: { children?: ReactNode }) => <ul className="list-none ml-0 mb-2 space-y-1">{children}</ul>,
+    ol: ({ children }: { children?: ReactNode }) => <ol className="list-decimal ml-4 mb-2 space-y-1">{children}</ol>,
+    li: ({ children }: { children?: ReactNode }) => (
+      <li className="text-[13px] leading-relaxed flex items-start gap-1.5">
+        <span className="text-text-muted mt-0.5">•</span>
+        <span className="flex-1">{children}</span>
+      </li>
+    ),
+    strong: ({ children }: { children?: ReactNode }) => <strong className="font-semibold text-text">{children}</strong>,
+    em: ({ children }: { children?: ReactNode }) => <em className="italic text-text-secondary">{children}</em>,
+    code: ({ children, className }: { children?: ReactNode; className?: string }) => {
+      const isBlock = className?.includes('language-')
+      if (isBlock) {
+        return (
+          <code className="block bg-black/10 dark:bg-black/35 text-text p-2 rounded text-[12px] font-mono overflow-x-auto my-2 border border-border">
+            {children}
+          </code>
+        )
+      }
+      return (
+        <code className="bg-black/10 dark:bg-black/35 text-text px-1 py-0.5 rounded text-[12px] font-mono border border-border">
+          {children}
+        </code>
+      )
+    },
+    pre: ({ children }: { children?: ReactNode }) => (
+      <pre className="bg-black/10 dark:bg-black/35 rounded-md overflow-hidden my-2 border border-border">{children}</pre>
+    ),
+    a: ({ href, children }: { href?: string; children?: ReactNode }) => (
+      <a href={href} className="text-accent hover:underline" target="_blank" rel="noopener noreferrer">
+        {children}
+      </a>
+    ),
+    blockquote: ({ children }: { children?: ReactNode }) => (
+      <blockquote className="border-l-2 border-accent pl-3 my-2 text-text-muted italic">{children}</blockquote>
+    ),
+    hr: () => <hr className="border-border my-3" />,
+    table: ({ node, children, ...props }: any) => {
+      const data = extractTableCardData(node)
+      if (!data || data.rows.length === 0) {
+        return (
+          <table className="ai-markdown-table" {...props}>
+            {children}
+          </table>
+        )
+      }
+      const cards = data.rows
+        .map((row, rowIndex) => {
+          const fields: JSX.Element[] = []
+          data.headers.forEach((header, colIndex) => {
+            const value = row[colIndex]
+            if (!value) return
+            const label = header || `字段${colIndex + 1}`
+            fields.push(
+              <div className="ai-table-field" key={`field-${rowIndex}-${colIndex}`}>
+                <div className="ai-table-field-label">{label}</div>
+                <div className="ai-table-field-value">{value}</div>
+              </div>
+            )
+          })
+          if (fields.length === 0) return null
+          return (
+            <div className="ai-table-card" key={`row-${rowIndex}`}>
+              {fields}
+            </div>
+          )
+        })
+        .filter((card): card is JSX.Element => card !== null)
+
+      if (cards.length === 0) {
+        return (
+          <table className="ai-markdown-table" {...props}>
+            {children}
+          </table>
+        )
+      }
+
+      return <div className="ai-table-cards">{cards}</div>
+    },
+    thead: ({ children }: { children?: ReactNode }) => <thead className="ai-markdown-thead">{children}</thead>,
+    tbody: ({ children }: { children?: ReactNode }) => <tbody className="ai-markdown-tbody">{children}</tbody>,
+    tr: ({ children }: { children?: ReactNode }) => <tr className="ai-markdown-tr">{children}</tr>,
+    th: ({ children }: { children?: ReactNode }) => <th className="ai-markdown-th">{children}</th>,
+    td: ({ children }: { children?: ReactNode }) => <td className="ai-markdown-td">{children}</td>,
+  }
+
   return (
     <div 
-      className={`flex flex-col h-full bg-[#1e1e1e] border-l border-[#2d2d2d] ${isDragOver ? 'ring-2 ring-primary ring-inset' : ''}`}
+      className={`flex flex-col h-full bg-transparent ${isDragOver ? 'ring-2 ring-accent/40 ring-inset' : ''}`}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      {/* 头部 - Cursor 风格 */}
-      <div className="flex items-center justify-between px-3 py-2.5 border-b border-[#2d2d2d] bg-[#252526]">
-        <div className="flex items-center gap-2">
-          <div className="w-6 h-6 rounded-md bg-gradient-to-br from-violet-500 to-fuchsia-500 flex items-center justify-center">
-            <Bot className="w-3.5 h-3.5 text-white" />
+      {/* 头部 - 柔和玻璃态风格 */}
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+        <div className="flex items-center gap-2.5">
+          <div className="w-7 h-7 rounded-xl bg-gradient-to-br from-accent to-accent-hover flex items-center justify-center shadow-md shadow-accent/20">
+            <Bot className="w-4 h-4 text-white" />
           </div>
-          <span className="text-[13px] font-medium text-[#cccccc]">AI 助手</span>
+          <span className="text-sm font-semibold text-text tracking-wide">AI CHAT</span>
         </div>
-        <button
-          onClick={clearMessages}
-          className="p-1.5 rounded-md text-[#858585] hover:text-[#cccccc] hover:bg-[#2d2d2d] transition-colors"
-          title="清空对话"
-        >
-          <Trash2 className="w-3.5 h-3.5" />
-        </button>
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={openSettings}
+            className="p-2 rounded-xl text-text-muted hover:text-text hover:bg-black/5 dark:hover:bg-white/5 transition-all"
+            title="设置"
+          >
+            <Settings className="w-4 h-4" />
+          </button>
+          <button
+            onClick={clearMessages}
+            className="p-2 rounded-xl text-text-muted hover:text-text hover:bg-black/5 dark:hover:bg-white/5 transition-all"
+            title="清空对话"
+          >
+            <Trash2 className="w-4 h-4" />
+          </button>
+        </div>
       </div>
 
-      {/* 快捷命令 - 更紧凑 */}
-      <div className="px-3 py-2 border-b border-[#2d2d2d] flex gap-1.5 overflow-x-auto scrollbar-none">
+      {/* 快捷命令 - 柔和标签风格 */}
+      <div className="px-4 py-3 border-b border-border flex gap-2 overflow-x-auto scrollbar-none">
         {quickCommands.map((cmd, i) => (
           <button
             key={i}
             onClick={() => setInput(cmd.command)}
-            className="flex items-center gap-1 px-2 py-1 bg-[#2d2d2d] hover:bg-[#3c3c3c] text-[11px] text-[#858585] hover:text-[#cccccc] rounded-md transition-colors whitespace-nowrap"
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 text-[11px] text-text-muted hover:text-text rounded-xl transition-all whitespace-nowrap border border-black/10 dark:border-white/10 hover:border-accent/20"
           >
             {cmd.icon}
             <span>{cmd.label}</span>
@@ -2907,58 +4057,56 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
 
       {/* 拖拽提示 */}
       {isDragOver && (
-        <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#1e1e1e]/90 backdrop-blur-sm">
-          <div className="flex flex-col items-center gap-2 p-6 bg-[#2d2d2d] border border-[#3c3c3c] rounded-lg">
-            <Paperclip className="w-8 h-8 text-violet-400" />
-            <p className="text-sm text-[#cccccc]">释放以添加文件</p>
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/20 dark:bg-black/45 backdrop-blur-md">
+          <div className="flex flex-col items-center gap-3 p-8 glass-card">
+            <Paperclip className="w-10 h-10 text-accent" />
+            <p className="text-sm text-text font-medium">释放以添加文件</p>
           </div>
         </div>
       )}
 
-      {/* 消息列表 - Cursor 风格 + Framer Motion */}
-      <div className="flex-1 overflow-y-auto px-3 py-3 space-y-4 scrollbar-thin">
+      {/* 消息列表 - 更清爽：减少硬编码深色块 */}
+      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4 chat-scrollbar">
         <AnimatePresence mode="popLayout">
-        {displayMessages.map((message) => (
-          <motion.div
-            key={message.id}
-            layout
-            variants={messageVariants}
-            initial="hidden"
-            animate="visible"
-            exit="exit"
-            className={`group ${message.role === 'user' ? 'flex flex-col items-end' : ''}`}
-          >
-            {/* 用户消息 */}
-            {message.role === 'user' ? (
-              <div className="max-w-[90%]">
-                <div className="bg-gradient-to-b from-[#0e639c]/35 to-[#0e639c]/20 border border-[#0e639c]/35 text-[#e6f1ff] rounded-2xl rounded-tr-sm px-3 py-2 shadow-[0_6px_20px_rgba(14,99,156,0.12)]">
-                  <p className="text-[13px] leading-relaxed whitespace-pre-wrap">{message.content}</p>
+        {displayMessages.map((message) => {
+          const displayContent =
+            message.role === 'assistant' ? sanitizeAssistantText(message.content) : stripToolBlocks(message.content)
+
+          return (
+            <motion.div
+              key={message.id}
+              layout
+              variants={messageVariants}
+              initial="hidden"
+              animate="visible"
+              exit="exit"
+              className={`group ${message.role === 'user' ? 'flex flex-col items-end' : ''}`}
+            >
+              {/* 用户消息 */}
+              {message.role === 'user' ? (
+                <div className="max-w-[90%]">
+                  <div className="bg-gradient-to-br from-accent/92 to-accent-hover/92 text-white rounded-2xl rounded-tr-sm px-4 py-2.5 shadow-sm shadow-black/10 dark:shadow-black/20 border border-white/12">
+                    <p className="text-[13px] leading-relaxed whitespace-pre-wrap">{displayContent}</p>
+                  </div>
+                  <span className="text-[10px] text-text-dim mt-1.5 block text-right pr-1">
+                    {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  </span>
                 </div>
-                <span className="text-[10px] text-[#5a5a5a] mt-1 block text-right pr-1">
-                  {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                </span>
-              </div>
-            ) : message.content.includes('\n---\n✅') ? (
+              ) : displayContent.includes('\n---\n✅') ? (
               /* 操作完成消息 - 显示 AI 总结 + 状态卡片 */
               <div className="w-full space-y-3">
                 {/* AI 总结内容 */}
                 {(() => {
-                  const parts = message.content.split('\n---\n')
+                  const parts = displayContent.split('\n---\n')
                   const summaryContent = parts[0]
                   const statusContent = parts.slice(1).join('\n---\n')
                   return (
                     <>
                       {summaryContent && (
-                        <div className="text-[13px] leading-relaxed text-[#cccccc] prose prose-invert prose-sm max-w-none">
+                        <div className="text-[13px] leading-relaxed text-text prose prose-sm max-w-none">
                           <ReactMarkdown
-                            components={{
-                              p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-                              ul: ({ children }) => <ul className="list-disc pl-4 mb-2 space-y-1">{children}</ul>,
-                              ol: ({ children }) => <ol className="list-decimal pl-4 mb-2 space-y-1">{children}</ol>,
-                              li: ({ children }) => <li className="text-[13px]">{children}</li>,
-                              strong: ({ children }) => <strong className="font-semibold text-[#e5c07b]">{children}</strong>,
-                              code: ({ children }) => <code className="bg-[#2d2d2d] px-1 py-0.5 rounded text-[#e06c75] text-[12px]">{children}</code>,
-                            }}
+                            remarkPlugins={[remarkGfm]}
+                            components={markdownComponents}
                           >
                             {summaryContent}
                           </ReactMarkdown>
@@ -2966,10 +4114,10 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                       )}
                       {/* 状态卡片 */}
                       {statusContent && (
-                        <div className="bg-[#252526] border border-[#2d2d2d] rounded-lg overflow-hidden">
-                          <div className="flex items-center gap-2 px-3 py-2 bg-[#1e3a29] border-b border-[#2d4a39]">
-                            <CheckCircle className="w-3.5 h-3.5 text-[#4ec9b0]" />
-                            <span className="text-[12px] font-medium text-[#4ec9b0]">
+                        <div className="bg-black/5 dark:bg-white/5 border border-border rounded-lg overflow-hidden">
+                          <div className="flex items-center gap-2 px-3 py-2 bg-success/10 border-b border-success/20">
+                            <CheckCircle className="w-3.5 h-3.5 text-success" />
+                            <span className="text-[12px] font-medium text-success">
                               {statusContent.includes('表格') ? '表格已创建' : statusContent.includes('创建') ? '文档已创建' : '文档已更新'}
                             </span>
                           </div>
@@ -2984,18 +4132,18 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                                   <button
                                     key={i}
                                     onClick={() => fileNamePart && openCreatedFile(fileNamePart)}
-                                    className="w-full flex items-center justify-between gap-2 py-1 hover:bg-[#2d2d2d] cursor-pointer rounded"
+                                    className="w-full flex items-center justify-between gap-2 py-1 hover:bg-black/10 dark:hover:bg-white/10 cursor-pointer rounded"
                                   >
                                     <div className="flex items-center gap-2 min-w-0">
                                       {emoji === '📊' ? (
-                                        <Table className="w-3.5 h-3.5 text-[#4ec9b0] flex-shrink-0" />
+                                        <Table className="w-3.5 h-3.5 text-success flex-shrink-0" />
                                       ) : (
-                                        <FileText className="w-3.5 h-3.5 text-[#75beff] flex-shrink-0" />
+                                        <FileText className="w-3.5 h-3.5 text-accent flex-shrink-0" />
                                       )}
-                                      <span className="text-[12px] text-[#cccccc] font-mono truncate">{fileNamePart}</span>
+                                      <span className="text-[12px] text-text font-mono truncate">{fileNamePart}</span>
                                     </div>
                                     {stats && (
-                                      <span className="text-[10px] font-mono text-[#4ec9b0]">{stats}</span>
+                                      <span className="text-[10px] font-mono text-text-muted">{stats}</span>
                                     )}
                                   </button>
                                 )
@@ -3008,30 +4156,30 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                     </>
                   )
                 })()}
-                <span className="text-[10px] text-[#5a5a5a] mt-1 block">
+                <span className="text-[10px] text-text-dim mt-1 block">
                   {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                 </span>
               </div>
-            ) : message.content.startsWith('✅') ? (
+            ) : displayContent.startsWith('✅') ? (
               /* 简单操作完成消息 - Cursor 风格卡片 */
               <div className="w-full">
-                <div className="bg-[#252526] border border-[#2d2d2d] rounded-lg overflow-hidden">
+                <div className="glass-card-soft rounded-2xl overflow-hidden border border-border">
                   {/* 成功标题栏 */}
-                  <div className="flex items-center gap-2 px-3 py-2 bg-[#1e3a29] border-b border-[#2d4a39]">
-                    <CheckCircle className="w-3.5 h-3.5 text-[#4ec9b0]" />
-                    <span className="text-[12px] font-medium text-[#4ec9b0]">
-                      {message.content.includes('表格') ? '表格已创建' : message.content.includes('创建') ? '文档已创建' : '文档已更新'}
+                  <div className="flex items-center gap-2 px-3 py-2 bg-white/5 border-b border-border">
+                    <CheckCircle className="w-3.5 h-3.5 text-success" />
+                    <span className="text-[12px] font-medium text-text">
+                      {displayContent.includes('表格') ? '表格已创建' : displayContent.includes('创建') ? '文档已创建' : '文档已更新'}
                     </span>
                   </div>
                   {/* 文件信息 */}
                   <div className="px-3 py-2">
-                    {message.content.split('\n').slice(1).map((line, i) => {
+                    {displayContent.split('\n').slice(1).map((line, i) => {
                       if (line.startsWith('📄') || line.startsWith('📊')) {
                         const emoji = line.startsWith('📊') ? '📊' : '📄'
                         const parts = line.replace(/^(📄|📊)\s*/, '').split(/\s+/)
                         const fileNamePart = parts[0]?.replace(/`/g, '')
                         const stats = parts.slice(1).join(' ')
-                        const isCreateMessage = message.content.includes('创建')
+                        const isCreateMessage = displayContent.includes('创建')
                         return (
                           <button
                             key={i}
@@ -3040,29 +4188,29 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                                 openCreatedFile(fileNamePart)
                               }
                             }}
-                            className={`w-full flex items-center justify-between gap-2 py-1 ${isCreateMessage ? 'hover:bg-[#2d2d2d] cursor-pointer rounded' : ''}`}
+                            className={`w-full flex items-center justify-between gap-2 py-1 ${isCreateMessage ? 'hover:bg-white/5 cursor-pointer rounded-lg' : ''}`}
                           >
                             <div className="flex items-center gap-2 min-w-0">
                               {emoji === '📊' ? (
-                                <Table className="w-3.5 h-3.5 text-[#4ec9b0] flex-shrink-0" />
+                                <Table className="w-3.5 h-3.5 text-success flex-shrink-0" />
                               ) : (
-                                <FileText className="w-3.5 h-3.5 text-[#75beff] flex-shrink-0" />
+                                <FileText className="w-3.5 h-3.5 text-accent flex-shrink-0" />
                               )}
-                              <span className="text-[12px] text-[#cccccc] font-mono truncate">{fileNamePart}</span>
+                              <span className="text-[12px] text-text font-mono truncate">{fileNamePart}</span>
                             </div>
                             <div className="flex items-center gap-1 flex-shrink-0">
                               {stats.includes('+') && (
-                                <span className="text-[10px] font-mono text-[#4ec9b0]">
+                                <span className="text-[10px] font-mono text-success">
                                   {stats.match(/\+\d+/)?.[0]}
                                 </span>
                               )}
                               {stats.includes('-') && (
-                                <span className="text-[10px] font-mono text-[#f14c4c]">
+                                <span className="text-[10px] font-mono text-rose-400">
                                   {stats.match(/-\d+/)?.[0]}
                                 </span>
                               )}
                               {stats.includes('~') && (
-                                <span className="text-[10px] font-mono text-[#cca700]">
+                                <span className="text-[10px] font-mono text-warning">
                                   {stats.match(/~\d+/)?.[0]}
                                 </span>
                               )}
@@ -3076,28 +4224,28 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                   
                   {/* Diff 详情 */}
                   {message.diffChanges && message.diffChanges.length > 0 && (
-                    <div className="border-t border-[#2d2d2d] px-3 py-2">
-                      <div className="text-[10px] text-[#858585] mb-2">修改详情</div>
+                    <div className="border-t border-border px-3 py-2">
+                      <div className="text-[10px] text-text-muted mb-2">修改详情</div>
                       <div className="space-y-1">
                         {message.diffChanges.slice(0, 5).map((diff, i) => (
                           <button
                             key={i}
                             onClick={() => scrollToChange(diff.replaceText)}
-                            className="w-full text-left px-2 py-1.5 rounded bg-[#1e1e1e] hover:bg-[#2d2d2d] transition-colors"
+                            className="w-full text-left px-2 py-1.5 rounded bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-colors border border-black/10 dark:border-white/10"
                           >
                             <div className="flex items-center gap-2 text-[11px]">
-                              <span className="text-[#f14c4c] line-through truncate flex-1" title={diff.searchText}>
+                              <span className="text-error line-through truncate flex-1" title={diff.searchText}>
                                 {diff.searchText.slice(0, 25)}{diff.searchText.length > 25 ? '...' : ''}
                               </span>
-                              <span className="text-[#5a5a5a]">→</span>
-                              <span className="text-[#4ec9b0] truncate flex-1" title={diff.replaceText}>
+                              <span className="text-text-dim">→</span>
+                              <span className="text-success truncate flex-1" title={diff.replaceText}>
                                 {diff.replaceText.slice(0, 25)}{diff.replaceText.length > 25 ? '...' : ''}
                               </span>
                             </div>
                           </button>
                         ))}
                         {message.diffChanges.length > 5 && (
-                          <div className="text-[10px] text-[#858585] text-center py-1">
+                          <div className="text-[10px] text-text-muted text-center py-1">
                             还有 {message.diffChanges.length - 5} 处修改...
                           </div>
                         )}
@@ -3105,30 +4253,35 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                     </div>
                   )}
                 </div>
-                <span className="text-[10px] text-[#5a5a5a] mt-1 block pl-1">
+                <span className="text-[10px] text-text-dim mt-1 block pl-1">
                   {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                 </span>
               </div>
             ) : (
               /* AI 普通消息 - 使用 Markdown 渲染 */
               <div className="w-full">
-                <div className="bg-[#252526] border border-[#2d2d2d] rounded-lg rounded-tl-sm px-3 py-2">
-                  <div className="ai-markdown text-[13px] text-[#d4d4d4] leading-relaxed">
+                <div className="glass-card-soft border border-border rounded-2xl rounded-tl-sm px-3 py-2">
+                  <div className="ai-markdown text-[13px] text-text leading-relaxed">
                     {(() => {
-                      const parsed = tryParsePptOutlineDraft(message.content)
-                      const cleanedText = parsed ? stripPptOutlineJsonFromText(message.content) : message.content
+                      const baseText = displayContent
+                      const parsed = tryParsePptOutlineDraft(baseText)
+                      const cleanedText = parsed ? stripPptOutlineJsonFromText(baseText) : baseText
                       const jsonOpen = !!outlineJsonOpen[message.id]
+                      const dslMatch = tryExtractDocDsl(cleanedText)
+                      const markdownText = dslMatch
+                        ? cleanedText.replace(dslMatch.sourceBlock, '').trim()
+                        : cleanedText
 
                       return (
                         <>
                           {parsed && (
-                            <div className="mb-3 bg-[#1e1e1e] border border-[#2d2d2d] rounded-lg overflow-hidden">
-                              <div className="flex items-center justify-between px-3 py-2 bg-[#252526] border-b border-[#2d2d2d]">
+                            <div className="mb-3 bg-black/5 dark:bg-white/5 border border-border rounded-lg overflow-hidden">
+                              <div className="flex items-center justify-between px-3 py-2 bg-black/5 dark:bg-white/5 border-b border-border">
                                 <div className="min-w-0">
-                                  <div className="text-[12px] text-[#cccccc] truncate">
+                                  <div className="text-[12px] text-text truncate">
                                     PPT 大纲：{parsed.draft.title || '未命名'}（{parsed.draft.slides.length} 页）
                                   </div>
-                                  <div className="text-[10px] text-[#858585] truncate">
+                                  <div className="text-[10px] text-text-muted truncate">
                                     {parsed.draft.theme ? `主题：${parsed.draft.theme}  ` : ''}{parsed.draft.styleHint ? `风格：${parsed.draft.styleHint}` : ''}
                                   </div>
                                 </div>
@@ -3136,7 +4289,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                                   onClick={() =>
                                     setOutlineJsonOpen((prev) => ({ ...prev, [message.id]: !prev[message.id] }))
                                   }
-                                  className="px-2 py-1 text-[10px] rounded bg-[#2d2d2d] hover:bg-[#3c3c3c] text-[#cccccc] transition-colors flex-shrink-0"
+                                  className="px-2 py-1 text-[10px] rounded bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 text-text-secondary transition-colors flex-shrink-0 border border-black/10 dark:border-white/10"
                                   title={jsonOpen ? '收起 JSON' : '展开 JSON'}
                                 >
                                   {jsonOpen ? '收起 JSON' : '展开 JSON'}
@@ -3145,18 +4298,18 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
 
                               <div className="px-3 py-2 space-y-2">
                                 {parsed.draft.slides.map((s, idx) => (
-                                  <div key={`${s.pageNumber}-${idx}`} className="border border-[#2d2d2d] rounded-md bg-[#252526]">
-                                    <div className="px-2.5 py-2 border-b border-[#2d2d2d] flex items-center justify-between gap-2">
+                                  <div key={`${s.pageNumber}-${idx}`} className="border border-border rounded-md bg-black/5 dark:bg-white/5">
+                                    <div className="px-2.5 py-2 border-b border-border flex items-center justify-between gap-2">
                                       <div className="min-w-0">
-                                        <div className="text-[12px] text-[#e1e1e1] truncate">
+                                        <div className="text-[12px] text-text truncate">
                                           第{s.pageNumber || idx + 1}页：{s.headline || '（未填写标题）'}
                                         </div>
                                         {s.subheadline && (
-                                          <div className="text-[10px] text-[#9cdcfe] truncate">{s.subheadline}</div>
+                                          <div className="text-[10px] text-text-secondary truncate">{s.subheadline}</div>
                                         )}
                                       </div>
                                       {s.layoutIntent && (
-                                        <div className="text-[10px] text-[#858585] flex-shrink-0 truncate max-w-[45%]" title={s.layoutIntent}>
+                                        <div className="text-[10px] text-text-muted flex-shrink-0 truncate max-w-[45%]" title={s.layoutIntent}>
                                           {s.layoutIntent}
                                         </div>
                                       )}
@@ -3166,15 +4319,15 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                                         {s.bullets?.length ? (
                                           <ul className="space-y-1">
                                             {s.bullets.slice(0, 8).map((b, bi) => (
-                                              <li key={bi} className="text-[12px] text-[#d4d4d4] leading-relaxed flex items-start gap-1.5">
-                                                <span className="text-[#858585] mt-0.5">•</span>
+                                              <li key={bi} className="text-[12px] text-text-secondary leading-relaxed flex items-start gap-1.5">
+                                                <span className="text-text-muted mt-0.5">•</span>
                                                 <span className="flex-1">{b}</span>
                                               </li>
                                             ))}
                                           </ul>
                                         ) : null}
                                         {s.footerNote && (
-                                          <div className="mt-2 text-[10px] text-[#858585] border-t border-[#2d2d2d] pt-2">
+                                          <div className="mt-2 text-[10px] text-text-muted border-t border-border pt-2">
                                             页脚：{s.footerNote}
                                           </div>
                                         )}
@@ -3184,7 +4337,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                                 ))}
 
                                 {jsonOpen && (
-                                  <pre className="mt-2 bg-[#0f0f10] border border-[#2d2d2d] rounded-md p-2 text-[11px] text-[#d4d4d4] overflow-x-auto">
+                                  <pre className="mt-2 bg-black/10 dark:bg-black/35 border border-border rounded-md p-2 text-[11px] text-text-secondary overflow-x-auto">
                                     {parsed.rawJson}
                                   </pre>
                                 )}
@@ -3192,46 +4345,36 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                             </div>
                           )}
 
-                          {cleanedText && (
-                    <ReactMarkdown
-                      components={{
-                        h1: ({children}) => <h1 className="text-[15px] font-semibold text-[#e1e1e1] mt-3 mb-2 pb-1 border-b border-[#3c3c3c]">{children}</h1>,
-                        h2: ({children}) => <h2 className="text-[14px] font-semibold text-[#e1e1e1] mt-3 mb-1.5 flex items-center gap-1.5">{children}</h2>,
-                        h3: ({children}) => <h3 className="text-[13px] font-medium text-[#cccccc] mt-2 mb-1">{children}</h3>,
-                        p: ({children}) => <p className="mb-2 last:mb-0">{children}</p>,
-                        ul: ({children}) => <ul className="list-none ml-0 mb-2 space-y-1">{children}</ul>,
-                        ol: ({children}) => <ol className="list-decimal ml-4 mb-2 space-y-1">{children}</ol>,
-                        li: ({children}) => <li className="text-[13px] leading-relaxed flex items-start gap-1.5"><span className="text-[#858585] mt-0.5">•</span><span className="flex-1">{children}</span></li>,
-                        strong: ({children}) => <strong className="font-semibold text-[#e1e1e1]">{children}</strong>,
-                        em: ({children}) => <em className="italic text-[#9cdcfe]">{children}</em>,
-                        code: ({children, className}) => {
-                          const isBlock = className?.includes('language-')
-                          if (isBlock) {
-                            return <code className="block bg-[#1e1e1e] text-[#ce9178] p-2 rounded text-[12px] font-mono overflow-x-auto my-2">{children}</code>
-                          }
-                          return <code className="bg-[#1e1e1e] text-[#ce9178] px-1 py-0.5 rounded text-[12px] font-mono">{children}</code>
-                        },
-                        pre: ({children}) => <pre className="bg-[#1e1e1e] rounded-md overflow-hidden my-2">{children}</pre>,
-                        a: ({href, children}) => <a href={href} className="text-[#75beff] hover:underline" target="_blank" rel="noopener noreferrer">{children}</a>,
-                        blockquote: ({children}) => <blockquote className="border-l-2 border-[#0e639c] pl-3 my-2 text-[#9a9a9a] italic">{children}</blockquote>,
-                        hr: () => <hr className="border-[#3c3c3c] my-3" />,
-                      }}
-                    >
-                              {cleanedText}
-                    </ReactMarkdown>
+                          {dslMatch && (
+                            <div className="dsl-preview mb-3">
+                              <div className="dsl-preview-header">结构化文档预览</div>
+                              <div
+                                className="dsl-preview-body"
+                                dangerouslySetInnerHTML={{ __html: dslToHtml(dslMatch.dsl) }}
+                              />
+                            </div>
+                          )}
+                          {markdownText && (
+                            <ReactMarkdown
+                              remarkPlugins={[remarkGfm]}
+                              components={markdownComponents}
+                            >
+                              {markdownText}
+                            </ReactMarkdown>
                           )}
                         </>
                       )
                     })()}
                   </div>
                 </div>
-                <span className="text-[10px] text-[#5a5a5a] mt-1 block pl-1">
+                <span className="text-[10px] text-text-dim mt-1 block pl-1">
                   {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                 </span>
               </div>
             )}
-          </motion.div>
-        ))}
+            </motion.div>
+          )
+        })}
         </AnimatePresence>
 
         {/* 流式输出 - 实时显示 AI 响应 (使用 Framer Motion) */}
@@ -3245,20 +4388,56 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               animate="visible"
               exit="exit"
             >
-              <div className="bg-[#252526] border border-[#2d2d2d] rounded-lg rounded-tl-sm px-3 py-2">
-                <motion.div className="streaming-container" layout>
-                  <CinematicTyper text={streamingContent} isStreaming={isLoading} />
-                </motion.div>
-              </div>
-              {/* 状态指示 */}
-              <div className="flex items-center gap-1.5 mt-1.5 pl-1">
-                <div className="flex gap-0.5">
-                  <span className="w-1 h-1 rounded-full bg-violet-400 animate-pulse" style={{ animationDelay: '0ms' }} />
-                  <span className="w-1 h-1 rounded-full bg-violet-400 animate-pulse" style={{ animationDelay: '150ms' }} />
-                  <span className="w-1 h-1 rounded-full bg-violet-400 animate-pulse" style={{ animationDelay: '300ms' }} />
+              {/* 思考过程展示区域 - 默认展开，用户可手动折叠 */}
+              <details className="thinking-section" open>
+                <summary className="thinking-summary">
+                  <span className="thinking-indicator">
+                    <span className="thinking-pulse"></span>
+                  </span>
+                  <span>正在思考</span>
+                  <svg className="thinking-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M9 18l6-6-6-6" />
+                  </svg>
+                </summary>
+                <div className="thinking-body">
+                  {streamingReasoning ? (
+                    <CinematicTyper text={streamingReasoning} isStreaming={isLoading} baseSpeed={2} maxSpeed={8} />
+                  ) : (
+                    <span className="text-text-dim text-sm">正在思考中...</span>
+                  )}
                 </div>
-                <span className="text-[10px] text-[#5a5a5a]">AI 正在生成...</span>
-              </div>
+              </details>
+              
+              {editPhase === 'editing' && (
+                <div className="glass-card-soft rounded-2xl rounded-tl-sm px-4 py-3 border border-border">
+                  <div className="flex items-center gap-2">
+                    <span className="thinking-indicator">
+                      <span className="thinking-pulse"></span>
+                    </span>
+                    <span className="text-[13px] text-text">正在创作文档</span>
+                    <span className="ml-auto text-[11px] text-text-dim">AI 正在更改文档内容...</span>
+                  </div>
+                </div>
+              )}
+
+              {editPhase === 'done' && streamingSummary && (
+                <div className="glass-card-soft rounded-2xl rounded-tl-sm px-4 py-3 border border-border">
+                  <div className="flex items-center gap-2 text-success">
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span className="text-[13px]">创作已完成</span>
+                  </div>
+                  <div className="mt-2 text-[12px] text-text-secondary whitespace-pre-wrap">{streamingSummary}</div>
+                </div>
+              )}
+
+              {/* 正式回复内容 */}
+              {editPhase === 'idle' && streamingContent && (
+                <div className="glass-card-soft rounded-2xl rounded-tl-sm px-4 py-3">
+                  <div className="streaming-container">
+                    <div className="cinematic-typer">{streamingContent}</div>
+                  </div>
+                </div>
+              )}
             </motion.div>
           )}
         </AnimatePresence>
@@ -3274,34 +4453,34 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               animate="visible"
               exit="exit"
             >
-              <div className="bg-[#252526] border border-[#2d2d2d] rounded-lg px-3 py-2">
+              <div className="glass-card-soft border border-border rounded-xl px-3 py-2">
                 <div className="flex items-center gap-2">
-                  <Loader2 className="w-3.5 h-3.5 text-violet-400 animate-spin flex-shrink-0" />
-                  <span className="text-[12px] text-[#cccccc] flex-1 truncate">
+                  <Loader2 className="w-3.5 h-3.5 text-accent animate-spin flex-shrink-0" />
+                  <span className="text-[12px] text-text flex-1 truncate">
                     {agentProgress.currentAction}
                   </span>
                   {agentProgress.thinkingTime > 0 && (
-                    <span className="text-[10px] text-[#858585] flex-shrink-0">
+                    <span className="text-[10px] text-text-muted flex-shrink-0">
                       {agentProgress.thinkingTime}s
                     </span>
                   )}
                 </div>
                 {toolActivity.length > 0 && (
-                  <div className="mt-2 border-t border-[#2d2d2d] pt-2">
-                    <div className="text-[10px] text-[#5a5a5a] uppercase tracking-wider mb-1">工具调用</div>
+                  <div className="mt-2 border-t border-border pt-2">
+                    <div className="text-[10px] text-text-dim uppercase tracking-wider mb-1">工具调用</div>
                     <div className="space-y-1">
                       {toolActivity.slice(-4).map(activity => (
-                        <div key={activity.id} className="flex items-center gap-1.5 text-[11px] text-[#cccccc]">
+                        <div key={activity.id} className="flex items-center gap-1.5 text-[11px] text-text-secondary">
                           {activity.status === 'running' ? (
-                            <Loader2 className="w-3 h-3 text-violet-400 animate-spin flex-shrink-0" />
+                            <Loader2 className="w-3 h-3 text-accent animate-spin flex-shrink-0" />
                           ) : activity.status === 'success' ? (
-                            <CheckCircle2 className="w-3 h-3 text-[#4ec9b0] flex-shrink-0" />
+                            <CheckCircle2 className="w-3 h-3 text-success flex-shrink-0" />
                           ) : (
-                            <X className="w-3 h-3 text-[#f14c4c] flex-shrink-0" />
+                            <X className="w-3 h-3 text-error flex-shrink-0" />
                           )}
                           <span className="truncate flex-1">{activity.label}</span>
                           {activity.detail && (
-                            <span className="text-[10px] text-[#858585] flex-shrink-0">{activity.detail}</span>
+                            <span className="text-[10px] text-text-muted flex-shrink-0">{activity.detail}</span>
                           )}
                         </div>
                       ))}
@@ -3317,13 +4496,13 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
       </div>
 
       {/* 上下文文件显示 - Cursor 风格 */}
-      <div className="px-3 py-2 border-t border-[#2d2d2d] bg-[#252526]">
+      <div className="px-3 py-2 border-t border-border bg-black/5 dark:bg-white/5">
         <div className="flex items-center gap-1.5 flex-wrap">
-          <span className="text-[10px] text-[#858585]">上下文:</span>
+          <span className="text-[10px] text-text-muted">上下文:</span>
           
           {/* 当前编辑的文档 */}
           {currentFile && (
-            <div className="flex items-center gap-1 px-1.5 py-0.5 bg-[#1e3a29] text-[#4ec9b0] text-[10px] rounded">
+            <div className="flex items-center gap-1 px-1.5 py-0.5 bg-success/10 text-success text-[10px] rounded border border-success/20">
               <FileText className="w-2.5 h-2.5" />
               <span className="max-w-[80px] truncate">{currentFile.name}</span>
             </div>
@@ -3333,93 +4512,29 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
           {attachedFiles.map((file) => (
             <div 
               key={file.path}
-              className="flex items-center gap-1 px-1.5 py-0.5 bg-[#0e639c]/30 text-[#75beff] text-[10px] rounded"
+              className="flex items-center gap-1 px-1.5 py-0.5 bg-accent/10 text-accent text-[10px] rounded border border-accent/20"
             >
               <FileText className="w-2.5 h-2.5" />
               <span className="max-w-[60px] truncate">{file.name}</span>
-              <button onClick={() => removeAttachedFile(file.path)} className="hover:bg-[#0e639c]/50 rounded p-0.5 -mr-0.5">
+              <button onClick={() => removeAttachedFile(file.path)} className="hover:bg-accent/15 rounded p-0.5 -mr-0.5">
                 <X className="w-2.5 h-2.5" />
               </button>
             </div>
           ))}
           
           {!currentFile && attachedFiles.length === 0 && (
-            <span className="text-[10px] text-[#5a5a5a]">拖拽文件添加上下文</span>
+            <span className="text-[10px] text-text-dim">拖拽文件添加上下文</span>
           )}
         </div>
       </div>
 
-      {/* AI 处理中状态指示器 - Cursor 风格 */}
-      {isLoading && (
-        <div className="px-3 py-2 border-t border-[#2d2d2d] bg-[#1e1e1e]">
-          <div className="flex items-center gap-2">
-            <div className="relative w-5 h-5">
-              <div className="absolute inset-0 rounded-full border border-violet-500/30"></div>
-              <div className="absolute inset-0 rounded-full border border-transparent border-t-violet-500 animate-spin"></div>
-            </div>
-            <div className="flex-1 min-w-0">
-              <span className="text-[12px] text-[#cccccc]">
-                {agentProgress.currentAction || '正在处理...'}
-              </span>
-            </div>
-            {agentProgress.thinkingTime > 0 && (
-              <span className="text-[10px] text-[#858585] flex-shrink-0">
-                {agentProgress.thinkingTime}s
-              </span>
-            )}
-          </div>
-          
-          {/* 进度步骤 - 更紧凑 */}
-          {agentProgress.steps.length > 0 && (
-            <div className="mt-2 pl-7 space-y-0.5">
-              {agentProgress.steps.map((step) => (
-                <div key={step.id} className="flex items-center gap-1.5">
-                  {step.status === 'completed' ? (
-                    <CheckCircle2 className="w-3 h-3 text-[#4ec9b0]" />
-                  ) : step.status === 'running' ? (
-                    <Loader2 className="w-3 h-3 text-violet-400 animate-spin" />
-                  ) : (
-                    <Circle className="w-3 h-3 text-[#5a5a5a]" />
-                  )}
-                  <span className={`text-[11px] ${
-                    step.status === 'completed' ? 'text-[#858585]' :
-                    step.status === 'running' ? 'text-[#cccccc]' : 'text-[#5a5a5a]'
-                  }`}>
-                    {step.description}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-          
-          {toolActivity.length > 0 && (
-            <div className="mt-2 pl-7 space-y-0.5">
-              <div className="text-[10px] text-[#5a5a5a] uppercase tracking-wider">工具调用</div>
-              {toolActivity.slice(-4).map(activity => (
-                <div key={activity.id} className="flex items-center gap-1.5 text-[11px] text-[#cccccc]">
-                  {activity.status === 'running' ? (
-                    <Loader2 className="w-3 h-3 text-violet-400 animate-spin" />
-                  ) : activity.status === 'success' ? (
-                    <CheckCircle2 className="w-3 h-3 text-[#4ec9b0]" />
-                  ) : (
-                    <X className="w-3 h-3 text-[#f14c4c]" />
-                  )}
-                  <span className="truncate flex-1">{activity.label}</span>
-                  {activity.detail && (
-                    <span className="text-[10px] text-[#858585]">{activity.detail}</span>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
       {/* 快捷命令提示 - Cursor 风格 */}
       {input.startsWith('/') && !isLoading && (
-        <div className="px-3 py-2 border-t border-[#2d2d2d] bg-[#252526]">
+        <div className="px-3 py-2 border-t border-border bg-black/5 dark:bg-white/5">
           <div className="space-y-0.5">
             {[
+              { cmd: '/审查', desc: '审查文档，找出问题并建议修改' },
+              { cmd: '/校对', desc: '检查语法、用词、逻辑问题' },
               { cmd: '/润色', desc: '优化文字表达' },
               { cmd: '/精简', desc: '删除冗余内容' },
               { cmd: '/翻译', desc: '翻译成英文/中文' },
@@ -3432,10 +4547,10 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               <button
                 key={item.cmd}
                 onClick={() => setInput(item.cmd + ' ')}
-                className="w-full flex items-center justify-between px-2 py-1.5 hover:bg-[#2d2d2d] rounded text-left"
+                className="w-full flex items-center justify-between px-2 py-1.5 hover:bg-black/10 dark:hover:bg-white/10 rounded text-left"
               >
-                <span className="text-[12px] text-violet-400">{item.cmd}</span>
-                <span className="text-[10px] text-[#858585]">{item.desc}</span>
+                <span className="text-[12px] text-accent">{item.cmd}</span>
+                <span className="text-[10px] text-text-muted">{item.desc}</span>
               </button>
             ))}
           </div>
@@ -3444,13 +4559,13 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
 
       {/* Word 格式操作确认条（dryRun → apply） */}
       {pendingWordOps && !isLoading && (
-        <div className="px-3 py-2 border-t border-[#2d2d2d] bg-[#252526]">
+        <div className="px-3 py-2 border-t border-border bg-black/5 dark:bg-white/5">
           <div className="flex items-center gap-2">
             <div className="flex-1 min-w-0">
-              <div className="text-[12px] text-[#cccccc] truncate">
+              <div className="text-[12px] text-text truncate">
                 {pendingWordOps.previewMessage || '已生成格式修改预览'}
               </div>
-              <div className="text-[10px] text-[#858585] truncate">
+              <div className="text-[10px] text-text-muted truncate">
                 {pendingWordOps.previewLines?.length
                   ? pendingWordOps.previewLines.join(' · ')
                   : '点击应用后将以“修订”方式写入，可逐条接受/拒绝'}
@@ -3462,6 +4577,14 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                 if (!pendingWordOps) return
                 setWordOpsApplying(true)
                 try {
+                  const prep = await prepareTemplateFillOutput(pendingWordOps.ops as any)
+                  if (!prep.success) {
+                    addMessage({
+                      role: 'assistant',
+                      content: `应用失败：${prep.message || '模板填充准备失败'}`,
+                    })
+                    return
+                  }
                   const result = applyWordOps(pendingWordOps.ops as any)
                   setPendingWordOps(null)
                   addMessage({
@@ -3474,7 +4597,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                   setWordOpsApplying(false)
                 }
               }}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-gradient-to-b from-[#0e639c]/35 to-[#0e639c]/20 border border-[#0e639c]/35 hover:from-[#0e639c]/45 hover:to-[#0e639c]/25 text-[#e6f1ff] text-[11px] rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-accent/12 border border-accent/25 hover:bg-accent/18 text-accent text-[11px] rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               title="应用修订"
             >
               <CheckCircle2 className="w-3.5 h-3.5" />
@@ -3483,7 +4606,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             <button
               disabled={wordOpsApplying}
               onClick={() => setPendingWordOps(null)}
-              className="p-1.5 rounded-md text-[#858585] hover:text-[#cccccc] hover:bg-[#2d2d2d] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="p-1.5 rounded-md text-text-muted hover:text-text hover:bg-black/10 dark:hover:bg-white/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               title="取消"
             >
               <X className="w-4 h-4" />
@@ -3494,13 +4617,13 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
 
       {/* PPT 大纲确认条（阶段1 → 阶段2） */}
       {pendingPptOutline && !pptGenerating && (
-        <div className="px-3 py-2 border-t border-[#2d2d2d] bg-[#252526]">
+        <div className="px-3 py-2 border-t border-border bg-black/5 dark:bg-white/5">
           <div className="flex items-center gap-2">
             <div className="flex-1 min-w-0">
-              <div className="text-[12px] text-[#cccccc] truncate">
+              <div className="text-[12px] text-text truncate">
                 已检测到 PPT 大纲：{pendingPptOutline.draft.title || '未命名'}（{pendingPptOutline.draft.slides?.length || 0} 页）
               </div>
-              <div className="text-[10px] text-[#858585] truncate">
+              <div className="text-[10px] text-text-muted truncate">
                 点击确认后将直接开始生成（Gemini 设计视觉 → DashScope 生图 → 导出 PPTX）
               </div>
             </div>
@@ -3511,7 +4634,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                 setPendingPptOutline(null)
                 executePptCreate(draft, rawJson)
               }}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-gradient-to-b from-[#0e639c]/35 to-[#0e639c]/20 border border-[#0e639c]/35 hover:from-[#0e639c]/45 hover:to-[#0e639c]/25 text-[#e6f1ff] text-[11px] rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-accent/12 border border-accent/25 hover:bg-accent/18 text-accent text-[11px] rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               title="确认大纲并开始生成 PPT"
             >
               <CheckCircle2 className="w-3.5 h-3.5" />
@@ -3520,7 +4643,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             <button
               disabled={isLoading || pptGenerating}
               onClick={() => setPendingPptOutline(null)}
-              className="p-1.5 rounded-md text-[#858585] hover:text-[#cccccc] hover:bg-[#2d2d2d] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="p-1.5 rounded-md text-text-muted hover:text-text hover:bg-black/10 dark:hover:bg-white/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               title="关闭提示"
             >
               <X className="w-4 h-4" />
@@ -3531,18 +4654,18 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
 
       {/* PPT 编辑反馈输入区域 */}
       {pptEditPending && !pptGenerating && (
-        <div className="px-3 py-2 border-t border-[#2d2d2d] bg-[#252526]">
+        <div className="px-3 py-2 border-t border-border bg-black/5 dark:bg-white/5">
           <div className="flex flex-col gap-2">
             <div className="flex items-center gap-2">
               <div className="flex-1 min-w-0">
-                <div className="text-[12px] text-[#cccccc]">
+                <div className="text-[12px] text-text">
                   {pptEditPending.mode === 'regenerate' ? '🔄 整页重做' : '🎨 局部编辑'}：
                   {pptEditPending.pageNumbers.length === 1 
                     ? `第 ${pptEditPending.pageNumbers[0]} 页`
                     : `${pptEditPending.pageNumbers.length} 页（${pptEditPending.pageNumbers.join(', ')}）`
                   }
                 </div>
-                <div className="text-[10px] text-[#858585]">
+                <div className="text-[10px] text-text-muted">
                   {pptEditPending.mode === 'regenerate' 
                     ? '请描述你对这些页面不满意的地方，AI 将根据反馈重新生成'
                     : '请描述你想要修改的部分（如：换背景颜色、改文字大小等）'
@@ -3554,7 +4677,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                   setPptEditPending(null)
                   setPptEditFeedback('')
                 }}
-                className="p-1.5 rounded-md text-[#858585] hover:text-[#cccccc] hover:bg-[#2d2d2d] transition-colors"
+                className="p-1.5 rounded-md text-text-muted hover:text-text hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
                 title="取消"
               >
                 <X className="w-4 h-4" />
@@ -3575,7 +4698,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                   }
                 }}
                 placeholder={pptEditPending.mode === 'regenerate' ? '例如：背景太暗，配色不协调，标题太小...' : '例如：背景换成蓝色渐变，标题放大一点...'}
-                className="flex-1 bg-[#2d2d2d] border border-[#3c3c3c] rounded-md px-3 py-1.5 text-[12px] text-[#d4d4d4] placeholder-[#5a5a5a] focus:outline-none focus:border-[#0e639c]"
+                className="flex-1 glass-input rounded-xl px-3 py-1.5 text-[12px] text-text placeholder-text-dim focus:outline-none focus:border-accent/40 focus:ring-2 focus:ring-accent/10"
                 autoFocus
               />
               <button
@@ -3586,7 +4709,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                   executePptEdit(pptxPath, pageNumbers, mode, pptEditFeedback.trim())
                   setPptEditFeedback('')
                 }}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-b from-[#0e639c]/35 to-[#0e639c]/20 border border-[#0e639c]/35 hover:from-[#0e639c]/45 hover:to-[#0e639c]/25 text-[#e6f1ff] text-[11px] rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-accent/12 border border-accent/25 hover:bg-accent/18 text-accent text-[11px] rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Send className="w-3.5 h-3.5" />
                 开始{pptEditPending.mode === 'regenerate' ? '重做' : '编辑'}
@@ -3596,10 +4719,10 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
         </div>
       )}
 
-      {/* 输入区域 - Cursor 风格 + PPT 拖拽支持 */}
+      {/* 输入区域 - 柔和玻璃态风格 */}
       <div 
-        className={`p-3 bg-[#1e1e1e] border-t transition-colors ${
-          isPptDragOver ? 'border-[#0e639c] bg-[#0e639c]/10' : 'border-[#2d2d2d]'
+        className={`p-4 border-t transition-colors ${
+          isPptDragOver ? 'border-accent/50 bg-accent/5' : 'border-border'
         }`}
         onDragEnter={(e) => {
           if (!e.dataTransfer.types.includes('application/ppt-page')) return
@@ -3651,32 +4774,32 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
       >
         {/* PPT 编辑上下文预览 */}
         {pptEditContext && (
-          <div className="mb-2 p-2 bg-[#2d2d2d] rounded-lg border border-[#3c3c3c] flex items-start gap-3">
+          <div className="mb-2 p-2 bg-black/5 dark:bg-white/5 rounded-xl border border-border flex items-start gap-3">
             <div className="relative flex-shrink-0">
               <img
                 src={`data:image/png;base64,${pptEditContext.imageBase64}`}
                 alt={`第 ${pptEditContext.pageNumber} 页${pptEditContext.isRegion ? '（框选区域）' : ''}`}
-                className="w-[100px] h-[62px] object-contain rounded border border-[#4a4a4a] bg-black"
+                className="w-[100px] h-[62px] object-contain rounded-lg border border-border bg-black/20"
               />
-              <div className="absolute -top-1 -left-1 bg-[#0e639c] text-[9px] text-white px-1.5 py-0.5 rounded">
+              <div className="absolute -top-1 -left-1 bg-accent text-[9px] text-white px-1.5 py-0.5 rounded-md shadow-sm shadow-accent/20">
                 {pptEditContext.isRegion ? '框选' : `第 ${pptEditContext.pageNumber} 页`}
               </div>
             </div>
             <div className="flex-1 min-w-0">
-              <div className="text-[11px] text-[#cccccc] mb-1">
+              <div className="text-[11px] text-text mb-1">
                 {pptEditContext.isRegion ? (
-                  <>已框选第 <span className="text-[#0e639c] font-medium">{pptEditContext.pageNumber}</span> 页的区域</>
+                  <>已框选第 <span className="text-accent font-medium">{pptEditContext.pageNumber}</span> 页的区域</>
                 ) : (
-                  <>已选择第 <span className="text-[#0e639c] font-medium">{pptEditContext.pageNumber}</span> 页</>
+                  <>已选择第 <span className="text-accent font-medium">{pptEditContext.pageNumber}</span> 页</>
                 )}
               </div>
-              <div className="text-[10px] text-[#888]">
+              <div className="text-[10px] text-text-muted">
                 输入修改要求，AI 将自动判断是整页重做还是局部调整
               </div>
             </div>
             <button
               onClick={() => setPptEditContext(null)}
-              className="p-1 text-[#888] hover:text-white hover:bg-[#3c3c3c] rounded transition-colors"
+              className="p-1 text-text-muted hover:text-text hover:bg-black/10 dark:hover:bg-white/10 rounded-lg transition-colors"
               title="移除"
             >
               <X className="w-3.5 h-3.5" />
@@ -3686,8 +4809,8 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
         
         {/* 拖拽提示 */}
         {isPptDragOver && (
-          <div className="mb-2 p-3 border-2 border-dashed border-[#0e639c] rounded-lg bg-[#0e639c]/10 text-center">
-            <div className="text-[12px] text-[#0e639c]">松开鼠标，将 PPT 页面添加到对话</div>
+          <div className="mb-2 p-3 border-2 border-dashed border-accent/50 rounded-xl bg-accent/6 text-center">
+            <div className="text-[12px] text-accent">松开鼠标，将 PPT 页面添加到对话</div>
           </div>
         )}
         
@@ -3702,10 +4825,10 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                 ? `描述如何修改第 ${pptEditContext.pageNumber} 页...` 
                 : isLoading 
                   ? "AI 正在处理中..." 
-                  : "输入消息或 / 查看命令..."
+                  : "输入问题或 / 查看命令..."
             }
-            className={`w-full bg-[#2d2d2d] border rounded-lg pl-3 pr-10 py-2.5 text-[13px] text-[#d4d4d4] placeholder-[#5a5a5a] focus:outline-none transition-colors resize-none scrollbar-none ${
-              isLoading ? 'border-violet-500/30' : pptEditContext ? 'border-[#0e639c]/50 focus:border-[#0e639c]' : 'border-[#3c3c3c] focus:border-[#0e639c]'
+            className={`w-full glass-input rounded-2xl pl-4 pr-12 py-3 text-[13px] text-text placeholder-text-dim focus:outline-none transition-all resize-none scrollbar-none ${
+              isLoading ? 'border-accent/20' : pptEditContext ? 'border-accent/35 focus:border-accent/50' : ''
             }`}
             rows={2}
             disabled={isLoading}
@@ -3713,10 +4836,10 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
           <button
             onClick={handleSend}
             disabled={isLoading || !input.trim()}
-            className={`absolute right-2 bottom-2 p-1.5 rounded-md transition-colors disabled:cursor-not-allowed ${
+            className={`absolute right-3 bottom-3 p-2 rounded-xl transition-all disabled:cursor-not-allowed ${
               isLoading 
-                ? 'text-violet-400' 
-                : 'text-[#858585] hover:text-[#cccccc] hover:bg-[#3c3c3c] disabled:opacity-30'
+                ? 'text-accent bg-accent/10' 
+                : 'text-text-muted hover:text-text hover:bg-black/10 dark:hover:bg-white/10 disabled:opacity-30'
             }`}
           >
             {isLoading ? (
@@ -3727,13 +4850,11 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
           </button>
         </div>
         
-        <p className="text-[10px] text-[#5a5a5a] text-center mt-1.5">
-          {isLoading ? (
-            <span className="text-violet-400">处理中...</span>
-          ) : pptEditContext ? (
-            <span className="text-[#0e639c]">输入修改要求后按 Enter 发送</span>
+        <p className="text-[10px] text-text-dim text-center mt-2">
+          {pptEditContext ? (
+            <span className="text-accent">输入修改要求后按 Enter 发送</span>
           ) : (
-            <>按 <kbd className="px-1 py-0.5 bg-[#2d2d2d] rounded text-[9px]">Enter</kbd> 发送 · <span className="text-violet-400">/</span> 快捷命令 · 拖拽 PPT 页面到此处编辑</>
+            <>AI can make mistakes. Review generated code.</>
           )}
         </p>
       </div>

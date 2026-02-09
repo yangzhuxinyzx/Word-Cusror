@@ -111,7 +111,7 @@ const CinematicBlockReveal: React.FC<CinematicBlockRevealProps> = ({
           className="mb-3 last:mb-0"
         >
           <div
-            className="leading-[1.7] text-zinc-800 prose prose-slate max-w-none"
+            className="leading-[1.7] text-text-secondary prose prose-sm max-w-none"
             dangerouslySetInnerHTML={{ __html: block }}
           />
         </motion.div>

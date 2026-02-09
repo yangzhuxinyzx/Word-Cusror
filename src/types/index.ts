@@ -79,6 +79,8 @@ export interface FileItem {
   name: string
   path: string
   type: 'file' | 'folder'
+  relativePath?: string
+  extension?: string
   children?: FileItem[]
   content?: string
 }
@@ -117,6 +119,7 @@ export interface ChatMessage {
   operationType?: 'create' | 'edit' | 'analyze' | 'chat'
   diffChanges?: DiffChange[]  // 修改记录，用于显示 Diff 和跳转
   fileName?: string           // 相关文件名
+  reasoning?: string          // AI 思考过程（kimi-k2.5 等思考模型）
   // Agent 进度信息（用于在聊天中显示进度）
   agentStatus?: {
     isActive: boolean
@@ -150,6 +153,13 @@ export interface AISettings {
   pptImageModel?: 'z-image-turbo' | 'qwen-image-plus' | 'gemini-image'
   // Brave Search API Key（用于联网搜索）
   braveApiKey?: string
+  // 记忆系统
+  memoryEnabled?: boolean
+  memoryTopK?: number
+  memoryMaxChars?: number
+  memoryTextWeight?: number
+  memoryVectorWeight?: number
+  memoryFlushThresholdChars?: number
 }
 
 export interface EditorCommand {

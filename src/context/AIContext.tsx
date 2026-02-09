@@ -1,5 +1,8 @@
 import { createContext, useContext, useState, useCallback, ReactNode, useRef, useEffect } from 'react'
 import { ChatMessage, AISettings } from '../types'
+import { DOC_EDIT_START, DOC_EDIT_END, DOC_SUMMARY_START, DOC_SUMMARY_END } from '../utils/aiMarkers'
+import { memoryAppend, memoryAppendSession, memorySearch } from '../memory/manager'
+import { formatMemoryResults } from '../memory/hybrid'
 
 // 工具调用结果类型
 export interface ToolResult {
@@ -23,6 +26,9 @@ interface AIContextType {
   messages: ChatMessage[]
   isLoading: boolean
   streamingContent: string
+  streamingReasoning: string  // AI 思考过程（kimi-k2.5 等思考模型）
+  editPhase: 'idle' | 'editing' | 'done'
+  streamingSummary: string
   settings: AISettings
   isCompleting: boolean  // 是否正在补全
   addMessage: (message: Omit<ChatMessage, 'id' | 'timestamp'>) => void
@@ -35,7 +41,8 @@ interface AIContextType {
     content: string, 
     documentContext?: string, 
     filesContext?: string,
-    callbacks?: AgentCallbacks
+    callbacks?: AgentCallbacks,
+    memoryContext?: { workspaceKey?: string; workspaceSummary?: string }
   ) => Promise<void>
   // Tab 补全功能 - 使用本地模型
   getCompletion: (
@@ -47,13 +54,20 @@ interface AIContextType {
 }
 
 const defaultSettings: AISettings = {
-  apiKey: 'sk-0nVwsLWNu2sndSqVxN1MlK5Mb0vQwZaagfAapPsE5UqcMSUW',
-  model: 'gemini-3-flash-preview',
+  apiKey: '',
+  model: 'kimi-k2.5',
   baseUrl: 'https://api.linapi.net/v1',
-  temperature: 0.7,
+  temperature: 1,  // kimi-k2.5 模型只支持 temperature=1
   maxTokens: 4096,
   // PPT 图像生成模型（默认使用 Gemini 生图）
   pptImageModel: 'gemini-image',
+  // 记忆系统默认配置
+  memoryEnabled: true,
+  memoryTopK: 5,
+  memoryMaxChars: 2000,
+  memoryTextWeight: 0.6,
+  memoryVectorWeight: 0.4,
+  memoryFlushThresholdChars: 12000,
   // 本地模型配置 - 用于快速 Tab 补全
   localModel: {
     enabled: true,
@@ -63,21 +77,37 @@ const defaultSettings: AISettings = {
   }
 }
 
-// 从 localStorage 加载设置
+/**
+ * 合并设置：将来源 overlay 到 base 上（仅非空值覆盖）
+ * 用于 .env > localStorage > defaultSettings 的多层合并
+ */
+function mergeSettings(base: AISettings, overlay: Partial<AISettings>): AISettings {
+  const result = { ...base }
+  for (const [key, value] of Object.entries(overlay)) {
+    if (key === 'localModel' && value && typeof value === 'object') {
+      result.localModel = {
+        ...base.localModel,
+        ...(value as Partial<NonNullable<AISettings['localModel']>>),
+      }
+    } else if (value !== undefined && value !== null && value !== '') {
+      ;(result as any)[key] = value
+    }
+  }
+  return result
+}
+
+// 从 localStorage 加载设置（同步，用于初始渲染）
 function loadSettingsFromStorage(): AISettings {
   try {
     const saved = localStorage.getItem('word-cursor-settings')
     if (saved) {
       const parsed = JSON.parse(saved)
-      // 合并默认设置和已保存的设置，确保新增的字段有默认值
-      return {
-        ...defaultSettings,
-        ...parsed,
-        localModel: {
-          ...defaultSettings.localModel,
-          ...parsed.localModel,
-        },
+      // 设置迁移：如果是旧模型，更新为新默认值
+      if (parsed.model === 'GLM-4.7' || parsed.model === 'GLM-4') {
+        parsed.model = 'kimi-k2.5'
+        parsed.temperature = 1
       }
+      return mergeSettings(defaultSettings, parsed)
     }
   } catch (e) {
     console.warn('Failed to load settings from localStorage:', e)
@@ -86,6 +116,78 @@ function loadSettingsFromStorage(): AISettings {
 }
 
 const AIContext = createContext<AIContextType | undefined>(undefined)
+
+// 从内容中提取思考内容（<think> 标签）
+function extractThinking(content: string): { thinking: string; cleaned: string } {
+  const thinkMatch = content.match(/<think>([\s\S]*?)<\/think>/g)
+  let thinking = ''
+  if (thinkMatch) {
+    thinking = thinkMatch.map(m => m.replace(/<\/?think>/g, '')).join('\n')
+  }
+  const cleaned = content.replace(/<think>[\s\S]*?<\/think>/g, '')
+  return { thinking, cleaned }
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+const EDIT_START_REGEX = new RegExp(escapeRegExp(DOC_EDIT_START), 'g')
+const EDIT_END_REGEX = new RegExp(escapeRegExp(DOC_EDIT_END), 'g')
+const SUMMARY_BLOCK_REGEX = new RegExp(
+  `${escapeRegExp(DOC_SUMMARY_START)}[\\s\\S]*?(?:${escapeRegExp(DOC_SUMMARY_END)})?`,
+  'g'
+)
+
+function stripToolBlocks(content: string): string {
+  let cleaned = content
+  cleaned = cleaned.replace(/\[TOOL_CALL\][\s\S]*?\[\/TOOL_CALL\]/g, '')
+  cleaned = cleaned.replace(/\[TOOL_RESULT\][\s\S]*?\[\/TOOL_RESULT\]/g, '')
+  return cleaned
+}
+
+function extractSummaryBlock(content: string): string {
+  const startIndex = content.indexOf(DOC_SUMMARY_START)
+  if (startIndex === -1) return ''
+  const start = startIndex + DOC_SUMMARY_START.length
+  const endIndex = content.indexOf(DOC_SUMMARY_END, start)
+  const summary = endIndex === -1 ? content.slice(start) : content.slice(start, endIndex)
+  return summary.trim()
+}
+
+function parseAssistantOutput(content: string): { displayText: string; summary: string; phase: 'idle' | 'editing' | 'done' } {
+  let phase: 'idle' | 'editing' | 'done' = 'idle'
+  if (content.includes(DOC_EDIT_START)) phase = 'editing'
+  if (content.includes(DOC_EDIT_END)) phase = 'done'
+
+  const summary = extractSummaryBlock(content)
+  let displayText = content
+  displayText = displayText.replace(SUMMARY_BLOCK_REGEX, '')
+  displayText = displayText.replace(EDIT_START_REGEX, '').replace(EDIT_END_REGEX, '')
+  displayText = stripToolBlocks(displayText)
+  displayText = displayText.replace(/\n{3,}/g, '\n\n').trim()
+  return { displayText, summary, phase }
+}
+
+function extractStreamText(value: unknown): string {
+  if (!value) return ''
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) {
+    return value.map(part => {
+      if (!part) return ''
+      if (typeof part === 'string') return part
+      if (typeof (part as { text?: unknown }).text === 'string') return (part as { text: string }).text
+      if (typeof (part as { content?: unknown }).content === 'string') return (part as { content: string }).content
+      return ''
+    }).join('')
+  }
+  if (typeof value === 'object') {
+    const obj = value as { text?: unknown; content?: unknown }
+    if (typeof obj.text === 'string') return obj.text
+    if (typeof obj.content === 'string') return obj.content
+  }
+  return ''
+}
 
 // 清理模型返回的特殊标签
 function cleanModelOutput(content: string): string {
@@ -107,6 +209,31 @@ function cleanMessageForSend(content: string): string {
   return cleaned.trim()
 }
 
+function truncateTextForMemory(text: string, maxLen: number): string {
+  const normalized = (text || '').replace(/\s+/g, ' ').trim()
+  if (normalized.length <= maxLen) return normalized
+  return normalized.slice(0, maxLen) + '...'
+}
+
+function buildMemoryFlushText(
+  recentMessages: Array<{ role: string; content: string }>,
+  currentUserContent: string,
+  maxChars = 1500
+): string {
+  const lines: string[] = []
+  const tail = recentMessages.slice(-6)
+  tail.forEach((msg) => {
+    const label = msg.role === 'user' ? '用户' : msg.role === 'assistant' ? '助手' : msg.role
+    lines.push(`${label}: ${truncateTextForMemory(msg.content, 200)}`)
+  })
+  if (currentUserContent) {
+    lines.push(`用户当前请求: ${truncateTextForMemory(currentUserContent, 300)}`)
+  }
+  const summary = lines.join('\n')
+  if (summary.length <= maxChars) return summary
+  return summary.slice(0, maxChars) + '\n...(内容已截断)'
+}
+
 // 提取工具调用之外的文本内容
 function extractTextContent(content: string): string {
   // 移除所有工具调用块
@@ -116,6 +243,50 @@ function extractTextContent(content: string): string {
   // 清理多余空行
   text = text.replace(/\n{3,}/g, '\n\n').trim()
   return text
+}
+
+// 从指定 key 后提取 JSON 对象（支持多行、嵌套）
+function extractJsonObjectAfterKey(argsText: string, key: string): string | null {
+  const keyRegex = new RegExp(`^\\s*${key}\\s*[:=]\\s*`, 'm')
+  const match = keyRegex.exec(argsText)
+  if (!match) return null
+
+  const startIndex = match.index + match[0].length
+  const openIndex = argsText.indexOf('{', startIndex)
+  if (openIndex === -1) return null
+
+  let depth = 0
+  let inString = false
+  let escaped = false
+
+  for (let i = openIndex; i < argsText.length; i++) {
+    const ch = argsText[i]
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (ch === '\\') {
+        escaped = true
+      } else if (ch === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+
+    if (ch === '{') depth++
+    if (ch === '}') {
+      depth--
+      if (depth === 0) {
+        return argsText.slice(openIndex, i + 1).trim()
+      }
+    }
+  }
+
+  return null
 }
 
 // 解析工具调用
@@ -139,16 +310,43 @@ function parseToolCalls(content: string): Array<{ tool: string; args: Record<str
         args['title'] = titleMatch[1].trim()
       }
       
+      // 提取 dsl（JSON 对象）- 最高优先级
+      const dslJson = extractJsonObjectAfterKey(argsText, 'dsl')
+      if (dslJson) {
+        args['dsl'] = dslJson
+        console.log('解析到 dsl:', args['dsl'].substring(0, 100))
+      }
+
       // 提取 elements（JSON 数组）- 优先处理
       const elementsMatch = argsText.match(/^\s*elements\s*[:=]\s*(\[[\s\S]*?\])(?:\n|$)/m)
       if (elementsMatch) {
         args['elements'] = elementsMatch[1].trim()
         console.log('解析到 elements:', args['elements'])
       }
+
+      // 可选：指定样式参考（从 DocxCatalog 选择）
+      const styleRefPathMatch = argsText.match(/^\s*styleRefPath\s*[:=]\s*(.+?)(?:\n|$)/m)
+      if (styleRefPathMatch) {
+        args['styleRefPath'] = styleRefPathMatch[1].trim()
+      }
+      const styleRefFileNameMatch = argsText.match(/^\s*styleRefFileName\s*[:=]\s*(.+?)(?:\n|$)/m)
+      if (styleRefFileNameMatch) {
+        args['styleRefFileName'] = styleRefFileNameMatch[1].trim()
+      }
+
+      // 可选：指定内容参考（用于“格式参考 + 内容参考 → 生成新文档”）
+      const contentRefPathMatch = argsText.match(/^\s*contentRefPath\s*[:=]\s*(.+?)(?:\n|$)/m)
+      if (contentRefPathMatch) {
+        args['contentRefPath'] = contentRefPathMatch[1].trim()
+      }
+      const contentRefFileNameMatch = argsText.match(/^\s*contentRefFileName\s*[:=]\s*(.+?)(?:\n|$)/m)
+      if (contentRefFileNameMatch) {
+        args['contentRefFileName'] = contentRefFileNameMatch[1].trim()
+      }
       
       // 提取 content - 从 "content:" 开始到结尾的所有内容
       const contentMatch = argsText.match(/^\s*content\s*[:=]\s*([\s\S]*)$/m)
-      if (contentMatch && !args['elements']) {
+      if (contentMatch && !args['elements'] && !args['dsl']) {
         // 获取 content: 之后的所有内容
         let contentValue = contentMatch[1]
         // 如果 content 在 title 之前，需要截取到 title 之前
@@ -169,6 +367,16 @@ function parseToolCalls(content: string): Array<{ tool: string; args: Record<str
       if (replacementsMatch) {
         args['replacements'] = replacementsMatch[1].trim()
         console.log('解析到 replacements:', args['replacements'])
+      }
+
+      // 可选：指定模板来源（从 DocxCatalog 选择）
+      const templatePathMatch = argsText.match(/^\s*templatePath\s*[:=]\s*(.+?)(?:\n|$)/m)
+      if (templatePathMatch) {
+        args['templatePath'] = templatePathMatch[1].trim()
+      }
+      const templateFileNameMatch = argsText.match(/^\s*templateFileName\s*[:=]\s*(.+?)(?:\n|$)/m)
+      if (templateFileNameMatch) {
+        args['templateFileName'] = templateFileNameMatch[1].trim()
       }
     } else if (toolName === 'word_edit_ops') {
       // word_edit_ops：ops(JSON数组) + 可选 dryRun
@@ -248,9 +456,18 @@ export function AIProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(false)
   const [isCompleting, setIsCompleting] = useState(false)
   const [streamingContent, setStreamingContent] = useState('')
+  const [streamingReasoning, setStreamingReasoning] = useState('')  // AI 思考过程
+  const [editPhase, setEditPhase] = useState<'idle' | 'editing' | 'done'>('idle')
+  const [streamingSummary, setStreamingSummary] = useState('')
   const [settings, setSettings] = useState<AISettings>(loadSettingsFromStorage)
   const abortControllerRef = useRef<AbortController | null>(null)
   const completionAbortRef = useRef<AbortController | null>(null)
+  const lastMemoryFlushAtRef = useRef(0)
+  const sessionIdRef = useRef(
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  )
 
   const addMessage = useCallback((message: Omit<ChatMessage, 'id' | 'timestamp'>) => {
     const newMessage: ChatMessage = {
@@ -291,12 +508,54 @@ export function AIProvider({ children }: { children: ReactNode }) {
     }
   }, [messages])
 
+  // 启动时从 .env 加载设置（Electron 桌面端），优先级最高
+  useEffect(() => {
+    if (window.electronAPI?.getEnvSettings) {
+      window.electronAPI.getEnvSettings().then(envSettings => {
+        if (envSettings && Object.keys(envSettings).length > 0) {
+          setSettings(prev => {
+            const merged = mergeSettings(prev, envSettings)
+            // 同步回写 localStorage，保持一致
+            localStorage.setItem('word-cursor-settings', JSON.stringify(merged))
+            return merged
+          })
+        }
+      }).catch(e => console.warn('加载 .env 设置失败:', e))
+    }
+  }, [])
+
   const updateSettings = useCallback((newSettings: Partial<AISettings>) => {
     setSettings(prev => {
       const updated = { ...prev, ...newSettings }
+      // 同时写入 localStorage（备份）和 .env（主存储）
       localStorage.setItem('word-cursor-settings', JSON.stringify(updated))
+      // 异步写入 .env 文件（Electron 桌面端）
+      if (window.electronAPI?.saveEnvSettings) {
+        window.electronAPI.saveEnvSettings(updated).catch(e =>
+          console.warn('保存设置到 .env 失败:', e)
+        )
+      }
       return updated
     })
+  }, [])
+
+  const buildMemoryEntry = useCallback((
+    userText: string,
+    assistantText: string,
+    toolResults: ToolResult[],
+    workspaceSummary?: string
+  ) => {
+    const lines: string[] = []
+    if (userText) lines.push(`用户: ${userText}`)
+    if (assistantText) lines.push(`助手: ${assistantText}`)
+    if (toolResults.length) {
+      const tools = toolResults.map(t => `${t.tool}${t.success ? '' : '(失败)'}`).join(', ')
+      lines.push(`工具: ${tools}`)
+    }
+    if (workspaceSummary) {
+      lines.push(`工作夹摘要: ${workspaceSummary}`)
+    }
+    return lines.join('\n')
   }, [])
 
   // Agent 系统提示词 - Word-Cursor 专用
@@ -327,6 +586,39 @@ export function AIProvider({ children }: { children: ReactNode }) {
    当所有操作完成后，直接回复用户，简要总结你做了什么修改，**不要再调用任何工具**。
 </task_completion_rules>
 
+<output_markers>
+当你开始对文档进行创建/修改时，必须输出以下标记（原样输出）：
+1) 在首次开始修改前输出：${DOC_EDIT_START}
+2) 在完成全部修改后输出：${DOC_EDIT_END}
+3) 在总结内容前后输出：
+${DOC_SUMMARY_START}
+...总结内容...
+${DOC_SUMMARY_END}
+
+规则：
+- 只在“涉及文档修改/创建”的任务中使用这些标记
+- 不要向用户展示原始 DSL/JSON 或工具调用日志
+- 工具调用仍然使用 [TOOL_CALL]...[/TOOL_CALL] 格式
+</output_markers>
+
+<workspace_rules>
+**工作夹目录规则（重要）**
+
+1. 工作夹目录 = 当前打开文件所在目录。
+2. 系统会提供“工作夹索引”摘要（可能被截断）。如需更多文件清单，请使用 **workspace_list**。
+3. 查看文件内容时优先使用 **workspace_summarize**；只有确有必要才使用 **workspace_read**。
+4. 避免一次读取多个大文件，按需逐个读取，防止上下文爆炸。
+</workspace_rules>
+
+<template_fill_rules>
+**无占位符模板自动填充（必须遵守）**
+
+1. 先调用 word_edit_ops，action=detect_fields，dryRun=true，获取候选字段（包含 path/当前值/类型）。
+2. 再调用 word_edit_ops，action=apply，dryRun=true，提交 assignments（优先使用 fieldId + path + oldValue + value）。
+3. 输出模式必须为新文档：params.output="new_doc"，可选 params.outputName 指定文件名。
+4. 等用户确认后再应用（用户点击“应用修订”）。
+</template_fill_rules>
+
 <tool_selection>
 **工具选择指南**
 
@@ -350,10 +642,22 @@ export function AIProvider({ children }: { children: ReactNode }) {
 | 分栏排版 | **word_edit_ops** (columns) |
 | 添加水印 | **word_edit_ops** (watermark) |
 | 生成目录 | **word_edit_ops** (toc) |
+| 提取文档大纲 | **word_edit_ops** (outline_summary: extract_outline) |
+| 生成文档摘要 | **word_edit_ops** (outline_summary: generate_summary) |
+| 检测模板占位符 | **word_edit_ops** (template_fill: detect_placeholders) |
+| 填充模板占位符 | **word_edit_ops** (template_fill: fill_single/fill_all) |
+| 无占位符模板自动填充 | **word_edit_ops** (template_fill: detect_fields → apply) |
+| 插入脚注/尾注 | **word_edit_ops** (citation_footnote: insert_footnote/insert_endnote) |
+| 添加参考文献 | **word_edit_ops** (citation_footnote: add_citation) |
+| 生成参考文献列表 | **word_edit_ops** (citation_footnote: generate_bibliography) |
+| 获取工作夹目录文件清单 | **workspace_list** |
+| 打开工作夹中的文件（切换当前编辑文件） | **workspace_open** |
+| 查看工作夹文件摘要 | **workspace_summarize** |
+| 读取工作夹文件内容（受限，谨慎） | **workspace_read** |
 | 在当前文档插入新内容 | **insert** |
 | 删除当前文档的某些内容 | **delete** |
-| 创建全新的文档（不基于模板） | **create** |
-| 按照当前文档的格式创建新文档 | **create_from_template** |
+| 创建全新的文档（不基于模板） | **create**（可选：styleRefPath/styleRefFileName + contentRefPath/contentRefFileName） |
+| 按照某个模板 docx 的结构创建新文档 | **create_from_template**（可选：templatePath/templateFileName 指定模板） |
 | 需要查找外部资讯/调研数据/事实核查 | **web_search** |
 | 读取 Excel 单元格内容 | **excel_read** |
 | 搜索 Excel 表格内容 | **excel_search** |
@@ -398,6 +702,27 @@ export function AIProvider({ children }: { children: ReactNode }) {
 - 用户给了新内容让你"填进去"或"改成这个"，用 **replace**，不是 create！
 </tool_selection>
 
+<docx_catalog_policy>
+**DocxCatalog（非常重要）**
+
+系统可能会在「[附加文件内容]」中提供一个 \`【DocxCatalog】\`，列出当前可用的 \`.docx\` 候选（来自：聊天附件 + 工作区），每个候选包含：文件名、路径、排版画像（字体/缩进/行距/页边距）与结构统计。
+
+当用户说“像这个文档一样”“参考这个文档的格式/样式/排版”时，你必须先做两步判断：
+
+1) **用户想继承什么？**
+- **StyleReference（只要排版像）**：用户说“只参考样式/排版/字体/缩进/行距”，且结构可以不同。
+- **TemplateCopy（结构也要像）**：用户说“按这个结构/版式/表格布局/一模一样格式填内容”。
+
+2) **从 DocxCatalog 选哪一个？**
+- 如果有明显最匹配候选（文件名关键词、结构统计、排版画像与用户描述高度一致），直接选它并执行。
+- 如果候选之间差距不明显：**先询问用户**（列出 2-3 个候选文件名让用户选）。
+
+**工具调用规则（点名候选）**
+- 需要 **StyleReference**：用 \`create\` 工具创建新文档，并在 TOOL_CALL 里附带：\`styleRefPath:\` 或 \`styleRefFileName:\`（从 DocxCatalog 复制）。
+- 需要 **ContentReference**（保留内容文档结构/标题层级）：在 \`create\` 里再附带：\`contentRefPath:\` 或 \`contentRefFileName:\`。
+- 需要 **TemplateCopy**：用 \`create_from_template\`，并附带：\`templatePath:\` 或 \`templateFileName:\`（从 DocxCatalog 复制）。
+</docx_catalog_policy>
+
 <communication>
 - 使用简洁、专业的语言
 - 使用 **加粗** 突出关键信息
@@ -436,7 +761,7 @@ export function AIProvider({ children }: { children: ReactNode }) {
 **⚠️ Word 文档分段修改原则（极其重要！）**
 
 修改 **Word 文档** 时，使用 replace 工具进行精准修改，**必须分多次调用**：
-- **每次 replace 的 search 参数不超过 200 字**
+- **每次 replace 的 search 参数不超过 1000 字**
 - **每次只改一个段落、一句话或一个短语**
 - **逐条修改，让用户能清楚看到每处变化**
 - **工具执行后你会收到最新的文档内容，请基于最新内容继续修改**
@@ -449,7 +774,7 @@ export function AIProvider({ children }: { children: ReactNode }) {
 
 **错误示例（禁止！）**
 - ❌ 一次性替换整篇文档
-- ❌ search 参数超过 200 字
+- ❌ search 参数超过 1000 字
 - ❌ 把多个段落合并到一次 replace 中
 
 **📊 Excel 表格不受此限制**
@@ -482,7 +807,7 @@ num: 5
 当用户要求修改、替换、更正 **Word 文档** 中的特定内容时使用。
 
 **⚠️ 最重要原则：逐条小范围修改！**
-- **search 参数不超过 200 字！** 超过 200 字会导致匹配失败
+- **search 参数不超过 1000 字！** 超过 1000 字会导致匹配失败
 - **每次只修改一小段内容**（通常一句话或一个短语）
 - **不要一次替换整段或多行内容**
 - **多处修改时，分多次调用 replace**
@@ -550,6 +875,55 @@ color: #ff0000
 - 如果需要替换多处不同内容，为每处分别调用一次
 - 相同内容的多处出现会被一次性全部替换
 - 系统会智能处理 HTML 标签，保留原有格式
+
+## 1.1 review - 文档审查（逐条标记问题并建议修改）
+
+当用户要求**审查、校对、检查、纠错**文档时使用。与 replace 类似，但额外支持：
+- **reason**：修改原因说明（必填）
+- **type**：问题分类（必填）
+- **DSL 格式参数**：可同时修正格式问题（fontFamily / fontSize / bold / color 等）
+
+**基本格式**：
+[TOOL_CALL] review
+search: 存在问题的原文（精确匹配，纯文本，不加引号）
+replace: 修改后的文字
+reason: 修改原因（简洁说明为什么要改）
+type: grammar
+[/TOOL_CALL]
+
+**带格式修正**：
+[TOOL_CALL] review
+search: 需要修正格式的原文
+replace: 修改后的文字
+reason: 标题应为黑体14pt加粗
+type: format
+fontFamily: 黑体
+fontSize: 14pt
+bold: true
+[/TOOL_CALL]
+
+**type 分类说明**：
+- grammar：语法/语病/标点错误
+- logic：逻辑不通/前后矛盾/因果错乱
+- style：措辞不当/口语化/不专业/表述突兀
+- typo：错别字/拼写错误
+- format：字体/字号/格式不规范
+
+**可用格式参数**（均可选）：
+- bold: true/false - 粗体
+- italic: true/false - 斜体
+- underline: true/false - 下划线
+- color: #颜色代码 - 文字颜色
+- fontSize: 字号 - 如 14pt、12pt
+- fontFamily: 字体名 - 如 黑体、仿宋、宋体
+
+**关键规则**：
+- 每次只改一处，search 精确匹配原文（纯文本，不加引号）
+- reason 必填，简洁说明修改理由（10-30字）
+- type 必填，方便用户按类型筛选审阅
+- 优先处理严重问题（语病>逻辑>错别字>措辞>格式）
+- 从文档开头到结尾顺序处理，避免位置偏移
+- search 不超过 200 字，每次只改最小范围
 
 ## 1.5 word_edit_ops - 格式/样式/结构操作（Word 文档专用，支持预览确认）
 当用户想要**调整格式、样式、列表、表格、图片或文档结构**时使用。
@@ -1017,6 +1391,144 @@ ops: [
 ]
 [/TOOL_CALL]
 
+### 18. outline_summary - 大纲/摘要生成
+**action 类型**：
+- extract_outline：提取文档大纲结构
+- generate_summary：生成文档摘要
+- insert_summary：插入摘要到文档
+
+**示例（提取文档大纲）**：
+[TOOL_CALL] word_edit_ops
+dryRun: false
+ops: [
+  {
+    "type": "outline_summary",
+    "target": { "scope": "document" },
+    "params": { "action": "extract_outline" }
+  }
+]
+[/TOOL_CALL]
+
+**示例（生成摘要并插入文档开头）**：
+[TOOL_CALL] word_edit_ops
+dryRun: false
+ops: [
+  {
+    "type": "outline_summary",
+    "target": { "scope": "document" },
+    "params": { "action": "insert_summary", "content": "本文档主要介绍...", "position": "start" }
+  }
+]
+[/TOOL_CALL]
+
+### 19. template_fill - 模板智能填充
+**action 类型**：
+- detect_placeholders：检测文档中的占位符（{{xxx}}、【xxx】、[xxx]、___）
+- detect_fields：无占位符模板字段识别（返回 path/当前值/类型）
+- fill_single：填充单个占位符
+- fill_all：批量填充所有占位符
+- apply：按 assignments 填充（支持 fieldId/path/oldValue）
+
+**示例（检测占位符）**：
+[TOOL_CALL] word_edit_ops
+dryRun: false
+ops: [
+  {
+    "type": "template_fill",
+    "target": { "scope": "document" },
+    "params": { "action": "detect_placeholders" }
+  }
+]
+[/TOOL_CALL]
+
+**示例（填充单个占位符）**：
+[TOOL_CALL] word_edit_ops
+dryRun: false
+ops: [
+  {
+    "type": "template_fill",
+    "target": { "scope": "document" },
+    "params": { "action": "fill_single", "placeholder": "{{公司名称}}", "value": "北京科技有限公司" }
+  }
+]
+[/TOOL_CALL]
+
+**示例（无占位符：先识别，再按 path 精准填充）**：
+[TOOL_CALL] word_edit_ops
+dryRun: true
+ops: [
+  {
+    "type": "template_fill",
+    "target": { "scope": "document" },
+    "params": { "action": "detect_fields" }
+  }
+]
+[/TOOL_CALL]
+
+[TOOL_CALL] word_edit_ops
+dryRun: true
+ops: [
+  {
+    "type": "template_fill",
+    "target": { "scope": "document" },
+    "params": {
+      "action": "apply",
+      "assignments": [
+        {
+          "fieldId": "p:12:colon",
+          "path": "h1[1]/p[4]",
+          "oldValue": "",
+          "value": "张三",
+          "fieldType": "person"
+        }
+      ],
+      "output": "new_doc",
+      "outputName": "已填充-报名表.docx"
+    }
+  }
+]
+[/TOOL_CALL]
+
+### 20. citation_footnote - 引用/脚注管理
+**action 类型**：
+- insert_footnote：插入脚注（页面底部）
+- insert_endnote：插入尾注（文档末尾）
+- add_citation：添加参考文献引用
+- generate_bibliography：整理参考文献列表
+
+**示例（插入脚注）**：
+[TOOL_CALL] word_edit_ops
+dryRun: false
+ops: [
+  {
+    "type": "citation_footnote",
+    "target": { "scope": "document", "text": "关键数据" },
+    "params": { "action": "insert_footnote", "anchorText": "关键数据", "content": "数据来源：2024年行业报告" }
+  }
+]
+[/TOOL_CALL]
+
+**示例（添加参考文献，GB/T 7714格式）**：
+[TOOL_CALL] word_edit_ops
+dryRun: false
+ops: [
+  {
+    "type": "citation_footnote",
+    "target": { "scope": "document" },
+    "params": { 
+      "action": "add_citation", 
+      "format": "gb7714",
+      "source": {
+        "type": "book",
+        "title": "人工智能导论",
+        "author": "张三",
+        "year": "2024"
+      }
+    }
+  }
+]
+[/TOOL_CALL]
+
 ## 2. create - 从零创建新文档
 **⚠️ 注意**：如果用户要求"按照当前文档格式"创建新文档，请使用 **create_from_template** 工具！
 
@@ -1025,13 +1537,77 @@ create 工具只适用于：
 - 用户明确要求从零开始创建
 - 创建简单文档
 
-**方式一：HTML 内容（推荐）**
+**⚠️ 长文档 DSL 链式创建策略（极其重要！）**
+
+当文档内容预计超过 2000 字时，**必须用 DSL 分段创建**，禁止一次性生成全部内容。
+全程使用 DSL 格式，每一步都可以自主指定字体、字号、颜色、行距等排版参数。
+
+**第 1 步：用 create + DSL 创建文档的第一部分**
+- 用 create 工具，传入 dsl 参数，包含文档标题和第一部分内容（1~2 个章节，不超过 1500 字）
+- DSL 中为每个标题、段落设置合适的字体/字号/格式
+
+**第 2~N 步：用 insert + DSL 追加后续部分**
+- 用 **insert** 工具，position="end"，传入 dsl 参数，追加下一部分的内容
+- 每步只写 1~2 个章节，不超过 1500 字
+- DSL 中同样指定完整的排版格式
+
+**最后一步：整体审查**
+- 全部写完后，系统会附带最新完整文档内容
+- 检查有无遗漏/错误，用 replace 修正细节；无问题则回复总结
+
+**示例流程**：
+1. create dsl:{"blocks":[标题+一、项目概述（带字体字号格式）]}
+2. insert position:end dsl:{"blocks":[二、业务需求（带格式）]}
+3. insert position:end dsl:{"blocks":[三、技术方案（带格式）]}
+4. insert position:end dsl:{"blocks":[四、实施计划（带格式）]}  ← 最后一部分
+5. 审查完整文档 → 回复总结
+
+**DSL 格式排版建议（中文商务/公文文档）**：
+- 一级标题：黑体，16pt，居中，段前12pt段后6pt
+- 二级标题：黑体，14pt，左对齐，加粗
+- 三级标题：黑体，12pt，左对齐，加粗
+- 正文段落：仿宋，12pt（小四），首行缩进2em，行距28pt
+- 表格内容：宋体，10.5pt（五号）
+
+**核心规则**：
+- 每步都用 DSL，AI 自主控制每个段落的字体/字号/颜色/行距
+- 每步不超过 1500 字，分多步完成长文档
+- 每步完成后系统会返回最新文档，据此继续下一步
+- 全部写完后必须审查一遍
+
+**方式一：DSL 结构化格式（推荐，可控性最强）**
+[TOOL_CALL] create
+title: 文档标题
+dsl: {"blocks":[{"type":"heading","level":1,"content":"标题"},{"type":"paragraph","content":[{"text":"正文内容","bold":true}]}]}
+[/TOOL_CALL]
+
+**DSL 块类型**：
+- heading: {"type":"heading","level":1,"content":"标题","format":{"alignment":"center"}}
+- paragraph: {"type":"paragraph","content":"正文","format":{"firstLineIndent":"2em"}}
+- paragraph（带格式）: {"type":"paragraph","content":[{"text":"普通"},{"text":"粗体","bold":true}]}
+- list: {"type":"list","listType":"bullet","items":[{"content":"项目1"}]}
+- table: {"type":"table","rows":[{"cells":[{"content":"表头"}],"isHeader":true}]}
+- table（合并单元格）: {"type":"table","rows":[{"cells":[{"content":"合并","colSpan":2}]}]}
+- image: {"type":"image","src":"https://...","width":"300px","alignment":"center"}
+
+**DSL 行内格式（Run）**: text, bold, italic, underline, strikethrough, fontFamily, fontSize, color, highlight
+**DSL 段落格式（format）**: alignment, firstLineIndent, leftIndent, spaceBefore, spaceAfter, lineHeight
+
+**方式二：参考另一个 DOCX 的排版**
+[TOOL_CALL] create
+title: 合并后的新文档
+styleRefFileName: 格式参考.docx
+contentRefFileName: 内容参考.docx
+content: （可留空或简短说明，系统会优先用 contentRefFileName 解析正文结构）
+[/TOOL_CALL]
+
+**方式三：HTML 内容（简单场景）**
 [TOOL_CALL] create
 title: 文档标题
 content: <h1 style="text-align: center">标题</h1><p>正文内容...</p>
 [/TOOL_CALL]
 
-**支持的 HTML 标签**：
+**HTML 支持标签**：
 - 标题: <h1>/<h2>/<h3> - 可加 style="text-align: center" 居中
 - 段落: <p> - 默认首行缩进
 - 粗体: <strong> 或 <b>
@@ -1041,34 +1617,78 @@ content: <h1 style="text-align: center">标题</h1><p>正文内容...</p>
 - 表格: <table><tr><td>单元格</td></tr></table>
 - 列表: <ul><li>项目</li></ul> 或 <ol><li>项目</li></ol>
 
-**方式二：elements 数组（复杂格式）**
+**方式四：elements 数组（兼容旧格式）**
 [TOOL_CALL] create
 title: 文档标题
-elements: [{"type":"heading","content":"标题","level":1,"alignment":"center"},{"type":"paragraph","content":"正文","bold":true}]
+elements: [{"type":"heading","content":"标题","level":1},{"type":"paragraph","content":"正文","bold":true}]
 [/TOOL_CALL]
 
 **elements 格式**（JSON数组）：
-- **标题**: {"type":"heading","content":"标题文字","level":1,"alignment":"center"}
+- **标题**: {"type":"heading","content":"标题文字","level":1}
 - **段落**: {"type":"paragraph","content":"段落内容","bold":true,"fontSize":14}
 - **表格**: {"type":"table","rows":3,"cols":2,"data":[["表头1","表头2"],["数据1","数据2"]]}
 
-**局限性**：
-- create 无法复制复杂格式（合并单元格、特殊边框等）
-- 如果需要保留原文档的复杂格式，使用 create_from_template
+**格式选择建议**：
+- 需要精确控制格式（字体/颜色/表格合并等）→ 使用 DSL
+- 简单文本创建 → 使用 HTML 或 elements
+- 需要保留原文档复杂格式 → 使用 create_from_template
+
+**⚠️ 文档审查策略（用户请求审查/校对/检查/纠错时使用）**
+
+当用户要求审查、校对、检查文档时，**必须使用 review 工具**（不要用 replace），按以下流程执行：
+
+**第 1 步：通读全文**，从以下维度识别问题：
+  1. 语言通顺性（语病、错别字、标点）→ type: grammar / typo
+  2. 逻辑连贯性（段落衔接、前后一致）→ type: logic
+  3. 表述专业性（用词准确、避免口语化）→ type: style
+  4. 格式规范性（标题层级、字体字号一致）→ type: format
+  5. 内容完整性（遗漏、重复）→ type: logic
+
+**第 2 步：概述文档整体质量**
+  - 用一段文字总结文档的优缺点
+  - 列出即将修改的问题清单（编号+简述）
+
+**第 3 步：逐条使用 review 工具标记修改**
+  - 从文档开头到结尾依次处理，避免位置偏移
+  - 每条**必须填写 reason 和 type**
+  - 内容/措辞问题 → review（纯文字替换）
+  - 格式问题 → review + 格式参数（fontFamily/fontSize/bold 等）
+  - 问题较多时**先处理最重要的 10 处**，然后告知用户可继续审查
+
+**第 4 步：给出审查总结**
+  - 共发现 N 个问题，已提交 N 处修改建议
+  - 按类别统计：语法 X 处、逻辑 X 处、措辞 X 处...
+  - 提醒用户去修订面板逐条接受/拒绝
 
 ## 3. insert - 插入内容
-在文档的指定位置插入新内容。
+在文档的指定位置插入新内容。支持**纯文本**和**DSL 结构化格式**两种方式。
 
-调用格式：
+**方式一：纯文本插入**
 [TOOL_CALL] insert
 position: start | end | after:锚点文字
-content: 要插入的内容
+content: 要插入的文本内容
+[/TOOL_CALL]
+
+**方式二：DSL 格式插入（推荐用于长文档续写，可精确控制排版）**
+[TOOL_CALL] insert
+position: end
+dsl: {"blocks":[...]}
+[/TOOL_CALL]
+
+DSL 格式与 create 工具的 dsl 参数完全一致，支持 heading/paragraph/list/table 等所有块类型，以及 fontFamily/fontSize/color/bold/lineHeight 等全部排版属性。
+
+**DSL 插入示例（追加一个章节到末尾）**：
+[TOOL_CALL] insert
+position: end
+dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"二、业务需求分析","fontFamily":"黑体","fontSize":14,"bold":true}]},{"type":"paragraph","content":[{"text":"    本项目旨在解决企业日常运营中的核心痛点...","fontFamily":"仿宋","fontSize":12}],"format":{"lineHeight":"28pt","firstLineIndent":"2em"}}]}
 [/TOOL_CALL]
 
 **position 参数说明**：
 - \`start\`：在文档开头插入
-- \`end\`：在文档末尾插入
+- \`end\`：在文档末尾插入（长文档续写时必须用 end）
 - \`after:某段文字\`：在指定文字后面插入
+
+**⚠️ 长文档创建时，第 2 步起必须用 insert + dsl + position:end 来续写，不要用 replace。**
 
 ## 4. delete - 删除内容
 删除文档中的指定内容。
@@ -1704,10 +2324,23 @@ content: <h1>通知</h1><p>内容...</p>
 - 用户要求“返回修改后的完整文档内容”时：直接返回最终内容（Markdown）
 - 其它情况：给出简洁、可直接复制使用的答案`
 
+  const streamFallbackContent = async (content: string, signal: AbortSignal) => {
+    if (!content) return
+    const total = content.length
+    const chunkSize = total > 4000 ? 120 : total > 1500 ? 60 : total > 400 ? 30 : 12
+    const delay = 24
+    for (let i = 0; i < total; i += chunkSize) {
+      if (signal.aborted) break
+      setStreamingContent(content.slice(0, i + chunkSize))
+      await new Promise(resolve => setTimeout(resolve, delay))
+    }
+  }
+
   // 单次 API 调用
   const callAPI = async (
     allMessages: Array<{ role: string; content: string }>,
-    signal: AbortSignal
+    signal: AbortSignal,
+    options?: { returnRaw?: boolean }
   ): Promise<string> => {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -1716,6 +2349,97 @@ content: <h1>通知</h1><p>内容...</p>
       headers['Authorization'] = `Bearer ${settings.apiKey}`
     }
 
+    // Electron 环境：优先走主进程代理（Node fetch/HTTP1.1），避免渲染进程 HTTP/2 的 ERR_HTTP2_PING_FAILED
+    if (window.electronAPI?.isElectron && window.electronAPI.aiChatCompletions && window.electronAPI.onAIStreamDelta) {
+      const requestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+      let fullContent = ''
+      let fullReasoning = ''  // 思考内容（kimi-k2.5 等思考模型）
+      let contentDeltaCount = 0
+      
+      // 清空之前的思考内容
+      setStreamingReasoning('')
+
+      const unsubscribe = window.electronAPI.onAIStreamDelta((payload) => {
+        if (!payload || payload.requestId !== requestId) return
+        
+        // 处理内容增量
+        const delta = payload.delta || ''
+        if (delta) {
+          contentDeltaCount += 1
+          fullContent += delta
+          // 从内容中提取 <think> 标签内的思考内容
+          const { thinking, cleaned } = extractThinking(fullContent)
+          if (thinking && thinking !== fullReasoning) {
+            fullReasoning = thinking
+            setStreamingReasoning(fullReasoning)
+          }
+          const parsed = parseAssistantOutput(cleaned)
+          if (parsed.summary) setStreamingSummary(parsed.summary)
+          if (parsed.phase === 'editing') setEditPhase('editing')
+          if (parsed.phase === 'done') setEditPhase('done')
+          setStreamingContent(parsed.displayText)
+        }
+        
+        // 处理思考增量（kimi-k2.5 等思考模型 - 通过单独字段返回）
+        const reasoningDelta = (payload as { reasoningDelta?: string }).reasoningDelta || ''
+        if (reasoningDelta) {
+          fullReasoning += reasoningDelta
+          setStreamingReasoning(fullReasoning)
+        }
+
+      })
+
+      const abortHandler = () => {
+        try {
+          window.electronAPI?.aiCancel?.(requestId)
+        } catch {
+          // ignore
+        }
+      }
+
+      signal.addEventListener('abort', abortHandler, { once: true })
+
+      try {
+        // kimi-k2.5 模型只支持 temperature=1，自动修正
+        const effectiveTemperature = settings.model.toLowerCase().includes('kimi-k2') ? 1 : settings.temperature
+        
+        const result = await window.electronAPI.aiChatCompletions({
+          requestId,
+          baseUrl: settings.baseUrl,
+          apiKey: settings.apiKey,
+          model: settings.model,
+          messages: allMessages,
+          temperature: effectiveTemperature,
+          maxTokens: settings.maxTokens,
+        })
+
+        if (!result?.success) {
+          throw new Error(result?.error || '请求失败')
+        }
+
+        const content = result.content || fullContent
+        const cleaned = cleanModelOutput(content)
+        const parsed = parseAssistantOutput(cleaned)
+        const displayText = parsed.displayText || parsed.summary || cleaned
+        if (parsed.summary) setStreamingSummary(parsed.summary)
+        if (parsed.phase === 'editing') setEditPhase('editing')
+        if (parsed.phase === 'done') setEditPhase('done')
+        if (contentDeltaCount === 0 && displayText) {
+          await streamFallbackContent(displayText, signal)
+        }
+        return options?.returnRaw ? cleaned : displayText
+      } finally {
+        try {
+          unsubscribe?.()
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    // kimi-k2.5 模型只支持 temperature=1，自动修正
+    const effectiveTemperature = settings.model.toLowerCase().includes('kimi-k2') ? 1 : settings.temperature
+
     const response = await fetch(`${settings.baseUrl}/chat/completions`, {
       method: 'POST',
       headers,
@@ -1723,7 +2447,7 @@ content: <h1>通知</h1><p>内容...</p>
       body: JSON.stringify({
         model: settings.model,
         messages: allMessages,
-        temperature: settings.temperature,
+        temperature: effectiveTemperature,
         max_tokens: settings.maxTokens,
         stream: true,
       }),
@@ -1739,7 +2463,11 @@ content: <h1>通知</h1><p>内容...</p>
 
     const decoder = new TextDecoder()
     let fullContent = ''
+    let fullReasoning = ''  // 存储完整的思考过程
     let buffer = ''
+    
+    // 清空之前的思考内容
+    setStreamingReasoning('')
     
     // 读取超时包装函数
     const readWithTimeout = async (timeoutMs: number) => {
@@ -1774,10 +2502,48 @@ content: <h1>通知</h1><p>内容...</p>
 
           try {
             const json = JSON.parse(data)
-            const delta = json.choices?.[0]?.delta?.content || ''
-            if (delta) {
-              fullContent += delta
-              setStreamingContent(cleanModelOutput(fullContent))
+            const choice = json.choices?.[0] || {}
+            const delta = choice?.delta || {}
+            const message = choice?.message || {}
+            
+            // 调试：首次收到 delta 时打印结构，便于确认 kimi-k2.5 等模型的字段名
+            if (delta && !fullContent && !fullReasoning) {
+              console.log('[AI stream] delta keys:', Object.keys(delta || {}), 'sample:', JSON.stringify(delta).slice(0, 300))
+            }
+            
+            // 处理思考内容（kimi-k2.5 等思考模型）- 尝试多种字段名
+            const reasoningDelta = delta?.reasoning_content || delta?.thinking_content || delta?.reasoning || delta?.thinking || delta?.thought || message?.reasoning_content || json?.reasoning_content || ''
+            if (reasoningDelta) {
+              fullReasoning += reasoningDelta
+              setStreamingReasoning(fullReasoning)
+            }
+            
+            // 处理正常内容
+            let contentDelta = delta?.content || delta?.text || ''
+            if (!contentDelta) {
+              const messageContent = extractStreamText(message?.content ?? message?.text)
+              if (messageContent) {
+                contentDelta = messageContent
+              } else if (choice?.text) {
+                contentDelta = choice.text
+              }
+            }
+            if (contentDelta && fullContent && contentDelta.startsWith(fullContent)) {
+              contentDelta = contentDelta.slice(fullContent.length)
+            }
+            if (contentDelta) {
+              fullContent += contentDelta
+              // 从内容中提取 <think> 标签内的思考内容
+              const { thinking, cleaned } = extractThinking(fullContent)
+              if (thinking && thinking !== fullReasoning) {
+                fullReasoning = thinking
+                setStreamingReasoning(fullReasoning)
+              }
+              const parsed = parseAssistantOutput(cleaned)
+              if (parsed.summary) setStreamingSummary(parsed.summary)
+              if (parsed.phase === 'editing') setEditPhase('editing')
+              if (parsed.phase === 'done') setEditPhase('done')
+              setStreamingContent(parsed.displayText)
             }
           } catch {
             // 忽略解析错误
@@ -1786,7 +2552,13 @@ content: <h1>通知</h1><p>内容...</p>
       }
     }
 
-    return cleanModelOutput(fullContent)
+    const cleaned = cleanModelOutput(fullContent)
+    const parsed = parseAssistantOutput(cleaned)
+    if (parsed.summary) setStreamingSummary(parsed.summary)
+    if (parsed.phase === 'editing') setEditPhase('editing')
+    if (parsed.phase === 'done') setEditPhase('done')
+    const displayText = parsed.displayText || parsed.summary || cleaned
+    return options?.returnRaw ? cleaned : displayText
   }
 
   // 传统单轮消息（不走 Agent 工具循环）
@@ -1796,6 +2568,9 @@ content: <h1>通知</h1><p>内容...</p>
   ): Promise<string> => {
     setIsLoading(true)
     setStreamingContent('')
+    setStreamingReasoning('')  // 清空思考内容
+    setEditPhase('idle')
+    setStreamingSummary('')
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort()
@@ -1825,10 +2600,14 @@ content: <h1>通知</h1><p>内容...</p>
     content: string,
     documentContext?: string,
     filesContext?: string,
-    callbacks?: AgentCallbacks
+    callbacks?: AgentCallbacks,
+    memoryContext?: { workspaceKey?: string; workspaceSummary?: string }
   ): Promise<void> => {
     setIsLoading(true)
     setStreamingContent('')
+    setStreamingReasoning('')  // 清空思考内容
+    setEditPhase('idle')
+    setStreamingSummary('')
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort()
@@ -1848,6 +2627,36 @@ content: <h1>通知</h1><p>内容...</p>
         userContent += `\n\n[附加文件内容]\n${filesContext}`
       }
 
+      const memoryEnabled = settings.memoryEnabled !== false
+      const memoryTopK = Math.max(1, settings.memoryTopK || 5)
+      const memoryMaxChars = Math.max(500, settings.memoryMaxChars || 2000)
+      const memoryTextWeight = typeof settings.memoryTextWeight === 'number' ? settings.memoryTextWeight : 0.6
+      const memoryVectorWeight = typeof settings.memoryVectorWeight === 'number' ? settings.memoryVectorWeight : 0.4
+      const workspaceKey = memoryContext?.workspaceKey || ''
+
+      if (memoryEnabled && window.electronAPI?.memorySearch && content.trim().length >= 6) {
+        try {
+              const memoryResp = await memorySearch({
+            query: content,
+            topK: memoryTopK,
+            textWeight: memoryTextWeight,
+            vectorWeight: memoryVectorWeight,
+            workspaceKey,
+          })
+          if (memoryResp.success && memoryResp.results.length > 0) {
+            const memoryBlock = formatMemoryResults(
+              memoryResp.results,
+              memoryMaxChars
+            )
+            if (memoryBlock) {
+              userContent += `\n\n[记忆检索]\n${memoryBlock}`
+            }
+          }
+        } catch {
+          // ignore memory failures
+        }
+      }
+
       // 获取历史消息 - 保留完整上下文，让 AI 能处理长对话和复杂任务
       // 保留 200 条消息，充分利用模型的上下文窗口
       const recentMessages = messages
@@ -1859,6 +2668,34 @@ content: <h1>通知</h1><p>内容...</p>
         }))
         .filter(m => m.content.length > 0)
 
+      if (memoryEnabled && window.electronAPI?.memoryAppend) {
+        const flushThreshold = Math.max(2000, settings.memoryFlushThresholdChars || 12000)
+        const now = Date.now()
+        if (now - lastMemoryFlushAtRef.current > 60_000) {
+          const approxChars = recentMessages.reduce((sum, m) => sum + m.content.length, 0) + userContent.length
+          if (approxChars > flushThreshold) {
+            const summary = buildMemoryFlushText(recentMessages, content)
+            if (summary) {
+              try {
+                await memoryAppend({
+                  text: `【自动记忆刷新】\n${summary}`,
+                  source: 'auto_flush',
+                  tags: ['L2'],
+                })
+                await memoryAppendSession({
+                  sessionId: sessionIdRef.current,
+                  text: summary,
+                  meta: { workspaceKey, type: 'flush' },
+                })
+                lastMemoryFlushAtRef.current = now
+              } catch {
+                // ignore memory failures
+              }
+            }
+          }
+        }
+      }
+
       // 初始化对话
       conversationMessages.push(
         { role: 'system', content: agentSystemPrompt },
@@ -1869,7 +2706,9 @@ content: <h1>通知</h1><p>内容...</p>
       let maxIterations = 20 // 防止无限循环，增加到20次以支持复杂任务
       let iteration = 0
       let accumulatedContent = '' // 累积所有响应中的文本内容
+      let latestSummary = '' // 解析到的最新总结
       let lastResponse = ''
+      let finalContentForMemory = ''
 
       // 【防重复修改】追踪已修改的内容
       const modifiedSearchTexts = new Set<string>() // 已被替换的原文
@@ -1882,10 +2721,18 @@ content: <h1>通知</h1><p>内容...</p>
       while (iteration < maxIterations && !shouldForceStop) {
         iteration++
         
+        // 安全过滤：确保没有空 content 的消息（API 会拒绝空消息）
+        for (let i = conversationMessages.length - 1; i >= 0; i--) {
+          if (!conversationMessages[i].content || !conversationMessages[i].content.trim()) {
+            conversationMessages[i].content = '[空]'
+          }
+        }
+
         // 调用 API
         const response = await callAPI(
           conversationMessages,
-          abortControllerRef.current.signal
+          abortControllerRef.current.signal,
+          { returnRaw: true }
         )
         lastResponse = response
 
@@ -1894,10 +2741,14 @@ content: <h1>通知</h1><p>内容...</p>
           const toolCalls = parseToolCalls(response)
           
           // 提取工具调用之外的文本内容并累积
-          const textContent = extractTextContent(response)
-          console.log('[Agent] 提取的文本内容:', textContent?.substring(0, 200))
-          if (textContent) {
-            accumulatedContent = textContent // 用最新的内容替换，因为 AI 会在最后给出完整总结
+          const parsedOutput = parseAssistantOutput(cleanModelOutput(response))
+          console.log('[Agent] 提取的文本内容:', parsedOutput.displayText?.substring(0, 200))
+          if (parsedOutput.summary) {
+            latestSummary = parsedOutput.summary
+            setStreamingSummary(parsedOutput.summary)
+          }
+          if (parsedOutput.displayText) {
+            accumulatedContent = parsedOutput.displayText // 用最新的内容替换，因为 AI 会在最后给出完整总结
             console.log('[Agent] 累积内容已更新:', accumulatedContent.substring(0, 200))
           }
           
@@ -1986,14 +2837,14 @@ content: <h1>通知</h1><p>内容...</p>
 
           // 获取最新的文档内容（如果有修改文档的工具调用）
           let documentUpdate = ''
-          const documentTools = ['replace', 'insert', 'delete']
+          const documentTools = ['replace', 'insert', 'delete', 'review']
           const hasDocumentChange = toolCalls.some(c => documentTools.includes(c.tool))
           if (hasDocumentChange && callbacks?.getLatestDocument) {
             const latestDoc = callbacks.getLatestDocument()
             if (latestDoc) {
               // 截取文档内容，避免过长
-              const truncatedDoc = latestDoc.length > 2000 
-                ? latestDoc.substring(0, 2000) + '\n...(文档内容已截断)...'
+              const truncatedDoc = latestDoc.length > 8000 
+                ? latestDoc.substring(0, 8000) + '\n...(文档内容已截断)...'
                 : latestDoc
               documentUpdate = `\n\n[文档当前状态（仅供参考，不需要再次修改已修改过的内容）]\n${truncatedDoc}`
             }
@@ -2006,9 +2857,10 @@ content: <h1>通知</h1><p>内容...</p>
           }
 
           // 将工具结果添加到对话（附带最新文档内容）
+          const toolResultContent = (results.join('\n\n') + documentUpdate + completionHint).trim()
           conversationMessages.push({
             role: 'user',
-            content: results.join('\n\n') + documentUpdate + completionHint
+            content: toolResultContent || '[工具调用已完成，无额外输出]'
           })
 
           // 如果强制停止，跳出循环
@@ -2019,9 +2871,13 @@ content: <h1>通知</h1><p>内容...</p>
               conversationMessages,
               abortControllerRef.current.signal
             )
-            // 提取纯文本响应（不包含工具调用）
-            const summaryText = extractTextContent(summaryResponse) || summaryResponse
-            accumulatedContent = summaryText
+            const parsedSummary = parseAssistantOutput(cleanModelOutput(summaryResponse))
+            if (parsedSummary.summary) {
+              latestSummary = parsedSummary.summary
+              setStreamingSummary(parsedSummary.summary)
+            }
+            accumulatedContent = parsedSummary.summary || parsedSummary.displayText || summaryResponse
+            finalContentForMemory = accumulatedContent
             break
           }
 
@@ -2033,8 +2889,19 @@ content: <h1>通知</h1><p>内容...</p>
         // 优先使用当前响应，如果为空则使用累积的内容
         console.log('[Agent] 最终响应:', response?.substring(0, 200))
         console.log('[Agent] 累积内容:', accumulatedContent?.substring(0, 200))
-        const finalContent = response.trim() || accumulatedContent
+        const parsedFinal = parseAssistantOutput(cleanModelOutput(response))
+        if (parsedFinal.summary) {
+          latestSummary = parsedFinal.summary
+          setStreamingSummary(parsedFinal.summary)
+        }
+        const finalContent =
+          parsedFinal.summary ||
+          parsedFinal.displayText ||
+          latestSummary ||
+          response.trim() ||
+          accumulatedContent
         console.log('[Agent] 最终内容:', finalContent?.substring(0, 200))
+        finalContentForMemory = finalContent
         callbacks?.onContent?.(finalContent)
         callbacks?.onComplete?.(finalContent, allToolResults)
         break
@@ -2046,9 +2913,35 @@ content: <h1>通知</h1><p>内容...</p>
         console.log('[Agent] 累积内容:', accumulatedContent?.substring(0, 200))
         console.log('[Agent] 最后响应:', lastResponse?.substring(0, 200))
         // 使用累积的内容或最后的响应
-        const finalContent = accumulatedContent || lastResponse || '任务已完成（达到最大步骤数）'
+        const finalContent = latestSummary || accumulatedContent || lastResponse || '任务已完成（达到最大步骤数）'
         console.log('[Agent] 最终内容:', finalContent?.substring(0, 200))
+        finalContentForMemory = finalContent
         callbacks?.onComplete?.(finalContent, allToolResults)
+      }
+
+      if (finalContentForMemory && memoryEnabled && window.electronAPI?.memoryAppend) {
+        try {
+          const entry = buildMemoryEntry(
+            cleanMessageForSend(content),
+            cleanMessageForSend(finalContentForMemory),
+            allToolResults,
+            memoryContext?.workspaceSummary
+          )
+          const maxChars = settings.memoryMaxChars || 2000
+          const trimmed = entry.length > maxChars ? entry.slice(0, maxChars) + '... (已截断)' : entry
+          await memoryAppend({
+            text: trimmed,
+            source: 'chat',
+            tags: ['L1'],
+          })
+          await memoryAppendSession({
+            sessionId: sessionIdRef.current,
+            text: trimmed,
+            meta: { workspaceKey, type: 'turn' },
+          })
+        } catch {
+          // ignore memory failures
+        }
       }
 
     } catch (error) {
@@ -2166,6 +3059,9 @@ ${recentText}
         isLoading,
         isCompleting,
         streamingContent,
+        streamingReasoning,
+        editPhase,
+        streamingSummary,
         settings,
         addMessage,
         updateLastMessage,

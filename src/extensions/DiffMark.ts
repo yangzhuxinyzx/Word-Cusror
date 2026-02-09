@@ -31,9 +31,6 @@ export const DiffOld = Mark.create({
       {
         tag: 'span[class="diff-old"]',
       },
-      {
-        style: 'text-decoration: line-through; background-color: #fecaca',
-      },
     ]
   },
 
@@ -43,7 +40,6 @@ export const DiffOld = Mark.create({
       'span',
       mergeAttributes(HTMLAttributes, {
         class: 'diff-old',
-        style: 'background-color: #fecaca; color: #b91c1c; text-decoration: line-through; padding: 1px 2px; border-radius: 2px;',
       }),
       0, // 0 表示内容将被放在这里
     ]
@@ -81,9 +77,6 @@ export const DiffNew = Mark.create({
       {
         tag: 'span[class="diff-new"]',
       },
-      {
-        style: 'background-color: #bbf7d0',
-      },
     ]
   },
 
@@ -93,7 +86,6 @@ export const DiffNew = Mark.create({
       'span',
       mergeAttributes(HTMLAttributes, {
         class: 'diff-new',
-        style: 'background-color: #bbf7d0; color: #15803d; padding: 1px 2px; border-radius: 2px;',
       }),
       0,
     ]

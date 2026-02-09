@@ -17,8 +17,8 @@ const MAX_ANIMATED_CHARS = 20
 export default function CinematicTyper({
   text,
   isStreaming,
-  baseSpeed = 1,
-  maxSpeed = 4,
+  baseSpeed = 3,   // 提高默认速度：每帧3个字符
+  maxSpeed = 12,   // 提高最大速度：积压时每帧12个字符
 }: CinematicTyperProps) {
   const [displayed, setDisplayed] = useState('')
   const [animatedChars, setAnimatedChars] = useState<AnimatedChar[]>([])
@@ -47,9 +47,10 @@ export default function CinematicTyper({
 
       let charsToTake = baseSpeed
       const backlog = queue.length
-      if (backlog > 80) charsToTake = maxSpeed
-      else if (backlog > 50) charsToTake = Math.min(maxSpeed, baseSpeed + 2)
-      else if (backlog > 30) charsToTake = Math.min(maxSpeed, baseSpeed + 1)
+      // 根据积压量动态调整速度，更积极地消费队列
+      if (backlog > 100) charsToTake = maxSpeed
+      else if (backlog > 50) charsToTake = Math.min(maxSpeed, baseSpeed + 6)
+      else if (backlog > 20) charsToTake = Math.min(maxSpeed, baseSpeed + 3)
 
       const chunk = queue.splice(0, charsToTake)
 
@@ -67,6 +68,11 @@ export default function CinematicTyper({
 
   useEffect(() => {
     if (!text) {
+      // 如果 text 变空，但队列中还有内容，继续处理队列
+      if (queueRef.current.length > 0 && processingRef.current) {
+        prevLengthRef.current = 0
+        return // 不重置，让队列继续处理
+      }
       setDisplayed('')
       setAnimatedChars([])
       queueRef.current = []
@@ -117,14 +123,6 @@ export default function CinematicTyper({
 
   return (
     <div className="cinematic-typer">
-      {showThinking && (
-        <div className="cinematic-thinking">
-          <span />
-          <span />
-          <span />
-          <span className="cinematic-thinking-text">AI 正在思考…</span>
-        </div>
-      )}
       {stableText}
       {animatedChars.map(({ char, id }) => (
         <span key={id} className="cinematic-char">

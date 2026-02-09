@@ -1,0 +1,19 @@
+/*
+ * ONLYOFFICE bundled fonts
+ *
+ * 实际的 @font-face 会在运行时由 `loadOnlyOfficeBundledFonts()` 注入，
+ * 这里保留一个稳定的 CSS 入口，便于以后改成静态生成。
+ */
+
+
+
+
+
+
+
+
+
+
+
+
+
