@@ -9,9 +9,10 @@ import { toChineseDefaultFallbackStack } from '../fonts/fontManifest'
 import { useComments } from './CommentContext'
 import { postProcessDocxWithAnnotations } from '../utils/docxExportWithTracking'
 // DSL 支持
-import type { DocDsl } from '../types/docDsl'
-import { validateDocDsl, dslToHtml } from '../utils/docDsl'
+import type { DocDsl, DslBlock, DslRun, DslInline, DslBlockMeta, DslRunMeta } from '../types/docDsl'
+import { validateDocDsl, dslToHtml, normalizeContent, extractPlainText } from '../utils/docDsl'
 import { dslToDocxBlob } from '../utils/docDslToDocx'
+import { htmlToDsl } from '../utils/htmlToDsl'
 
 // 将 ArrayBuffer 转换为 Base64（分块处理，避免大文件导致栈溢出）
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -47,7 +48,12 @@ interface ReplaceResult {
   message: string
   searchText?: string
   replaceText?: string
-  positions?: number[]  // 替换发生的位置索引
+  positions?: number[]  // match positions in plain-text projection
+  debug?: {
+    reasonCode: 'not_found' | 'empty_search' | 'already_applied'
+    effectiveSearch?: string
+    hints?: string[]
+  }
 }
 
 // 单个替换记录
@@ -178,6 +184,9 @@ interface DocumentContextType {
   replaceInDocument: (search: string, replace: string, reviewMeta?: { reason?: string; type?: string }) => ReplaceResult
   insertInDocument: (position: string, content: string) => { success: boolean; message: string }
   deleteInDocument: (target: string) => { success: boolean; count: number; message: string }
+  replaceViaDsl: (search: string, replace: string, options?: { blockIndex?: number; format?: Partial<import('../types/docDsl').DslRun> }) => { success: boolean; count: number; message: string }
+  insertViaDsl: (position: string, dslBlocks: import('../types/docDsl').DslBlock[]) => { success: boolean; message: string }
+  deleteViaDsl: (target: string, options?: { blockIndex?: number }) => { success: boolean; count: number; message: string }
   scrollToText: (text: string) => void  // 滚动到指定文本
   confirmReplacement: () => void  // 确认替换
   rejectReplacement: () => void   // 拒绝替换
@@ -678,6 +687,28 @@ async function createDocxBlob(content: string, title: string, typographyProfile?
     return undefined
   }
 
+  // 字体槽位分离：CJK 字体放 eastAsia，Latin 字体放 ascii/hAnsi
+  const CJK_FONT_SET = new Set([
+    '宋体', '黑体', '仿宋', '楷体', '微软雅黑', '华文中宋', '华文仿宋',
+    '华文楷体', '华文宋体', '华文细黑', '方正小标宋简体', '方正仿宋简体',
+    'SimSun', 'SimHei', 'FangSong', 'KaiTi', 'Microsoft YaHei',
+    'STZhongsong', 'STFangsong', 'STKaiti', 'STSong', 'STXihei',
+  ])
+  const LATIN_FONT_SET = new Set([
+    'Times New Roman', 'Arial', 'Calibri', 'Cambria', 'Georgia',
+    'Verdana', 'Tahoma', 'Trebuchet MS', 'Garamond', 'Palatino Linotype',
+    'Book Antiqua', 'Century', 'Consolas', 'Courier New', 'Segoe UI',
+  ])
+  const resolveFontSlots = (name: string): { ascii: string; hAnsi: string; eastAsia: string } => {
+    const n = name.trim()
+    const isCjk = CJK_FONT_SET.has(n) || /[\u4e00-\u9fff]/.test(n) || /^(ST|MS |Noto Sans (SC|TC|JP|KR)|Source Han)/i.test(n)
+    if (isCjk) {
+      return { ascii: 'Times New Roman', hAnsi: 'Times New Roman', eastAsia: n }
+    }
+    const latin = LATIN_FONT_SET.has(n) ? n : 'Times New Roman'
+    return { ascii: latin, hAnsi: latin, eastAsia: '仿宋' }
+  }
+
   const parseStyle = (style: string) => {
     const s = style || ''
     const get = (name: string) => {
@@ -794,7 +825,7 @@ async function createDocxBlob(content: string, title: string, typographyProfile?
         const fontFamily = parsed.fontFamily
           ? parsed.fontFamily.split(',')[0].replace(/['"]/g, '').trim()
           : ''
-        if (fontFamily) next.font = { ascii: fontFamily, hAnsi: fontFamily, eastAsia: fontFamily }
+        if (fontFamily) next.font = resolveFontSlots(fontFamily)
         const pt = parseCssFontSizePt(parsed.fontSize || '')
         if (pt) next.size = Math.round(pt * 2)
       }
@@ -1615,6 +1646,14 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
             setFiles(convertFiles(folderResult.data))
           }
 
+          // 给所有块加 diff 标记（绿色高亮），让用户可以审查后确认
+          const diffId = `diff-create-${Date.now()}`
+          for (const block of dsl.blocks) {
+            if ('_meta' in block || block.type === 'heading' || block.type === 'paragraph') {
+              (block as any)._meta = { diffRole: 'new' as const, diffId }
+            }
+          }
+
           // 生成 HTML 预览用于编辑器
           const htmlContent = dslToHtml(dsl)
 
@@ -1636,6 +1675,19 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           setDocxData(null)
           setExcelData(null)
           setHasUnsavedChanges(false)
+
+          // 注册为待确认修改，让 accept/reject 按钮出现
+          const blockCount = dsl.blocks.length
+          setPendingReplacements(prev => ({
+            items: [...prev.items, {
+              id: diffId,
+              searchText: '',
+              replaceText: `[创建文档: ${fileName}]`,
+              count: blockCount,
+              timestamp: Date.now(),
+            }],
+            total: prev.total + blockCount,
+          }))
 
           return { success: true, message: `已创建文档: ${fileName}`, filePath }
         } else {
@@ -1935,7 +1987,8 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       const ext = currentFile.name.split('.').pop()?.toLowerCase()
       
       if (ext === 'docx') {
-        const sourceHtml = documentContentRef.current || document.content
+        const sourceHtmlRaw = documentContentRef.current || document.content
+        const sourceHtml = stripDiffMarkupForExport(sourceHtmlRaw)
         const blob = await createDocxBlob(sourceHtml, document.title, typographyProfile)
         let arrayBuffer = await blob.arrayBuffer()
 
@@ -1971,7 +2024,8 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       fileContentCacheRef.current.delete(currentFile.path)
       setHasUnsavedChanges(false)
     } else {
-      const sourceHtml = documentContentRef.current || document.content
+      const sourceHtmlRaw = documentContentRef.current || document.content
+      const sourceHtml = stripDiffMarkupForExport(sourceHtmlRaw)
       const blob = await createDocxBlob(sourceHtml, document.title, typographyProfile)
       let arrayBuffer = await blob.arrayBuffer()
 
@@ -2082,7 +2136,8 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         setLastReplacement(null)
         setHasUnsavedChanges(true)
       }
-      const sourceHtml = documentContentRef.current || document.content
+      const sourceHtmlRaw = documentContentRef.current || document.content
+      const sourceHtml = stripDiffMarkupForExport(sourceHtmlRaw)
       const blob = await createDocxBlob(sourceHtml, document.title, typographyProfile)
       let arrayBuffer = await blob.arrayBuffer()
 
@@ -2114,6 +2169,102 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
   }, [currentFile, document, saveCurrentFile, pendingReplacements.total, extraPendingChanges, typographyProfile, commentsForExport])
 
   // Agent 静默保存：将当前编辑器内容写回 .docx 文件（无弹窗）
+  // Strip unresolved diff markup before writing or exporting docx.
+  const stripDiffMarkupForExport = useCallback((html: string): string => {
+    if (!html) return html
+    if (!html.includes('diff-old') && !html.includes('diff-new') && !html.includes('data-diff-role') && !html.includes('data-diff-id')) {
+      return html
+    }
+
+    const unwrapNode = (node: Element) => {
+      const parent = node.parentNode
+      if (!parent) return
+      while (node.firstChild) {
+        parent.insertBefore(node.firstChild, node)
+      }
+      parent.removeChild(node)
+    }
+
+    const stripDiffStyles = (el: HTMLElement) => {
+      const style = el.getAttribute('style')
+      if (!style || !/(fecaca|bbf7d0|c8e6c9|b91c1c|15803d|line-through)/i.test(style)) {
+        return
+      }
+
+      const cleanedDeclarations = style
+        .split(';')
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .filter((declaration) => {
+          const [rawName, rawValue = ''] = declaration.split(':')
+          const name = rawName.trim().toLowerCase()
+          const value = rawValue.trim().toLowerCase()
+
+          if (name === 'text-decoration' && value.includes('line-through')) return false
+          if (name === 'background-color' && /(fecaca|bbf7d0|c8e6c9|rgb\(254\s*,\s*202\s*,\s*202\)|rgb\(187\s*,\s*247\s*,\s*208\)|rgb\(200\s*,\s*230\s*,\s*201\))/.test(value)) return false
+          if (name === 'color' && /(b91c1c|15803d|rgb\(185\s*,\s*28\s*,\s*28\)|rgb\(21\s*,\s*128\s*,\s*61\))/.test(value)) return false
+          if (name === 'padding' && /(1px\s+2px|0\s+2px)/.test(value)) return false
+          if (name === 'border-radius' && value === '2px') return false
+          return true
+        })
+
+      if (cleanedDeclarations.length > 0) {
+        el.setAttribute('style', cleanedDeclarations.join('; '))
+      } else {
+        el.removeAttribute('style')
+      }
+    }
+
+    try {
+      const parser = new DOMParser()
+      const doc = parser.parseFromString(html, 'text/html')
+
+      doc.querySelectorAll<HTMLElement>('.diff-old').forEach((el) => el.remove())
+
+      doc.querySelectorAll<HTMLElement>('.diff-new').forEach((el) => {
+        if (el.tagName.toLowerCase() === 'span') {
+          unwrapNode(el)
+          return
+        }
+        el.classList.remove('diff-new')
+        stripDiffStyles(el)
+      })
+
+      doc.querySelectorAll<HTMLElement>('[data-diff-role="old"]').forEach((el) => el.remove())
+
+      doc.querySelectorAll<HTMLElement>('[data-diff-role="new"]').forEach((el) => {
+        const tag = el.tagName.toLowerCase()
+        el.removeAttribute('data-diff-id')
+        el.removeAttribute('data-diff-role')
+        el.removeAttribute('data-diff-kind')
+        el.classList.remove('diff-old', 'diff-new')
+        stripDiffStyles(el)
+
+        if (tag === 'span') {
+          unwrapNode(el)
+        }
+      })
+
+      doc.querySelectorAll<HTMLElement>('[data-diff-id]').forEach((el) => {
+        el.removeAttribute('data-diff-id')
+        el.removeAttribute('data-diff-role')
+        el.removeAttribute('data-diff-kind')
+        el.classList.remove('diff-old', 'diff-new')
+        stripDiffStyles(el)
+      })
+
+      return doc.body.innerHTML
+    } catch (error) {
+      console.warn('[silentSaveToFile] diff cleanup failed, fallback to regex:', error)
+      return html
+        .replace(/<span class="diff-old"[^>]*>[\s\S]*?<\/span>/g, '')
+        .replace(/<span class="diff-new"[^>]*>([\s\S]*?)<\/span>/g, '$1')
+        .replace(/\sdata-diff-id="[^"]*"/g, '')
+        .replace(/\sdata-diff-role="[^"]*"/g, '')
+        .replace(/\sdata-diff-kind="[^"]*"/g, '')
+    }
+  }, [])
+
   const silentSaveToFile = useCallback(async (): Promise<{ success: boolean; error?: string }> => {
     if (!currentFile || !isElectron || !window.electronAPI?.writeBinaryFile) {
       return { success: false, error: '无当前文件或非 Electron 环境' }
@@ -2123,7 +2274,8 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       return { success: false, error: `不支持的文件类型: ${ext}` }
     }
     try {
-      const sourceHtml = documentContentRef.current || document.content
+      const sourceHtmlRaw = documentContentRef.current || document.content
+      const sourceHtml = stripDiffMarkupForExport(sourceHtmlRaw)
       const blob = await createDocxBlob(sourceHtml, document.title, typographyProfile)
       const arrayBuffer = await blob.arrayBuffer()
       const base64 = arrayBufferToBase64(arrayBuffer)
@@ -2136,7 +2288,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       return { success: false, error: (e as Error).message }
     }
-  }, [currentFile, document, isElectron, typographyProfile])
+  }, [currentFile, document, isElectron, typographyProfile, stripDiffMarkupForExport])
 
   // AI 编辑应用
   const applyAIEdit = useCallback((newContent: string) => {
@@ -2150,19 +2302,105 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
   }, [])
 
   // 获取 Tiptap 文档的格式化结构信息（供 AI 参考）
+  // 输出纯文本 + 格式标注，不含 HTML 标签，确保 AI 用纯文本搜索
   const getTiptapDocumentStructure = useCallback((): string => {
     const content = document.content
     if (!content) return ''
     
-    // 解析 HTML 获取结构信息
     const parser = new DOMParser()
     const doc = parser.parseFromString(content, 'text/html')
     
     const elements: string[] = []
-    elements.push('【文档结构 - 可用于精确替换的文字】')
-    elements.push('⚠️ 替换时 search 必须与下面引号内的文字完全一致！\n')
+    elements.push('【文档内容与格式】')
+    elements.push('说明：引号内为精确文字（用于 search），方括号内为格式信息。\n')
     
-    // 处理表格 - 单独提取，显示每个单元格
+    // 从元素提取简化字体名（去掉 fallback 列表，只取第一个）
+    const simplifyFont = (raw: string): string => {
+      if (!raw) return ''
+      // "仿宋, STFANGSO, FanSong, \"Fangsong SC\", serif" → "仿宋"
+      const first = raw.split(',')[0].trim().replace(/["']/g, '')
+      return first
+    }
+    
+    // 从一个元素收集格式信息
+    const collectFormat = (el: HTMLElement): string[] => {
+      const info: string[] = []
+      const style = el.getAttribute('style') || ''
+      const tag = el.tagName.toLowerCase()
+      
+      // 字体
+      const fontFamily = style.match(/font-family:\s*([^;]+)/)?.[1] || ''
+      if (fontFamily) info.push(simplifyFont(fontFamily))
+      
+      // 字号
+      const fontSize = style.match(/font-size:\s*([^;]+)/)?.[1]?.trim() || ''
+      if (fontSize) info.push(fontSize)
+      
+      // 粗体
+      if (tag === 'strong' || tag === 'b' || style.includes('font-weight: bold') || style.includes('font-weight:bold')) info.push('粗体')
+      // 斜体
+      if (tag === 'em' || tag === 'i' || style.includes('font-style: italic')) info.push('斜体')
+      // 下划线
+      if (tag === 'u' || (style.includes('text-decoration') && style.includes('underline'))) info.push('下划线')
+      // 删除线
+      if (tag === 's' || tag === 'del' || (style.includes('text-decoration') && style.includes('line-through'))) info.push('删除线')
+      
+      // 颜色（排除 inherit/transparent）
+      const colorMatch = style.match(/(?:^|[^-])color:\s*([^;]+)/)?.[1]?.trim() || ''
+      if (colorMatch && colorMatch !== 'inherit' && colorMatch !== 'transparent' && !colorMatch.startsWith('var(')) info.push(`颜色:${colorMatch}`)
+      
+      // 背景色
+      const bgColor = style.match(/background-color:\s*([^;]+)/)?.[1]?.trim() || ''
+      if (bgColor && bgColor !== 'transparent' && !bgColor.startsWith('var(')) info.push(`背景:${bgColor}`)
+      
+      // 对齐
+      const alignment = style.match(/text-align:\s*(\w+)/)?.[1] || ''
+      if (alignment && alignment !== 'left') info.push(alignment === 'center' ? '居中' : alignment === 'right' ? '右对齐' : alignment === 'justify' ? '两端对齐' : alignment)
+      
+      // 缩进
+      const textIndent = style.match(/text-indent:\s*([^;]+)/)?.[1]?.trim() || ''
+      if (textIndent && textIndent !== '0' && textIndent !== '0px') info.push(`缩进:${textIndent}`)
+      
+      // 行距
+      const lineHeight = style.match(/line-height:\s*([^;]+)/)?.[1]?.trim() || ''
+      if (lineHeight && lineHeight !== 'normal') info.push(`行距:${lineHeight}`)
+      
+      return info
+    }
+    
+    // 提取段内混合格式：当 <p> 内有多个不同格式的 <span> 时拆分标注
+    const extractInlineRuns = (el: HTMLElement): string => {
+      const spans = el.querySelectorAll(':scope > span, :scope > strong, :scope > b, :scope > em, :scope > i, :scope > u')
+      if (spans.length <= 1) {
+        // 只有一个或没有 span，整段统一格式
+        return ''
+      }
+      
+      // 检查是否有不同格式
+      const runs: { format: string[]; text: string }[] = []
+      let hasVariation = false
+      let prevFormatKey = ''
+      
+      for (const span of Array.from(spans)) {
+        const text = span.textContent?.trim() || ''
+        if (!text) continue
+        const fmt = collectFormat(span as HTMLElement)
+        const fmtKey = fmt.join(',')
+        if (prevFormatKey && fmtKey !== prevFormatKey) hasVariation = true
+        prevFormatKey = fmtKey
+        runs.push({ format: fmt, text })
+      }
+      
+      if (!hasVariation || runs.length <= 1) return ''
+      
+      // 有格式变化：输出分段标注
+      return runs.map(r => {
+        const fmtStr = r.format.length > 0 ? `[${r.format.join(',')}]` : ''
+        return `${fmtStr}"${r.text}"`
+      }).join(' + ')
+    }
+    
+    // 处理表格
     const processTable = (table: HTMLTableElement, tableIndex: number) => {
       const rows = table.querySelectorAll('tr')
       const colCount = rows[0]?.querySelectorAll('td, th').length || 0
@@ -2173,18 +2411,19 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         cells.forEach((cell, colIdx) => {
           const cellText = cell.textContent?.trim() || ''
           if (cellText) {
-            // 获取单元格样式
-            const style = (cell as HTMLElement).getAttribute('style') || ''
-            const isBold = cell.querySelector('strong, b') !== null || style.includes('font-weight: bold')
-            const bgColor = style.match(/background-color:\s*([^;]+)/)?.[1] || ''
-            const borderInfo = style.includes('border') ? '有边框' : ''
-            
-            const formatInfo = []
-            if (isBold) formatInfo.push('粗体')
-            if (bgColor) formatInfo.push(`背景:${bgColor}`)
-            if (borderInfo) formatInfo.push(borderInfo)
-            
-            const formatStr = formatInfo.length > 0 ? ` [${formatInfo.join(',')}]` : ''
+            const cellEl = cell as HTMLElement
+            const fmt = collectFormat(cellEl)
+            // 也检查单元格内的 span/strong
+            const innerBold = cell.querySelector('strong, b')
+            if (innerBold && !fmt.includes('粗体')) fmt.push('粗体')
+            const innerSpan = cell.querySelector('span')
+            if (innerSpan) {
+              const spanFmt = collectFormat(innerSpan as HTMLElement)
+              for (const f of spanFmt) {
+                if (!fmt.includes(f)) fmt.push(f)
+              }
+            }
+            const formatStr = fmt.length > 0 ? ` [${fmt.join(',')}]` : ''
             elements.push(`   [${rowIdx+1},${colIdx+1}]${formatStr}: "${cellText}"`)
           }
         })
@@ -2205,49 +2444,73 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           return
         }
         
-        // 获取样式信息
-        const style = el.getAttribute('style') || ''
-        const isBold = tag === 'strong' || tag === 'b' || style.includes('font-weight: bold')
-        const isItalic = tag === 'em' || tag === 'i' || style.includes('font-style: italic')
-        const isUnderline = tag === 'u' || style.includes('text-decoration') && style.includes('underline')
-        const alignment = style.match(/text-align:\s*(\w+)/)?.[1] || ''
-        const fontSize = style.match(/font-size:\s*([^;]+)/)?.[1] || ''
-        const fontFamily = style.match(/font-family:\s*([^;]+)/)?.[1] || ''
-        const color = style.match(/(?:^|[^-])color:\s*([^;]+)/)?.[1] || ''
-        
-        if (tag === 'h1') {
-          const text = el.textContent?.trim() || ''
-          if (text) elements.push(`📌 标题1 [居中,大字]: "${text}"`)
-        } else if (tag === 'h2') {
-          const text = el.textContent?.trim() || ''
-          if (text) elements.push(`📌 标题2: "${text}"`)
-        } else if (tag === 'h3') {
-          const text = el.textContent?.trim() || ''
-          if (text) elements.push(`📌 标题3: "${text}"`)
-        } else if (tag === 'p') {
+        // 标题：提取实际格式（字体/字号/对齐等）
+        if (tag === 'h1' || tag === 'h2' || tag === 'h3' || tag === 'h4') {
           const text = el.textContent?.trim() || ''
           if (text) {
-            const formatInfo = []
-            if (isBold) formatInfo.push('粗体')
-            if (isItalic) formatInfo.push('斜体')
-            if (isUnderline) formatInfo.push('下划线')
-            if (alignment && alignment !== 'left') formatInfo.push(alignment)
-            if (fontSize) formatInfo.push(`字号:${fontSize}`)
-            if (color) formatInfo.push(`颜色:${color}`)
-            const formatStr = formatInfo.length > 0 ? ` [${formatInfo.join(',')}]` : ''
+            const level = tag.charAt(1)
+            const fmt = collectFormat(el)
+            // 也检查标题内部的 span 格式
+            const innerSpan = el.querySelector('span')
+            if (innerSpan) {
+              const spanFmt = collectFormat(innerSpan as HTMLElement)
+              for (const f of spanFmt) {
+                if (!fmt.includes(f)) fmt.push(f)
+              }
+            }
+            const formatStr = fmt.length > 0 ? ` [${fmt.join(',')}]` : ''
+            elements.push(`📌 标题${level}${formatStr}: "${text}"`)
+          }
+        } else if (tag === 'p') {
+          const text = el.textContent?.trim() || ''
+          if (!text) return // 空段落跳过
+          
+          // 检查段内混合格式
+          const inlineRuns = extractInlineRuns(el)
+          if (inlineRuns) {
+            // 段落级格式（对齐/缩进/行距）
+            const paraFmt: string[] = []
+            const style = el.getAttribute('style') || ''
+            const alignment = style.match(/text-align:\s*(\w+)/)?.[1] || ''
+            if (alignment && alignment !== 'left') paraFmt.push(alignment === 'center' ? '居中' : alignment === 'right' ? '右对齐' : alignment)
+            const textIndent = style.match(/text-indent:\s*([^;]+)/)?.[1]?.trim() || ''
+            if (textIndent && textIndent !== '0' && textIndent !== '0px') paraFmt.push(`缩进:${textIndent}`)
+            const paraFmtStr = paraFmt.length > 0 ? ` [${paraFmt.join(',')}]` : ''
+            elements.push(`📝 段落${paraFmtStr}: ${inlineRuns}`)
+          } else {
+            // 统一格式段落
+            const fmt = collectFormat(el)
+            // 如果段落本身没字体信息，检查内部第一个 span
+            const innerSpan = el.querySelector('span')
+            if (innerSpan) {
+              const spanFmt = collectFormat(innerSpan as HTMLElement)
+              for (const f of spanFmt) {
+                if (!fmt.includes(f)) fmt.push(f)
+              }
+            }
+            const formatStr = fmt.length > 0 ? ` [${fmt.join(',')}]` : ''
             elements.push(`📝 段落${formatStr}: "${text}"`)
           }
         } else if (tag === 'table') {
           processTable(el as HTMLTableElement, tableIndex++)
           processedTables.add(el as HTMLTableElement)
-          return // 不再递归处理表格内部
+          return
         } else if (tag === 'ul') {
           const items = el.querySelectorAll(':scope > li')
           if (items.length > 0) {
             elements.push(`📋 无序列表 (${items.length}项):`)
-            items.forEach((item, i) => {
-              const text = item.textContent?.trim() || ''
-              if (text) elements.push(`   • "${text}"`)
+            items.forEach((_item, _i) => {
+              const text = _item.textContent?.trim() || ''
+              if (text) {
+                const fmt = collectFormat(_item as HTMLElement)
+                const innerSpan = _item.querySelector('span')
+                if (innerSpan) {
+                  const spanFmt = collectFormat(innerSpan as HTMLElement)
+                  for (const f of spanFmt) { if (!fmt.includes(f)) fmt.push(f) }
+                }
+                const fmtStr = fmt.length > 0 ? ` [${fmt.join(',')}]` : ''
+                elements.push(`   •${fmtStr} "${text}"`)
+              }
             })
           }
           return
@@ -2255,12 +2518,34 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           const items = el.querySelectorAll(':scope > li')
           if (items.length > 0) {
             elements.push(`📋 有序列表 (${items.length}项):`)
-            items.forEach((item, i) => {
-              const text = item.textContent?.trim() || ''
-              if (text) elements.push(`   ${i+1}. "${text}"`)
+            items.forEach((_item, _i) => {
+              const text = _item.textContent?.trim() || ''
+              if (text) {
+                const fmt = collectFormat(_item as HTMLElement)
+                const innerSpan = _item.querySelector('span')
+                if (innerSpan) {
+                  const spanFmt = collectFormat(innerSpan as HTMLElement)
+                  for (const f of spanFmt) { if (!fmt.includes(f)) fmt.push(f) }
+                }
+                const fmtStr = fmt.length > 0 ? ` [${fmt.join(',')}]` : ''
+                elements.push(`   ${_i+1}.${fmtStr} "${text}"`)
+              }
             })
           }
           return
+        } else if (tag === 'img') {
+          // 图片占位
+          const alt = el.getAttribute('alt') || ''
+          const width = el.getAttribute('width') || el.style.width || ''
+          const height = el.getAttribute('height') || el.style.height || ''
+          const sizeInfo = width || height ? ` ${width}×${height}` : ''
+          elements.push(`🖼️ 图片${sizeInfo}${alt ? ` (${alt})` : ''}`)
+          return
+        } else if (tag === 'hr') {
+          elements.push('--- 分割线 ---')
+          return
+        } else if (tag === 'br') {
+          return // 换行不需要额外标注
         }
       }
       
@@ -2270,16 +2555,10 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     
     walkNodes(doc.body)
     
-    elements.push('\n【格式说明】')
-    elements.push('- 替换时，search 参数必须从上面的引号内复制精确文字')
-    elements.push('- 创建文档时可用的 HTML 格式：')
-    elements.push('  - 标题: <h1>标题1</h1>, <h2>标题2</h2>, <h3>标题3</h3>')
-    elements.push('  - 粗体: <strong>粗体文字</strong> 或 <b>粗体</b>')
-    elements.push('  - 斜体: <em>斜体文字</em> 或 <i>斜体</i>')
-    elements.push('  - 下划线: <u>下划线文字</u>')
-    elements.push('  - 居中: <p style="text-align: center">居中文字</p>')
-    elements.push('  - 颜色: <span style="color: red">红色文字</span>')
-    elements.push('  - 表格: <table><tr><td>单元格1</td><td>单元格2</td></tr></table>')
+    elements.push('\n【工具使用提示】')
+    elements.push('- search 参数必须使用引号内的精确纯文本，不要包含 HTML 标签或格式代码')
+    elements.push('- 方括号内的格式信息仅供参考，修改格式请用工具的格式参数（bold/fontSize/fontFamily/color 等）')
+    elements.push('- 如需修改格式但不改文字，可用 word_edit_ops 工具的 format_text / format_paragraph')
     
     return elements.join('\n')
   }, [document.content])
@@ -2294,9 +2573,16 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       return { success: false, count: 0, message: '搜索内容不能为空' }
     }
 
+    // 保护：search 和 replace 纯文本相同时跳过（避免无意义的 diff 标记）
+    const stripHtml = (s: string) => s.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()
+    if (stripHtml(search) === stripHtml(replace)) {
+      console.log(`[replaceInDocument] 跳过：search 与 replace 内容相同`)
+      return { success: true, count: 0, message: '内容相同，无需替换' }
+    }
+
     // 使用 ref 获取最新的文档内容（解决连续替换时闭包问题）
     const content = documentContentRef.current
-    
+
     console.log(`[replaceInDocument] 搜索: "${search.slice(0, 30)}..." 替换为: "${replace.slice(0, 30)}..."`)
     console.log(`[replaceInDocument] 当前内容长度: ${content.length}`)
     
@@ -2306,26 +2592,42 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     // 创建智能匹配正则 - 忽略 HTML 标签内部的匹配
     // 先尝试精确匹配，但要排除已有 diff 标记内的文字
     // 移除 diff 标记后的内容用于匹配（使用非贪婪匹配 [^<]* 代替 .*? 避免灾难性回溯）
-    const contentWithoutDiff = content.replace(/<span class="diff-(old|new)" data-diff-id="[^"]*"[^>]*>[^<]*<\/span>/g, '')
-    
+    const unwrapWrappedQuotes = (value: string): string => {
+      const trimmed = (value || '').trim()
+      if (
+        (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+        (trimmed.startsWith("'") && trimmed.endsWith("'"))
+      ) {
+        return trimmed.slice(1, -1).trim()
+      }
+      return value
+    }
+
+    // Common failure mode: model wraps search text with quotes.
+    const effectiveSearch = unwrapWrappedQuotes(search)
+
+    // Match against what user currently sees: remove old diff, keep new diff.
+    const contentForMatch = content
+      .replace(/<span class="diff-old"[^>]*>[\s\S]*?<\/span>/g, '')
+      .replace(/<span class="diff-new"[^>]*>([\s\S]*?)<\/span>/g, '$1')
+
     let positions: number[] = []
     let match
-    
-    // 统计纯文本中的匹配（忽略 HTML 标签）
-    const textContent = contentWithoutDiff.replace(/<[^>]+>/g, '')
-    const textRegex = new RegExp(escapeRegex(search), 'g')
+
+    const textContent = contentForMatch.replace(/<[^>]+>/g, '')
+    const textRegex = new RegExp(escapeRegex(effectiveSearch), 'g')
     while ((match = textRegex.exec(textContent)) !== null) {
       positions.push(match.index)
     }
-    
+
     let count = positions.length
     let useFuzzy = false
-    
-    // 如果精确匹配没找到，尝试模糊匹配（忽略空格差异）
+
+    // Fallback: ignore whitespace differences.
     if (count === 0) {
-      const fuzzySearch = search.replace(/\s+/g, '\\s*')
+      const fuzzySearch = effectiveSearch.replace(/\s+/g, '\\s*')
       positions = []
-      
+
       const fuzzyTextRegex = new RegExp(fuzzySearch, 'g')
       while ((match = fuzzyTextRegex.exec(textContent)) !== null) {
         positions.push(match.index)
@@ -2335,23 +2637,52 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     }
 
     if (count === 0) {
-      // 提供更有帮助的错误信息
-      const preview = search.length > 30 ? search.substring(0, 30) + '...' : search
-      console.log(`[replaceInDocument] ❌ 未找到: "${preview}"`)
-      console.log(`[replaceInDocument] 纯文本内容片段: "${textContent.slice(0, 200)}..."`)
-      return { 
-        success: false, 
-        count: 0, 
-        message: `未找到「${preview}」，请检查文字是否完全一致（包括标点和空格）` 
+      const preview = effectiveSearch.length > 30 ? effectiveSearch.substring(0, 30) + '...' : effectiveSearch
+      const hints: string[] = []
+
+      if (effectiveSearch !== search) {
+        hints.push('检测到 search 外层引号，已自动去除后重试。')
+      }
+
+      const condensedSearch = effectiveSearch.replace(/\s+/g, '')
+      const condensedText = textContent.replace(/\s+/g, '')
+      if (condensedSearch && condensedText.includes(condensedSearch)) {
+        hints.push('忽略空白后可匹配，可能存在换行或空格差异。')
+      }
+
+      const probe = condensedSearch.slice(0, Math.min(condensedSearch.length, 8))
+      if (probe.length >= 2) {
+        const probePos = condensedText.indexOf(probe)
+        if (probePos >= 0) {
+          const excerptStart = Math.max(0, probePos - 12)
+          const excerptEnd = Math.min(condensedText.length, probePos + probe.length + 20)
+          const excerpt = condensedText.slice(excerptStart, excerptEnd)
+          hints.push(`文档中有近似片段：${excerpt}`)
+        }
+      }
+
+      const hintMessage = hints.length
+        ? `；诊断：${hints.join('；')}`
+        : ''
+
+      console.log(`[replaceInDocument] not found: "${preview}" (text length:${textContent.length})`)
+      return {
+        success: false,
+        count: 0,
+        message: `未找到「${preview}」，请检查文字是否完全一致（包括标点和空格）${hintMessage}`,
+        debug: {
+          reasonCode: 'not_found',
+          effectiveSearch,
+          hints,
+        },
       }
     }
-    
-    console.log(`[replaceInDocument] ✓ 找到 ${count} 处匹配`)
 
-    // 为这次替换生成唯一 ID
+    console.log(`[replaceInDocument] matched ${count} occurrence(s)`)
+
+    // Generate a unique diff id for this operation.
     const diffId = generateDiffId()
-    
-    // 从 HTML 片段中提取格式标签
+
     const extractFormatTags = (htmlFragment: string): { openTags: string[]; closeTags: string[] } => {
       const openTags: string[] = []
       const closeTags: string[] = []
@@ -2371,27 +2702,57 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       return { openTags, closeTags }
     }
     
-    // 创建带唯一 ID 的 Diff 标记（保留原有格式）
+    // 创建带唯一 ID 的 Diff 标记（细粒度：只标记实际变化的字词）
     const createDiffHtml = (oldText: string, newText: string, originalHtml: string) => {
-      // 将换行符转换为 <br> 标签，确保在 HTML 中正确显示
       const formatText = (text: string) => text.replace(/\n/g, '<br>')
-      
+
       // 提取原有格式标签
       const { openTags, closeTags } = extractFormatTags(originalHtml)
       const openTagsStr = openTags.join('')
       const closeTagsStr = closeTags.join('')
-      
-      // 保留原有 HTML 中的格式标签用于旧内容显示
-      // 新内容也应用相同的格式标签
-      const formattedOld = originalHtml // 保留原有 HTML 结构
-      const formattedNew = openTagsStr + formatText(newText) + closeTagsStr
-      
-      return `<span class="diff-old" data-diff-id="${diffId}" style="background-color: #fecaca; color: #b91c1c; text-decoration: line-through; padding: 1px 2px; border-radius: 2px;">${formattedOld}</span><span class="diff-new" data-diff-id="${diffId}" style="background-color: #bbf7d0; color: #15803d; padding: 1px 2px; border-radius: 2px;">${formattedNew}</span>`
+
+      // 细粒度 diff：找出公共前缀和后缀，只标记中间变化的部分
+      let prefixLen = 0
+      const minLen = Math.min(oldText.length, newText.length)
+      while (prefixLen < minLen && oldText[prefixLen] === newText[prefixLen]) {
+        prefixLen++
+      }
+
+      let suffixLen = 0
+      while (
+        suffixLen < (minLen - prefixLen) &&
+        oldText[oldText.length - 1 - suffixLen] === newText[newText.length - 1 - suffixLen]
+      ) {
+        suffixLen++
+      }
+
+      const commonPrefix = oldText.slice(0, prefixLen)
+      const commonSuffix = suffixLen > 0 ? oldText.slice(oldText.length - suffixLen) : ''
+      const oldDiff = oldText.slice(prefixLen, oldText.length - suffixLen)
+      const newDiff = newText.slice(prefixLen, newText.length - suffixLen)
+
+      // 如果变化部分为空（完全相同），不生成 diff 标记
+      if (!oldDiff && !newDiff) {
+        return originalHtml
+      }
+
+      // 构建细粒度 diff HTML
+      const parts: string[] = []
+      if (commonPrefix) parts.push(formatText(commonPrefix))
+      if (oldDiff) {
+        parts.push(`<span class="diff-old" data-diff-id="${diffId}" style="background-color: #fecaca; color: #b91c1c; text-decoration: line-through; padding: 1px 2px; border-radius: 2px;">${formatText(oldDiff)}</span>`)
+      }
+      if (newDiff) {
+        parts.push(`<span class="diff-new" data-diff-id="${diffId}" style="background-color: #bbf7d0; color: #15803d; padding: 1px 2px; border-radius: 2px;">${formatText(newDiff)}</span>`)
+      }
+      if (commonSuffix) parts.push(formatText(commonSuffix))
+
+      return openTagsStr + parts.join('') + closeTagsStr
     }
     
     // 分段替换策略：将内容按照已有的 diff 标记分割，只在非 diff 区域进行替换
     // 这样可以保留之前的修改标注（使用 [^<]* 代替 .*? 避免灾难性回溯）
-    const diffPattern = /<span class="diff-(old|new)" data-diff-id="[^"]*"[^>]*>[^<]*<\/span>/g
+    const diffPattern = /<span class="diff-(old|new)" data-diff-id="[^"]*"[^>]*>[\s\S]*?<\/span>/g
     
     // 找出所有已有的 diff 标记的位置
     const diffMatches: { start: number; end: number; content: string }[] = []
@@ -2406,9 +2767,10 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     
     // 智能替换逻辑 - 支持跨 HTML 标签的文本匹配
     let newContent = content
+    let appliedCount = 0
     
     // 核心函数：在 HTML 中查找并替换文本（忽略标签，但保留格式）
-    const replaceTextInHtml = (html: string, searchText: string, createReplacement: (matchedText: string, originalHtml: string) => string): string => {
+    const replaceTextInHtml = (html: string, searchText: string, createReplacement: (matchedText: string, originalHtml: string) => string): { html: string; replacedCount: number } => {
       // 将 HTML 分解为文本节点和标签
       const parts: { type: 'text' | 'tag'; content: string; index: number }[] = []
       let lastIndex = 0
@@ -2450,7 +2812,9 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         matches.push({ start: m.index, end: m.index + m[0].length, text: m[0] })
       }
       
-      if (matches.length === 0) return html
+      if (matches.length === 0) {
+        return { html, replacedCount: 0 }
+      }
       
       // 从后向前替换（避免索引偏移问题）
       let result = html
@@ -2471,12 +2835,14 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         result = result.slice(0, htmlStart) + replacement + result.slice(htmlEnd)
       }
       
-      return result
+      return { html: result, replacedCount: matches.length }
     }
     
     if (diffMatches.length === 0) {
       // 没有已有标记，直接替换（保留原有格式）
-      newContent = replaceTextInHtml(content, search, (matchedText, originalHtml) => createDiffHtml(matchedText, replace, originalHtml))
+      const replaced = replaceTextInHtml(content, effectiveSearch, (matchedText, originalHtml) => createDiffHtml(matchedText, replace, originalHtml))
+      newContent = replaced.html
+      appliedCount = replaced.replacedCount
     } else {
       // 有已有标记，分段处理
       const segments: { type: 'normal' | 'diff'; content: string }[] = []
@@ -2497,11 +2863,26 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         if (seg.type === 'diff') {
           return seg.content
         } else {
-          return replaceTextInHtml(seg.content, search, (matchedText, originalHtml) => createDiffHtml(matchedText, replace, originalHtml))
+          const replaced = replaceTextInHtml(seg.content, effectiveSearch, (matchedText, originalHtml) => createDiffHtml(matchedText, replace, originalHtml))
+          appliedCount += replaced.replacedCount
+          return replaced.html
         }
       }).join('')
     }
     
+    if (appliedCount <= 0 || newContent === content) {
+      return {
+        success: false,
+        count: 0,
+        message: `No editable match found for "${effectiveSearch}"; this text may have already been modified in an earlier step.`,
+        debug: {
+          reasonCode: 'already_applied',
+          effectiveSearch,
+          hints: ['matching text only appears inside existing diff ranges'],
+        },
+      }
+    }
+
     // 同步更新 ref（关键！这样下一次调用就能获取最新内容）
     documentContentRef.current = newContent
     
@@ -2516,9 +2897,9 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     // 添加到待确认列表（保留之前的记录）
     const newReplacement: SingleReplacement = {
       id: diffId,
-      searchText: search,
+      searchText: effectiveSearch,
       replaceText: replace,
-      count,
+      count: appliedCount,
       timestamp: Date.now(),
       ...(reviewMeta?.reason ? { reviewReason: reviewMeta.reason } : {}),
       ...(reviewMeta?.type ? { reviewType: reviewMeta.type } : {}),
@@ -2526,23 +2907,23 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     
     setPendingReplacements(prev => ({
       items: [...prev.items, newReplacement],
-      total: prev.total + count
+      total: prev.total + appliedCount
     }))
     
     // 同时更新 lastReplacement 以保持向后兼容
     setLastReplacement({
-      searchText: search,
+      searchText: effectiveSearch,
       replaceText: replace,
-      count,
+      count: appliedCount,
       timestamp: Date.now(),
       pending: true
     })
 
     return { 
       success: true, 
-      count, 
-      message: `成功替换 ${count} 处`,
-      searchText: search,
+      count: appliedCount, 
+      message: `成功替换 ${appliedCount} 处`,
+      searchText: effectiveSearch,
       replaceText: replace,
       positions
     }
@@ -2964,34 +3345,82 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       insertHtml = `<p><span class="diff-new" data-diff-id="${diffId}">${formatted}</span></p>`
     }
 
+    // 提取 before:/after: 锚点
+    const extractAnchor = (pos: string): { mode: 'after' | 'before'; anchor: string } | null => {
+      if (pos.startsWith('after:')) return { mode: 'after', anchor: pos.slice(6).trim() }
+      if (pos.startsWith('before:')) return { mode: 'before', anchor: pos.slice(7).trim() }
+      return null
+    }
+
+    // 去除外层引号（模型常见错误：after:"某段文字"）
+    const unwrapQuotes = (s: string) => {
+      const t = s.trim()
+      if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")) ||
+          (t.startsWith('\u201c') && t.endsWith('\u201d')) || (t.startsWith('\u2018') && t.endsWith('\u2019')))
+        return t.slice(1, -1).trim()
+      return s
+    }
+
     if (position === 'start') {
-      // 在开头插入
       newContent = insertHtml + newContent
     } else if (position === 'end') {
-      // 在末尾插入
       newContent = newContent + insertHtml
-    } else if (position.startsWith('after:')) {
-      // 在指定文字后插入
-      const anchor = position.slice(6)
+    } else {
+      const parsed = extractAnchor(position)
+      if (!parsed) {
+        return { success: false, message: `无效的位置参数: ${position}，支持 start / end / after:文字 / before:文字` }
+      }
+
+      let { mode, anchor } = parsed
+      anchor = unwrapQuotes(anchor)
       if (!anchor) {
         return { success: false, message: '锚点文字不能为空' }
       }
-      
-      // 查找锚点位置
-      const anchorIndex = newContent.indexOf(anchor)
-      if (anchorIndex === -1) {
-        return { success: false, message: `未找到「${anchor}」` }
+
+      // 剥离 HTML 标签得到纯文本（与 replaceInDocument 一致）
+      const textContent = newContent.replace(/<[^>]+>/g, '')
+      let anchorIdx = textContent.indexOf(anchor)
+
+      // 模糊匹配：忽略空白差异
+      if (anchorIdx === -1) {
+        const escapeRegex = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        const fuzzy = escapeRegex(anchor).replace(/\s+/g, '\\s*')
+        const m = new RegExp(fuzzy).exec(textContent)
+        if (m) anchorIdx = m.index
       }
-      
-      // 在锚点后插入（找到锚点所在标签的结束位置）
-      const afterAnchor = anchorIndex + anchor.length
-      // 查找下一个标签结束位置
-      const nextTagEnd = newContent.indexOf('>', afterAnchor)
-      const insertPos = nextTagEnd !== -1 ? nextTagEnd + 1 : afterAnchor
-      
-      newContent = newContent.slice(0, insertPos) + insertHtml + newContent.slice(insertPos)
-    } else {
-      return { success: false, message: `无效的位置参数: ${position}` }
+
+      if (anchorIdx === -1) {
+        return { success: false, message: `未找到「${anchor.slice(0, 40)}」，请检查文字是否与文档一致` }
+      }
+
+      // 将纯文本偏移映射回 HTML 偏移（遍历 HTML，跳过标签，计数纯文本字符）
+      let textPos = 0
+      let htmlPos = 0
+      const targetTextPos = mode === 'after' ? anchorIdx + anchor.length : anchorIdx
+
+      while (htmlPos < newContent.length && textPos < targetTextPos) {
+        if (newContent[htmlPos] === '<') {
+          const tagEnd = newContent.indexOf('>', htmlPos)
+          htmlPos = tagEnd !== -1 ? tagEnd + 1 : htmlPos + 1
+        } else {
+          textPos++
+          htmlPos++
+        }
+      }
+
+      if (mode === 'after') {
+        // 向后找到最近的闭合标签后插入
+        const nextTagEnd = newContent.indexOf('>', htmlPos)
+        const insertPos = nextTagEnd !== -1 && (nextTagEnd - htmlPos) < 200 ? nextTagEnd + 1 : htmlPos
+        newContent = newContent.slice(0, insertPos) + insertHtml + newContent.slice(insertPos)
+      } else {
+        // before: 向前回退到最近的标签边界
+        let insertPos = htmlPos
+        while (insertPos > 0 && newContent[insertPos - 1] !== '>') {
+          insertPos--
+        }
+        newContent = newContent.slice(0, insertPos) + insertHtml + newContent.slice(insertPos)
+      }
     }
 
     // 同步更新 ref（关键！保证下一次工具调用拿到最新内容）
@@ -3011,7 +3440,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         id: diffId,
         kind: 'structure_edit',
         scope: 'document',
-        summary: `插入内容（${position === 'start' ? '开头' : position === 'end' ? '末尾' : '指定位置后'}）`,
+        summary: `插入内容（${position === 'start' ? '开头' : position === 'end' ? '末尾' : position.startsWith('before:') ? '指定位置前' : '指定位置后'}）`,
         beforePreview: '—',
         afterPreview: (content || '').length > 180 ? (content || '').slice(0, 180) + '…' : (content || ''),
         stats: { matches: 1 },
@@ -3107,7 +3536,302 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
 
     return { success: true, count, message: `已标记删除 ${count} 处（可在修订面板接受/拒绝）` }
   }, []) // 使用 ref 后不依赖 document.content
-  
+
+  // ─── DSL 缓存 ───
+  const dslCacheRef = useRef<{ html: string; dsl: DocDsl } | null>(null)
+  const getCachedDsl = useCallback((): DocDsl => {
+    const html = documentContentRef.current
+    if (dslCacheRef.current?.html === html) return dslCacheRef.current.dsl
+    const dsl = htmlToDsl(html)
+    dslCacheRef.current = { html, dsl }
+    return dsl
+  }, [])
+
+  // ─── DSL 工具：replaceViaDsl ───
+  const replaceViaDsl = useCallback((
+    search: string,
+    replace: string,
+    options?: { blockIndex?: number; format?: Partial<DslRun> }
+  ): { success: boolean; count: number; message: string } => {
+    if (!search) return { success: false, count: 0, message: '搜索内容不能为空' }
+
+    // 保护：search 和 replace 相同时跳过
+    if (search === replace) {
+      return { success: true, count: 0, message: '内容相同，无需替换' }
+    }
+
+    try {
+      const dsl = getCachedDsl()
+      const blocks = dsl.blocks
+
+      // 确定搜索范围
+      const searchBlocks: { block: DslBlock; index: number }[] = []
+      if (options?.blockIndex !== undefined) {
+        const idx = options.blockIndex
+        if (idx < 0 || idx >= blocks.length) {
+          return { success: false, count: 0, message: `blockIndex ${idx} 超出范围（共 ${blocks.length} 块）` }
+        }
+        searchBlocks.push({ block: blocks[idx], index: idx })
+      } else {
+        blocks.forEach((block, i) => searchBlocks.push({ block, index: i }))
+      }
+
+      // 在块中搜索并替换
+      let totalCount = 0
+      const unifiedDiffId = `diff-${Date.now()}-dsl`
+      for (const { block } of searchBlocks) {
+        if (block.type !== 'heading' && block.type !== 'paragraph') continue
+        const runs = normalizeContent(block.content)
+        const plainText = runs.map(r => r.text).join('')
+        if (!plainText.includes(search)) continue
+
+        // 找到匹配 → 简化处理：合并为纯文本，替换后重建
+        // 简化处理：将所有 runs 合并为纯文本，替换后重建
+        const replaced = plainText.split(search)
+        if (replaced.length <= 1) continue
+
+        totalCount += replaced.length - 1
+
+        // 构建新 content：细粒度 diff，只标记实际变化的部分
+        const diffId = unifiedDiffId
+
+        // 计算 search 和 replace 的公共前缀/后缀
+        let prefixLen = 0
+        const minLen = Math.min(search.length, replace.length)
+        while (prefixLen < minLen && search[prefixLen] === replace[prefixLen]) prefixLen++
+        let suffixLen = 0
+        while (suffixLen < (minLen - prefixLen) && search[search.length - 1 - suffixLen] === replace[replace.length - 1 - suffixLen]) suffixLen++
+
+        const commonPrefix = search.slice(0, prefixLen)
+        const commonSuffix = suffixLen > 0 ? search.slice(search.length - suffixLen) : ''
+        const oldDiff = search.slice(prefixLen, search.length - suffixLen)
+        const newDiff = replace.slice(prefixLen, replace.length - suffixLen)
+
+        const newContent: DslInline[] = []
+        for (let i = 0; i < replaced.length; i++) {
+          if (replaced[i]) {
+            newContent.push(replaced[i])
+          }
+          if (i < replaced.length - 1) {
+            // 细粒度：公共前缀 + diff-old + diff-new + 公共后缀
+            if (commonPrefix) newContent.push(commonPrefix)
+            if (oldDiff) {
+              newContent.push({
+                text: oldDiff,
+                _meta: { diffType: 'old' as const, diffId },
+              })
+            }
+            if (newDiff) {
+              const newRun: DslRun = {
+                text: newDiff,
+                _meta: { diffType: 'new' as const, diffId },
+              }
+              if (options?.format) Object.assign(newRun, options.format)
+              newContent.push(newRun)
+            }
+            if (commonSuffix) newContent.push(commonSuffix)
+          }
+        }
+
+        // 更新块内容
+        if (block.type === 'heading') {
+          (block as any).content = newContent
+        } else {
+          (block as any).content = newContent
+        }
+      }
+
+      if (totalCount === 0) {
+        return { success: false, count: 0, message: `未找到「${search.slice(0, 40)}」` }
+      }
+
+      // DSL → HTML → 更新编辑器
+      const newHtml = dslToHtml(dsl)
+      dslCacheRef.current = null // 清除缓存
+      documentContentRef.current = newHtml
+      setDocument(prev => prev ? { ...prev, content: newHtml, lastModified: new Date() } : prev)
+      setHasUnsavedChanges(true)
+
+      // 注册到待审阅修改（使 diff 接受/拒绝按钮可用）
+      setPendingReplacements(prev => ({
+        items: [...prev.items, {
+          id: unifiedDiffId,
+          searchText: search,
+          replaceText: replace,
+          count: totalCount,
+          timestamp: Date.now(),
+        }],
+        total: prev.total + totalCount,
+      }))
+      setLastReplacement({
+        searchText: search,
+        replaceText: replace,
+        count: totalCount,
+        timestamp: Date.now(),
+        pending: true,
+      })
+
+      return { success: true, count: totalCount, message: `已替换 ${totalCount} 处` }
+    } catch (e) {
+      console.error('[replaceViaDsl] error:', e)
+      return { success: false, count: 0, message: `DSL 替换失败: ${e}` }
+    }
+  }, [getCachedDsl])
+
+  // ─── DSL 工具：insertViaDsl ───
+  const insertViaDsl = useCallback((
+    position: string,
+    dslBlocks: DslBlock[]
+  ): { success: boolean; message: string } => {
+    if (!dslBlocks.length) return { success: false, message: '插入内容不能为空' }
+
+    try {
+      const dsl = getCachedDsl()
+
+      // 给新块加 diff 标记
+      const diffId = `diff-insert-${Date.now()}`
+      const markedBlocks = dslBlocks.map(b => {
+        if (b.type === 'heading' || b.type === 'paragraph') {
+          return { ...b, _meta: { diffRole: 'new' as const, diffId } }
+        }
+        return b
+      })
+
+      // 解析 position
+      if (position === 'start') {
+        dsl.blocks.unshift(...markedBlocks)
+      } else if (position === 'end') {
+        dsl.blocks.push(...markedBlocks)
+      } else if (position.startsWith('blockIndex:')) {
+        const idx = parseInt(position.replace('blockIndex:', ''))
+        if (isNaN(idx) || idx < 0 || idx >= dsl.blocks.length) {
+          return { success: false, message: `无效的 blockIndex: ${position}` }
+        }
+        dsl.blocks.splice(idx + 1, 0, ...markedBlocks)
+      } else if (position.startsWith('after:') || position.startsWith('before:')) {
+        const isAfter = position.startsWith('after:')
+        const anchor = position.slice(isAfter ? 6 : 7).trim()
+        if (!anchor) return { success: false, message: '锚点文字不能为空' }
+
+        // 在块中搜索锚点
+        let foundIdx = -1
+        for (let i = 0; i < dsl.blocks.length; i++) {
+          const block = dsl.blocks[i]
+          if (block.type === 'heading' || block.type === 'paragraph') {
+            const text = extractPlainText(block.content)
+            if (text.includes(anchor)) {
+              foundIdx = i
+              break
+            }
+          }
+        }
+
+        if (foundIdx === -1) {
+          return { success: false, message: `未找到「${anchor.slice(0, 40)}」` }
+        }
+
+        const insertIdx = isAfter ? foundIdx + 1 : foundIdx
+        dsl.blocks.splice(insertIdx, 0, ...markedBlocks)
+      } else {
+        return { success: false, message: `无效的位置参数: ${position}` }
+      }
+
+      // DSL → HTML → 更新编辑器
+      const newHtml = dslToHtml(dsl)
+      dslCacheRef.current = null
+      documentContentRef.current = newHtml
+      setDocument(prev => prev ? { ...prev, content: newHtml, lastModified: new Date() } : prev)
+
+      // 注册为待确认修改，让 accept/reject 按钮出现
+      setPendingReplacements(prev => ({
+        items: [...prev.items, {
+          id: diffId,
+          searchText: '',
+          replaceText: `[插入 ${dslBlocks.length} 个块]`,
+          count: dslBlocks.length,
+          timestamp: Date.now(),
+        }],
+        total: prev.total + dslBlocks.length,
+      }))
+
+      return { success: true, message: `已插入 ${dslBlocks.length} 个块` }
+    } catch (e) {
+      console.error('[insertViaDsl] error:', e)
+      return { success: false, message: `DSL 插入失败: ${e}` }
+    }
+  }, [getCachedDsl])
+
+  // ─── DSL 工具：deleteViaDsl ───
+  const deleteViaDsl = useCallback((
+    target: string,
+    options?: { blockIndex?: number }
+  ): { success: boolean; count: number; message: string } => {
+    if (!target && options?.blockIndex === undefined) {
+      return { success: false, count: 0, message: '删除目标不能为空' }
+    }
+
+    try {
+      const dsl = getCachedDsl()
+      let count = 0
+
+      if (options?.blockIndex !== undefined) {
+        // 按块索引删除整个块
+        const idx = options.blockIndex
+        if (idx < 0 || idx >= dsl.blocks.length) {
+          return { success: false, count: 0, message: `blockIndex ${idx} 超出范围` }
+        }
+        // 标记为 diff-old 而不是直接删除（让用户审查）
+        const block = dsl.blocks[idx]
+        if (block.type === 'heading' || block.type === 'paragraph') {
+          const runs = normalizeContent(block.content)
+          const markedRuns: DslInline[] = runs.map(r => ({
+            ...r,
+            _meta: { ...r._meta, diffType: 'old' as const },
+          }))
+          ;(block as any).content = markedRuns
+        }
+        count = 1
+      } else {
+        // 按文本搜索删除
+        for (const block of dsl.blocks) {
+          if (block.type !== 'heading' && block.type !== 'paragraph') continue
+          const runs = normalizeContent(block.content)
+          const plainText = runs.map(r => r.text).join('')
+          if (!plainText.includes(target)) continue
+
+          // 标记匹配文本为 diff-old
+          const newContent: DslInline[] = []
+          const parts = plainText.split(target)
+          for (let i = 0; i < parts.length; i++) {
+            if (parts[i]) newContent.push(parts[i])
+            if (i < parts.length - 1) {
+              newContent.push({
+                text: target,
+                _meta: { diffType: 'old' as const },
+              })
+              count++
+            }
+          }
+          ;(block as any).content = newContent
+        }
+      }
+
+      if (count === 0) {
+        return { success: false, count: 0, message: `未找到「${target?.slice(0, 40) || 'blockIndex:' + options?.blockIndex}」` }
+      }
+
+      const newHtml = dslToHtml(dsl)
+      dslCacheRef.current = null
+      documentContentRef.current = newHtml
+      setDocument(prev => prev ? { ...prev, content: newHtml, lastModified: new Date() } : prev)
+
+      return { success: true, count, message: `已标记删除 ${count} 处` }
+    } catch (e) {
+      console.error('[deleteViaDsl] error:', e)
+      return { success: false, count: 0, message: `DSL 删除失败: ${e}` }
+    }
+  }, [getCachedDsl])
+
   // 滚动到指定文本
   const scrollToText = useCallback((text: string) => {
     setScrollTarget(text)
@@ -3444,7 +4168,8 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         return { success: false, message: 'ops 为空或格式不正确' }
       }
 
-      let html = documentContentRef.current || ''
+      const originalHtml = documentContentRef.current || ''
+      let html = originalHtml
       const parser = new DOMParser()
       const doc = parser.parseFromString(html, 'text/html')
 
@@ -5791,7 +6516,8 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       }
 
       const newHtml = doc.body.innerHTML
-      if (newHtml !== (documentContentRef.current || '')) {
+      const htmlChanged = newHtml !== originalHtml
+      if (htmlChanged) {
         documentContentRef.current = newHtml
         setDocument(prev => ({
           ...prev,
@@ -5804,6 +6530,14 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
 
       if (created.length > 0) {
         setExtraPendingChanges(prev => [...prev, ...created])
+      }
+
+      if (!htmlChanged && created.length === 0) {
+        return {
+          success: false,
+          message: 'No revisions were produced: no editable target matched current document for provided target/params',
+          data: { created: 0, templateFillReport },
+        }
       }
 
       const baseMessage = `已生成修订：${created.length} 条。请在底部或“修订面板”中逐条确认。`
@@ -6018,6 +6752,9 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         replaceInDocument,
         insertInDocument,
         deleteInDocument,
+        replaceViaDsl,
+        insertViaDsl,
+        deleteViaDsl,
         scrollToText,
         scrollToDiffId,
         addPendingReplacementItem,

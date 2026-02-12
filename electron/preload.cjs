@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 文件操作
   readFile: (filePath) => ipcRenderer.invoke('read-file', filePath),
   writeFile: (filePath, content) => ipcRenderer.invoke('write-file', filePath, content),
+  appendFile: (filePath, content) => ipcRenderer.invoke('append-file', filePath, content),
   writeBinaryFile: (filePath, base64Data) => ipcRenderer.invoke('write-binary-file', filePath, base64Data),
   
   // 对话框

@@ -123,14 +123,57 @@ function dslLengthToPx(length: string | number | undefined): number | undefined 
   return Math.max(1, Math.round(twips / 15)) // 1px ≈ 15 twips
 }
 
+// ============== 字体处理 ==============
+
+/** Windows 系统常见安全字体（确保存在） */
+const SAFE_LATIN_FONTS = new Set([
+  'Times New Roman', 'Arial', 'Calibri', 'Cambria', 'Georgia',
+  'Verdana', 'Tahoma', 'Trebuchet MS', 'Garamond', 'Palatino Linotype',
+  'Book Antiqua', 'Century', 'Consolas', 'Courier New', 'Segoe UI',
+  'Lucida Sans', 'Franklin Gothic Medium', 'Impact',
+])
+
+const SAFE_CJK_FONTS = new Set([
+  '宋体', '黑体', '仿宋', '楷体', '微软雅黑', '华文中宋', '华文仿宋',
+  '华文楷体', '华文宋体', '华文细黑', '方正小标宋简体', '方正仿宋简体',
+  'SimSun', 'SimHei', 'FangSong', 'KaiTi', 'Microsoft YaHei',
+  'STZhongsong', 'STFangsong', 'STKaiti', 'STSong', 'STXihei',
+])
+
+/** 检测字体名是否为 CJK 字体 */
+function isCjkFont(name: string): boolean {
+  if (SAFE_CJK_FONTS.has(name)) return true
+  // 包含中文字符的字体名
+  if (/[\u4e00-\u9fff]/.test(name)) return true
+  // 常见 CJK 字体前缀
+  if (/^(ST|MS |Noto Sans (SC|TC|JP|KR)|Source Han|Noto Serif (SC|TC))/i.test(name)) return true
+  return false
+}
+
+/** 将模型指定的字体映射为安全的 ascii/hAnsi/eastAsia 三槽 */
+function resolveFont(fontFamily: string): { ascii: string; hAnsi: string; eastAsia: string } {
+  const name = fontFamily.trim()
+
+  if (isCjkFont(name)) {
+    // CJK 字体：eastAsia 用指定字体，ascii/hAnsi 用 Times New Roman
+    return { ascii: 'Times New Roman', hAnsi: 'Times New Roman', eastAsia: name }
+  }
+
+  // 拉丁字体：ascii/hAnsi 用指定字体（如果安全），eastAsia 保持默认
+  const latinFont = SAFE_LATIN_FONTS.has(name) ? name : 'Times New Roman'
+  return { ascii: latinFont, hAnsi: latinFont, eastAsia: '仿宋' }
+}
+
 // ============== Run 转换 ==============
 
 /**
  * 将 DslRun 转换为 TextRun 选项
  */
 function dslRunToTextRunOptions(run: DslRun): IRunOptions {
+  // 清理 \n：Word 的 TextRun 会忽略 \n，保持一致
+  const cleanedText = run.text.replace(/\n/g, ' ').replace(/\s+/g, ' ')
   const options: IRunOptions = {
-    text: run.text,
+    text: cleanedText,
   }
 
   if (run.bold) options.bold = true
@@ -141,11 +184,7 @@ function dslRunToTextRunOptions(run: DslRun): IRunOptions {
   if (run.subscript) options.subScript = true
 
   if (run.fontFamily) {
-    options.font = {
-      ascii: run.fontFamily,
-      hAnsi: run.fontFamily,
-      eastAsia: run.fontFamily,
-    }
+    options.font = resolveFont(run.fontFamily)
   }
 
   if (run.fontSize) {

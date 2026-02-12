@@ -3,6 +3,10 @@ import { ChatMessage, AISettings } from '../types'
 import { DOC_EDIT_START, DOC_EDIT_END, DOC_SUMMARY_START, DOC_SUMMARY_END } from '../utils/aiMarkers'
 import { memoryAppend, memoryAppendSession, memorySearch } from '../memory/manager'
 import { formatMemoryResults } from '../memory/hybrid'
+import { toolCallLogger } from '../utils/toolCallLogger'
+
+// 多模态消息 content 类型
+export type MessageContent = string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }>
 
 // 工具调用结果类型
 export interface ToolResult {
@@ -12,13 +16,99 @@ export interface ToolResult {
   data?: Record<string, unknown>
 }
 
+export type AgentDebugEvent =
+  | {
+      type: 'turn_start'
+      turnId: string
+      timestamp: string
+      model: string
+      baseUrl: string
+      userInput: string
+      hasDocumentContext: boolean
+      hasFilesContext: boolean
+      imageCount: number
+      recentMessagesCount: number
+    }
+  | {
+      type: 'api_response_raw'
+      turnId: string
+      timestamp: string
+      iteration: number
+      stage: 'loop' | 'forced_summary'
+      response: string
+      rawResponse?: string
+      hasToolCall: boolean
+    }
+  | {
+      type: 'tool_calls_parsed'
+      turnId: string
+      timestamp: string
+      iteration: number
+      calls: Array<{ tool: string; args: Record<string, string> }>
+    }
+  | {
+      type: 'tool_call_skipped'
+      turnId: string
+      timestamp: string
+      iteration: number
+      tool: string
+      args: Record<string, string>
+      reason: string
+    }
+  | {
+      type: 'tool_result'
+      turnId: string
+      timestamp: string
+      iteration: number
+      index: number
+      total: number
+      tool: string
+      args: Record<string, string>
+      result: ToolResult
+    }
+  | {
+      type: 'final_summary'
+      turnId: string
+      timestamp: string
+      iteration: number
+      source: 'normal' | 'forced_stop' | 'max_iterations'
+      content: string
+    }
+  | {
+      type: 'turn_complete'
+      turnId: string
+      timestamp: string
+      totalIterations: number
+      finalContent: string
+      toolResults: ToolResult[]
+    }
+  | {
+      type: 'turn_error'
+      turnId: string
+      timestamp: string
+      iteration: number
+      aborted: boolean
+      name?: string
+      message: string
+      stack?: string
+    }
+
 // Agent 回调类型
 export interface AgentCallbacks {
   onToolCall?: (tool: string, args: Record<string, string>) => Promise<ToolResult>
+  /** Fired when a tool call header is detected during streaming. */
+  onToolCallStart?: (tool: string) => void
+  /** Fired when a complete tool call is parsed from streaming output. */
+  onToolCallPreview?: (tool: string, args: Record<string, string>) => void
+  /** Fired when a tool call is skipped by in-turn dedup logic. */
+  onToolCallSkipped?: (tool: string, args: Record<string, string>, reason: string) => void
+  /** Assistant text chunk per loop iteration for interleaved chat rendering. */
+  onTextChunk?: (text: string) => void
+  onDebugEvent?: (event: AgentDebugEvent) => void | Promise<void>
   onContent?: (content: string) => void
   onComplete?: (content: string, toolResults: ToolResult[]) => void
   onThinking?: (thinking: string) => void
-  /** 获取最新的文档内容，用于在工具调用后让 AI 知道文档已更新 */
+  /** Return latest document snapshot so the model can recover from failed edits. */
   getLatestDocument?: () => string
 }
 
@@ -42,7 +132,8 @@ interface AIContextType {
     documentContext?: string, 
     filesContext?: string,
     callbacks?: AgentCallbacks,
-    memoryContext?: { workspaceKey?: string; workspaceSummary?: string }
+    memoryContext?: { workspaceKey?: string; workspaceSummary?: string },
+    images?: string[]
   ) => Promise<void>
   // Tab 补全功能 - 使用本地模型
   getCompletion: (
@@ -51,6 +142,8 @@ interface AIContextType {
   ) => Promise<string | null>
   // 取消正在进行的补全
   cancelCompletion: () => void
+  // 停止当前生成
+  stopGeneration: () => void
 }
 
 const defaultSettings: AISettings = {
@@ -58,7 +151,7 @@ const defaultSettings: AISettings = {
   model: 'kimi-k2.5',
   baseUrl: 'https://api.linapi.net/v1',
   temperature: 1,  // kimi-k2.5 模型只支持 temperature=1
-  maxTokens: 4096,
+  maxTokens: 16384,
   // PPT 图像生成模型（默认使用 Gemini 生图）
   pptImageModel: 'gemini-image',
   // 记忆系统默认配置
@@ -135,14 +228,252 @@ function escapeRegExp(value: string): string {
 const EDIT_START_REGEX = new RegExp(escapeRegExp(DOC_EDIT_START), 'g')
 const EDIT_END_REGEX = new RegExp(escapeRegExp(DOC_EDIT_END), 'g')
 const SUMMARY_BLOCK_REGEX = new RegExp(
-  `${escapeRegExp(DOC_SUMMARY_START)}[\\s\\S]*?(?:${escapeRegExp(DOC_SUMMARY_END)})?`,
+  `${escapeRegExp(DOC_SUMMARY_START)}[\s\S]*?(?:${escapeRegExp(DOC_SUMMARY_END)})?`,
   'g'
 )
+
+const LEGACY_XML_TOOL_NAMES = [
+  'replace',
+  'review',
+  'insert',
+  'delete',
+  'word_edit_ops',
+  'word_chart',
+  'create',
+  'copy_template',
+  'create_from_template',
+  'ppt_create',
+  'ppt_edit',
+  'workspace_list',
+  'workspace_open',
+  'workspace_summarize',
+  'workspace_read',
+  'web_search',
+  'excel_read',
+  'excel_search',
+  'excel_write',
+  'excel_insert_rows',
+  'excel_insert_columns',
+  'excel_delete_rows',
+  'excel_delete_columns',
+  'excel_add_sheet',
+  'excel_delete_sheet',
+  'excel_merge',
+  'excel_unmerge',
+  'excel_create',
+  'excel_formula',
+  'excel_sort',
+  'excel_autofill',
+  'excel_dimensions',
+  'excel_conditional_format',
+  'excel_calculate',
+  'excel_filter',
+  'excel_validation',
+  'excel_hyperlink',
+  'excel_find_replace',
+  'excel_chart',
+] as const
+
+const LEGACY_XML_TOOL_NAME_PATTERN = LEGACY_XML_TOOL_NAMES
+  .map((tool) => escapeRegExp(tool))
+  .join('|')
+
+const LEGACY_XML_TOOL_BLOCK_REGEX = new RegExp(
+  '<(' + LEGACY_XML_TOOL_NAME_PATTERN + ')>([\s\S]*?)<\/\\1>',
+  'gi'
+)
+
+const LEGACY_XML_TOOL_OPEN_TAG_REGEX = new RegExp(`<(${LEGACY_XML_TOOL_NAME_PATTERN})>`, 'gi')
+
+const LEGACY_XML_TOOL_ARG_REGEX = /<([a-zA-Z][\w-]*)>([\s\S]*?)<\/\1>/g
+
+const TOOL_USE_BLOCK_REGEX = /<tool_use>[\s\S]*?<\/tool_use>/gi
+const TOOL_USE_START_WITH_NAME_REGEX = /<tool_use>[\s\S]*?<tool_name>\s*([a-zA-Z0-9_]+)\s*<\/tool_name>/gi
+const TOOL_USE_NAME_REGEX = /<tool_name>\s*([\s\S]*?)\s*<\/tool_name>/i
+const TOOL_USE_PARAM_PAIR_REGEX = /<parameter_name>\s*([\s\S]*?)\s*<\/parameter_name>\s*<parameter_value>\s*([\s\S]*?)\s*<\/parameter_value>/gi
+const TOOL_USE_INPUT_JSON_REGEX = /<tool_input>\s*([\s\S]*?)\s*<\/tool_input>/i
+
+function cleanXmlTagText(value: string): string {
+  return (value || '').replace(/<[^>]+>/g, '').trim()
+}
+
+function decodeXmlEntities(value: string): string {
+  return (value || '')
+    .replace(/&quot;/g, '"')
+    .replace(/&#34;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+}
+
+function normalizeToolUseArgValue(value: unknown): string {
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'string') return value.trim()
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+function extractToolUseInputArgs(block: string): Record<string, string> {
+  const args: Record<string, string> = {}
+  const inputMatch = block.match(TOOL_USE_INPUT_JSON_REGEX)
+  if (!inputMatch) return args
+
+  const rawInput = decodeXmlEntities((inputMatch[1] || '').trim())
+  if (!rawInput) return args
+
+  const candidate = rawInput
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim()
+
+  if (!candidate) return args
+
+  try {
+    const parsed = JSON.parse(candidate)
+    if (Array.isArray(parsed)) {
+      args.ops = JSON.stringify(parsed)
+      return args
+    }
+    if (parsed && typeof parsed === 'object') {
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        const normalized = normalizeToolUseArgValue(value)
+        if (!key || !normalized) continue
+        args[key] = normalized
+      }
+    }
+  } catch {
+    // Ignore malformed JSON and fallback to other parameter extraction paths.
+  }
+
+  return args
+}
+
+function normalizeToolUseTagCalls(content: string): string {
+  if (!content || content.indexOf('<tool_use>') === -1) return content
+
+  return content.replace(TOOL_USE_BLOCK_REGEX, (block) => {
+    const toolNameMatch = block.match(TOOL_USE_NAME_REGEX)
+    let toolName = cleanXmlTagText(toolNameMatch?.[1] || '')
+    if (!toolName) return ''
+
+    const argsMap: Record<string, string> = {
+      ...extractToolUseInputArgs(block),
+    }
+
+    const pairRegex = new RegExp(TOOL_USE_PARAM_PAIR_REGEX.source, 'gi')
+    let pairMatch: RegExpExecArray | null
+    while ((pairMatch = pairRegex.exec(block)) !== null) {
+      const key = cleanXmlTagText(pairMatch[1] || '')
+      const value = cleanXmlTagText(pairMatch[2] || '')
+      if (!key || !value) continue
+      argsMap[key] = value
+    }
+
+    // Common key alias normalization across providers.
+    if (!argsMap.action && argsMap.operation) argsMap.action = argsMap.operation
+    if (!argsMap.search && argsMap.search_text) argsMap.search = argsMap.search_text
+    if (!argsMap.replace && argsMap.replace_text) argsMap.replace = argsMap.replace_text
+
+    if (toolName === 'word_edit_ops') {
+      const operation = (argsMap.operation || argsMap.action || '').toLowerCase()
+      const searchText = argsMap.search || argsMap.search_text || ''
+      const replaceText = argsMap.replace || argsMap.replace_text || ''
+      if (searchText && replaceText && (operation === 'search_replace' || operation === 'replace' || operation === 'find_replace' || !operation)) {
+        toolName = 'replace'
+        argsMap.search = searchText
+        argsMap.replace = replaceText
+      }
+    }
+
+    const argLines = Object.entries(argsMap)
+      .filter(([key, value]) => key && value)
+      .map(([key, value]) => `${key}: ${value}`)
+
+    if (argLines.length === 0) {
+      return `[TOOL_CALL] ${toolName}\n[/TOOL_CALL]`
+    }
+
+    return `[TOOL_CALL] ${toolName}\n${argLines.join('\n')}\n[/TOOL_CALL]`
+  })
+}
+
+function normalizeLegacyXmlToolCalls(content: string): string {
+  if (!content || content.indexOf('<') === -1) return content
+
+  return content.replace(LEGACY_XML_TOOL_BLOCK_REGEX, (_full, rawTool: string, rawBody: string) => {
+    let toolName = (rawTool || '').trim()
+    const body = rawBody || ''
+    const args: string[] = []
+    const argRegex = new RegExp(LEGACY_XML_TOOL_ARG_REGEX.source, 'g')
+    let argMatch: RegExpExecArray | null
+
+    while ((argMatch = argRegex.exec(body)) !== null) {
+      const key = (argMatch[1] || '').trim()
+      const value = (argMatch[2] || '').trim()
+      if (!key || !value) continue
+      args.push(`${key}: ${value}`)
+    }
+
+    // Compatibility: some models emit <word_edit_ops><search>...</search><replace>...</replace></word_edit_ops>.
+    if (toolName === 'word_edit_ops') {
+      const hasSearch = args.some((line) => line.startsWith('search:'))
+      const hasReplace = args.some((line) => line.startsWith('replace:'))
+      const hasAction = args.some((line) => line.startsWith('action:'))
+      if (hasSearch && hasReplace && !hasAction) {
+        toolName = 'replace'
+      }
+    }
+
+    if (args.length === 0) {
+      const compactBody = body.trim()
+      if (!compactBody) return ''
+      args.push(`content: ${compactBody}`)
+    }
+
+    return `[TOOL_CALL] ${toolName}\n${args.join('\n')}\n[/TOOL_CALL]`
+  })
+}
+
+function trimTrailingOpenToolCallBlock(displayText: string): string {
+  let cleaned = displayText || ''
+
+  const lastOpenIdx = cleaned.lastIndexOf('[TOOL_CALL]')
+  if (lastOpenIdx !== -1 && cleaned.indexOf('[/TOOL_CALL]', lastOpenIdx) === -1) {
+    cleaned = cleaned.substring(0, lastOpenIdx).trim()
+  }
+
+  const lowered = cleaned.toLowerCase()
+  const toolUseOpenIdx = lowered.lastIndexOf('<tool_use>')
+  if (toolUseOpenIdx !== -1 && lowered.indexOf('</tool_use>', toolUseOpenIdx) === -1) {
+    cleaned = cleaned.substring(0, toolUseOpenIdx).trim()
+  }
+
+  for (const tool of LEGACY_XML_TOOL_NAMES) {
+    const openTag = `<${tool}>`
+    const closeTag = `</${tool}>`
+    const openIdx = cleaned.lastIndexOf(openTag)
+    if (openIdx === -1) continue
+    if (cleaned.indexOf(closeTag, openIdx + openTag.length) === -1) {
+      cleaned = cleaned.substring(0, openIdx).trim()
+    }
+  }
+
+  return cleaned
+}
 
 function stripToolBlocks(content: string): string {
   let cleaned = content
   cleaned = cleaned.replace(/\[TOOL_CALL\][\s\S]*?\[\/TOOL_CALL\]/g, '')
   cleaned = cleaned.replace(/\[TOOL_RESULT\][\s\S]*?\[\/TOOL_RESULT\]/g, '')
+  cleaned = cleaned.replace(LEGACY_XML_TOOL_BLOCK_REGEX, '')
+  cleaned = cleaned.replace(TOOL_USE_BLOCK_REGEX, '')
   return cleaned
 }
 
@@ -165,6 +496,7 @@ function parseAssistantOutput(content: string): { displayText: string; summary: 
   displayText = displayText.replace(SUMMARY_BLOCK_REGEX, '')
   displayText = displayText.replace(EDIT_START_REGEX, '').replace(EDIT_END_REGEX, '')
   displayText = stripToolBlocks(displayText)
+  displayText = trimTrailingOpenToolCallBlock(displayText)
   displayText = displayText.replace(/\n{3,}/g, '\n\n').trim()
   return { displayText, summary, phase }
 }
@@ -206,6 +538,8 @@ function cleanMessageForSend(content: string): string {
   // 移除工具调用标记
   cleaned = cleaned.replace(/\[TOOL_CALL\][\s\S]*?\[\/TOOL_CALL\]/g, '')
   cleaned = cleaned.replace(/\[TOOL_RESULT\][\s\S]*?\[\/TOOL_RESULT\]/g, '')
+  cleaned = cleaned.replace(LEGACY_XML_TOOL_BLOCK_REGEX, '')
+  cleaned = cleaned.replace(TOOL_USE_BLOCK_REGEX, '')
   return cleaned.trim()
 }
 
@@ -238,6 +572,8 @@ function buildMemoryFlushText(
 function extractTextContent(content: string): string {
   // 移除所有工具调用块
   let text = content.replace(/\[TOOL_CALL\][\s\S]*?\[\/TOOL_CALL\]/g, '')
+  text = text.replace(LEGACY_XML_TOOL_BLOCK_REGEX, '')
+  text = text.replace(TOOL_USE_BLOCK_REGEX, '')
   // 移除工具结果块
   text = text.replace(/\[TOOL_RESULT\][\s\S]*?\[\/TOOL_RESULT\]/g, '')
   // 清理多余空行
@@ -292,12 +628,13 @@ function extractJsonObjectAfterKey(argsText: string, key: string): string | null
 // 解析工具调用
 function parseToolCalls(content: string): Array<{ tool: string; args: Record<string, string> }> {
   const toolCalls: Array<{ tool: string; args: Record<string, string> }> = []
+  const normalizedContent = normalizeToolUseTagCalls(normalizeLegacyXmlToolCalls(content))
   
   // 匹配 [TOOL_CALL] ... [/TOOL_CALL] 格式
   const toolCallRegex = /\[TOOL_CALL\]\s*(\w+)\s*\n([\s\S]*?)\[\/TOOL_CALL\]/g
   let match
   
-  while ((match = toolCallRegex.exec(content)) !== null) {
+  while ((match = toolCallRegex.exec(normalizedContent)) !== null) {
     const toolName = match[1]
     const argsText = match[2]
     const args: Record<string, string> = {}
@@ -400,7 +737,17 @@ function parseToolCalls(content: string): Array<{ tool: string; args: Record<str
         }
       }
     }
-    
+    if (toolName === 'word_edit_ops' && !args['action'] && args['search'] && args['replace']) {
+      toolCalls.push({
+        tool: 'replace',
+        args: {
+          search: args['search'],
+          replace: args['replace'],
+        },
+      })
+      continue
+    }
+
     toolCalls.push({ tool: toolName, args })
   }
   
@@ -408,11 +755,158 @@ function parseToolCalls(content: string): Array<{ tool: string; args: Record<str
 }
 
 // 检查是否包含工具调用
-function hasToolCall(content: string): boolean {
-  return content.includes('[TOOL_CALL]')
+function buildToolCallSignature(tool: string, args: Record<string, string>): string {
+  const normalizedArgs = Object.keys(args || {})
+    .sort()
+    .map((key) => {
+      const value = String(args[key] ?? '')
+        .replace(/\s+/g, ' ')
+        .trim()
+      return `${key}=${value}`
+    })
+  return `${tool}::${normalizedArgs.join('||')}`
 }
 
-// 从 sessionStorage 恢复消息
+function emitToolCallStartFromRaw(
+  rawContent: string,
+  state: { startedSignatures: Set<string> },
+  onStart?: (tool: string) => void,
+  maxStarts = Number.POSITIVE_INFINITY
+): void {
+  if (!onStart) return
+
+  const startCandidates: Array<{ index: number; tool: string; signature: string }> = []
+
+  const bracketStartRegex = /\[TOOL_CALL\]\s*(\w+)?/g
+  let bracketMatch: RegExpExecArray | null
+  while ((bracketMatch = bracketStartRegex.exec(rawContent)) !== null) {
+    const tool = (bracketMatch[1] || '').trim()
+    if (!tool) continue
+    startCandidates.push({
+      index: bracketMatch.index,
+      tool,
+      signature: `bracket:${bracketMatch.index}:${tool}`,
+    })
+  }
+
+  const xmlStartRegex = new RegExp(LEGACY_XML_TOOL_OPEN_TAG_REGEX.source, 'gi')
+  let xmlMatch: RegExpExecArray | null
+  while ((xmlMatch = xmlStartRegex.exec(rawContent)) !== null) {
+    const tool = (xmlMatch[1] || '').trim()
+    if (!tool) continue
+    startCandidates.push({
+      index: xmlMatch.index,
+      tool,
+      signature: `xml:${xmlMatch.index}:${tool}`,
+    })
+  }
+
+  const toolUseStartRegex = new RegExp(TOOL_USE_START_WITH_NAME_REGEX.source, 'gi')
+  let toolUseMatch: RegExpExecArray | null
+  while ((toolUseMatch = toolUseStartRegex.exec(rawContent)) !== null) {
+    const tool = (toolUseMatch[1] || '').trim()
+    if (!tool) continue
+
+    let normalizedTool = tool
+    if (tool === 'word_edit_ops') {
+      const toolUseSnippet = rawContent.slice(toolUseMatch.index, toolUseMatch.index + 600).toLowerCase()
+      const looksLikeSearchReplace =
+        toolUseSnippet.includes('search_replace') ||
+        toolUseSnippet.includes('<parameter_name>search_text</parameter_name>') ||
+        toolUseSnippet.includes('<parameter_name>replace_text</parameter_name>') ||
+        toolUseSnippet.includes('"search_text"') ||
+        toolUseSnippet.includes('"replace_text"')
+      if (looksLikeSearchReplace) {
+        normalizedTool = 'replace'
+      }
+    }
+
+    startCandidates.push({
+      index: toolUseMatch.index,
+      tool: normalizedTool,
+      signature: `tool_use:${toolUseMatch.index}:${normalizedTool}`,
+    })
+  }
+
+  if (startCandidates.length === 0) return
+
+  startCandidates.sort((a, b) => a.index - b.index)
+
+  for (const candidate of startCandidates) {
+    if (state.startedSignatures.size >= maxStarts) break
+    if (state.startedSignatures.has(candidate.signature)) continue
+
+    state.startedSignatures.add(candidate.signature)
+    try {
+      onStart(candidate.tool)
+    } catch (error) {
+      console.warn('[Agent] tool start callback failed:', error)
+    }
+  }
+}
+
+function emitToolCallPreviewFromRaw(
+  rawContent: string,
+  state: { emitted: Set<string> },
+  onPreview?: (tool: string, args: Record<string, string>) => void,
+  maxPreviews = Number.POSITIVE_INFINITY
+): void {
+  if (!onPreview) return
+
+  const calls = parseToolCalls(cleanModelOutput(rawContent))
+  if (calls.length === 0) return
+
+  for (const call of calls) {
+    if (state.emitted.size >= maxPreviews) break
+
+    const signature = buildToolCallSignature(call.tool, call.args)
+    if (state.emitted.has(signature)) continue
+    state.emitted.add(signature)
+
+    try {
+      onPreview(call.tool, { ...call.args })
+    } catch (error) {
+      console.warn('[Agent] tool preview callback failed:', error)
+    }
+  }
+}
+
+// Detect whether response contains at least one tool call block.
+function hasToolCall(content: string): boolean {
+  if (!content) return false
+  if (content.includes('[TOOL_CALL]')) return true
+  return parseToolCalls(content).length > 0
+}
+
+function buildToolFailureHint(latestDoc: string, search: string): string {
+  const normalizedSearch = (search || '').trim().replace(/^['"]|['"]$/g, '')
+  if (!normalizedSearch) return ''
+
+  const lines = latestDoc
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+  const keywordCandidates = Array.from(new Set([
+    normalizedSearch,
+    normalizedSearch.replace(/\s+/g, ''),
+    normalizedSearch.slice(0, Math.min(8, normalizedSearch.length)),
+    normalizedSearch.slice(Math.max(0, normalizedSearch.length - 8)),
+  ])).filter((item) => item.length >= 2)
+
+  const matched = lines
+    .filter((line) => keywordCandidates.some((keyword) => line.includes(keyword)))
+    .slice(0, 3)
+    .map((line, index) => `${index + 1}. ${line.slice(0, 120)}`)
+
+  if (matched.length === 0) {
+    return 'Supplement: text not found in latest document snapshot. Try a shorter and exact source snippet as search.'
+  }
+
+  return `Supplement: related lines from current document
+${matched.join('\n')}`
+}
+
 const getInitialMessages = (): ChatMessage[] => {
   const welcomeMessage: ChatMessage = {
     id: 'welcome',
@@ -462,6 +956,7 @@ export function AIProvider({ children }: { children: ReactNode }) {
   const [settings, setSettings] = useState<AISettings>(loadSettingsFromStorage)
   const abortControllerRef = useRef<AbortController | null>(null)
   const completionAbortRef = useRef<AbortController | null>(null)
+  const streamPrefixRef = useRef('')  // Agent 流式累积前缀（Cursor 风格连续输出）
   const lastMemoryFlushAtRef = useRef(0)
   const sessionIdRef = useRef(
     typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
@@ -472,7 +967,7 @@ export function AIProvider({ children }: { children: ReactNode }) {
   const addMessage = useCallback((message: Omit<ChatMessage, 'id' | 'timestamp'>) => {
     const newMessage: ChatMessage = {
       ...message,
-      id: Date.now().toString(),
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
       timestamp: new Date(),
     }
     setMessages(prev => [...prev, newMessage])
@@ -493,8 +988,46 @@ export function AIProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const clearMessages = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+      abortControllerRef.current = null
+    }
+
     setMessages([])
+    setStreamingContent('')
+    setStreamingReasoning('')
+    setStreamingSummary('')
+    setEditPhase('idle')
+    setIsLoading(false)
+
+    sessionIdRef.current = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+
     sessionStorage.removeItem('chat-messages')
+  }, [])
+
+  const stopGeneration = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+      abortControllerRef.current = null
+    }
+    // 把当前流式内容保存为 assistant 消息
+    setStreamingContent(prev => {
+      if (prev.trim()) {
+        setMessages(msgs => [...msgs, {
+          id: `${Date.now()}-stopped`,
+          role: 'assistant' as const,
+          content: prev + '\n\n*(已停止生成)*',
+          timestamp: Date.now(),
+        }])
+      }
+      return ''
+    })
+    setStreamingReasoning('')
+    setStreamingSummary('')
+    setEditPhase('idle')
+    setIsLoading(false)
   }, [])
   
   // 保存消息到 sessionStorage，防止热更新丢失
@@ -559,9 +1092,19 @@ export function AIProvider({ children }: { children: ReactNode }) {
   }, [])
 
   // Agent 系统提示词 - Word-Cursor 专用
+  const now = new Date()
+  const currentTimeStr = `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日 ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`
   const agentSystemPrompt = `你是 Word-Cursor AI 助手，一个专业的智能文档编辑代理。你运行在 Word-Cursor 编辑器中。
 
-你正在与用户协作编辑文档。每次用户发送消息时，系统会自动附带当前文档内容（HTML格式）和相关上下文信息。
+当前时间：${currentTimeStr}
+
+你正在与用户协作编辑文档。每次用户发送消息时，系统会自动附带当前文档内容（DSL JSON 格式）和相关上下文信息。
+
+**文档内容格式说明**：
+- 文档以 DSL JSON 格式提供，包含 \`blocks\` 数组
+- 每个块有 \`_i\` 字段表示块索引（如 \`"_i":0\` 表示第 0 个块）
+- 块类型包括：heading（标题）、paragraph（段落）、list（列表）、table（表格）、image（图片）、pageBreak（分页符）等
+- 使用 replace/insert/delete 工具时，可通过 \`blockIndex\` 参数精确定位到具体块，避免全文搜索歧义
 
 <task_completion_rules>
 **⚠️ 任务完成判断（极其重要！）**
@@ -578,12 +1121,17 @@ export function AIProvider({ children }: { children: ReactNode }) {
    - ✅ 收到工具成功的反馈
    - ✅ 没有更多需要修改的内容
    
-4. **何时继续工具调用**：
-   - ⚠️ 用户明确要求修改多处内容，且还有未完成的部分
-   - ⚠️ 上一次工具调用失败，需要重试（用不同的参数）
+4. Continue calling tools only when:
+   - The user clearly asked for multiple edits and some are still unfinished
+   - The previous tool call failed and needs a retry with different args
 
-5. **完成后的响应格式**：
-   当所有操作完成后，直接回复用户，简要总结你做了什么修改，**不要再调用任何工具**。
+5. Controlled batching mode (must follow):
+   - Output at most 3 [TOOL_CALL] blocks in each round
+   - First give one short sentence about the current step, then output the tool call
+   - After receiving [TOOL_RESULT], decide the next step; each new round can output 1-3 tool calls, never more than 3
+
+6. Completion response format:
+   After all operations are done, respond with one short summary sentence (e.g. "Completed X edits"). Do not call tools again or repeat completed steps because the user already saw each tool card in real time.
 </task_completion_rules>
 
 <output_markers>
@@ -605,9 +1153,15 @@ ${DOC_SUMMARY_END}
 **工作夹目录规则（重要）**
 
 1. 工作夹目录 = 当前打开文件所在目录。
-2. 系统会提供“工作夹索引”摘要（可能被截断）。如需更多文件清单，请使用 **workspace_list**。
-3. 查看文件内容时优先使用 **workspace_summarize**；只有确有必要才使用 **workspace_read**。
-4. 避免一次读取多个大文件，按需逐个读取，防止上下文爆炸。
+2. 系统会提供"工作夹索引"摘要（可能被截断）。如需更多文件清单，请使用 **workspace_list**。
+3. Prefer **workspace_summarize** for reading files; use **workspace_read** only when necessary.
+4. For workspace_summarize/workspace_read, you must provide one of path/file/filePath/name/relativePath, and the path should come from workspace_list results.
+5. Avoid reading many large files at once; read incrementally to prevent context overflow.
+6. **format 参数**（可选，仅对 .docx 文件有效）：
+   - 默认不传或 format: summary → 返回文本摘要（标题、段落数、正文概要）
+   - format: dsl → 返回完整 DSL JSON（包含字体、字号、对齐、缩进等格式信息）
+   - 当你需要了解其他文档的**排版格式**（字体、字号、行距、对齐方式等）时，使用 format: dsl
+   - 当你只需要了解文档**内容概要**时，使用默认的 summary 格式
 </workspace_rules>
 
 <template_fill_rules>
@@ -654,7 +1208,9 @@ ${DOC_SUMMARY_END}
 | 打开工作夹中的文件（切换当前编辑文件） | **workspace_open** |
 | 查看工作夹文件摘要 | **workspace_summarize** |
 | 读取工作夹文件内容（受限，谨慎） | **workspace_read** |
+| 读取工作夹 docx 文件的格式信息 | **workspace_read**（format: dsl） |
 | 在当前文档插入新内容 | **insert** |
+| 在 Word 文档中插入图表（柱状图/饼图/折线图等） | **word_chart** |
 | 删除当前文档的某些内容 | **delete** |
 | 创建全新的文档（不基于模板） | **create**（可选：styleRefPath/styleRefFileName + contentRefPath/contentRefFileName） |
 | 按照某个模板 docx 的结构创建新文档 | **create_from_template**（可选：templatePath/templateFileName 指定模板） |
@@ -695,11 +1251,15 @@ ${DOC_SUMMARY_END}
 - "**创建**一个新文档" → create
 - "按照这个格式**做一份**新的" → create_from_template
 - "**新建**一个..." → create
+- "**撰写**一份提案" → create
+- "**编写**一份报告" → create
+- "你正在**撰写**一份..." → create（必须用工具创建，不能只输出文字！）
 
 **关键区别**：
 - 如果用户只是想**改内容**，不管内容多少，都用 **replace**！
-- 只有用户明确说要"创建/新建/写一份新的"时，才用 create/create_from_template
+- 只有用户明确说要"创建/新建/写一份/撰写/编写"时，才用 create/create_from_template
 - 用户给了新内容让你"填进去"或"改成这个"，用 **replace**，不是 create！
+- **⚠️ 绝对不能把文档内容直接输出为文字回复！必须调用 create 工具！**
 </tool_selection>
 
 <docx_catalog_policy>
@@ -732,6 +1292,15 @@ ${DOC_SUMMARY_END}
 - 陈述假设并继续执行；除非真正被阻塞，否则不要停下来等待确认
 </communication>
 
+<punctuation_policy>
+**⚠️ 标点符号保留原则（极其重要！）**
+
+- **绝对不要修改文档中的引号类型**：不要把中文引号（""''）改成英文引号（""''），也不要反过来改
+- **不要"规范化"标点符号**：文档中的引号、括号、逗号、句号等标点保持原样，除非用户明确要求修改标点
+- **replace 操作时**：search 和 replace 中的标点必须与原文完全一致
+- 只有当用户明确说"统一引号""修改标点"等指令时，才可以修改标点符号
+</punctuation_policy>
+
 <quick_commands>
 用户可能使用快捷命令，你需要理解并执行：
 - /润色 → 优化文字表达，使其更流畅专业
@@ -761,6 +1330,7 @@ ${DOC_SUMMARY_END}
 **⚠️ Word 文档分段修改原则（极其重要！）**
 
 修改 **Word 文档** 时，使用 replace 工具进行精准修改，**必须分多次调用**：
+- Keep each round small: usually 2-3 tool calls max, then observe tool results before continuing.
 - **每次 replace 的 search 参数不超过 1000 字**
 - **每次只改一个段落、一句话或一个短语**
 - **逐条修改，让用户能清楚看到每处变化**
@@ -842,6 +1412,15 @@ search: 要查找的原文（必须精确匹配，尽量短小）
 replace: 替换后的新文字
 [/TOOL_CALL]
 
+**带 blockIndex 精确定位**（推荐）：
+[TOOL_CALL] replace
+blockIndex: 3
+search: 要查找的原文
+replace: 替换后的新文字
+[/TOOL_CALL]
+
+blockIndex 来自文档内容中每个块的 \`_i\` 字段，可精确定位到具体段落/标题，避免全文搜索歧义。不提供 blockIndex 时自动全文搜索。
+
 **带格式替换**（可选参数）：
 [TOOL_CALL] replace
 search: 原文
@@ -869,9 +1448,11 @@ color: #ff0000
 **关键规则**：
 - search 内容必须与文档中的文字**完全一致**，包括标点符号和空格
 - **⚠️ search 只能是纯文本！不要包含引号、HTML标签或任何格式代码**
+- search must not contain ellipsis ("..." or unicode ellipsis) or truncated snippets; use one complete contiguous source segment.
 - **错误示例**：search: "申请理由" ← 不要加引号！
 - **正确示例**：search: 申请理由 ← 直接写文字
-- **每次替换的内容尽量短**（一句话以内），方便用户审阅
+- **每次替换的内容尽量短**（一句话以内），方便用户审阅。search 只写包含变化的那句话（10-50字），不要把整段作为 search
+- **search 和 replace 必须有实际文字差异**，不要输出相同的内容
 - 如果需要替换多处不同内容，为每处分别调用一次
 - 相同内容的多处出现会被一次性全部替换
 - 系统会智能处理 HTML 标签，保留原有格式
@@ -923,7 +1504,9 @@ bold: true
 - type 必填，方便用户按类型筛选审阅
 - 优先处理严重问题（语病>逻辑>错别字>措辞>格式）
 - 从文档开头到结尾顺序处理，避免位置偏移
-- search 不超过 200 字，每次只改最小范围
+- **search 必须尽量短**：只包含需要修改的那句话或短语，不要把整段作为 search。例如只改一个字，search 就只写包含那个字的那句话（通常 10-50 字），不要写整段（200+ 字）
+- **search 和 replace 必须有实际文字差异**，不要输出相同的内容
+- 单次审查最多输出 30 条 review，避免一次性修改过多
 
 ## 1.5 word_edit_ops - 格式/样式/结构操作（Word 文档专用，支持预览确认）
 当用户想要**调整格式、样式、列表、表格、图片或文档结构**时使用。
@@ -1532,10 +2115,10 @@ ops: [
 ## 2. create - 从零创建新文档
 **⚠️ 注意**：如果用户要求"按照当前文档格式"创建新文档，请使用 **create_from_template** 工具！
 
-create 工具只适用于：
-- 用户没有打开任何文档
-- 用户明确要求从零开始创建
-- 创建简单文档
+create 工具适用于：
+- 用户没有打开任何文档，需要从零创建
+- 用户明确要求创建/撰写/编写新文档
+- 无论文档简单还是复杂，只要是"创建新文档"就用 create
 
 **⚠️ 长文档 DSL 链式创建策略（极其重要！）**
 
@@ -1551,16 +2134,12 @@ create 工具只适用于：
 - 每步只写 1~2 个章节，不超过 1500 字
 - DSL 中同样指定完整的排版格式
 
-**最后一步：整体审查**
-- 全部写完后，系统会附带最新完整文档内容
-- 检查有无遗漏/错误，用 replace 修正细节；无问题则回复总结
-
 **示例流程**：
 1. create dsl:{"blocks":[标题+一、项目概述（带字体字号格式）]}
 2. insert position:end dsl:{"blocks":[二、业务需求（带格式）]}
 3. insert position:end dsl:{"blocks":[三、技术方案（带格式）]}
-4. insert position:end dsl:{"blocks":[四、实施计划（带格式）]}  ← 最后一部分
-5. 审查完整文档 → 回复总结
+4. insert position:end dsl:{"blocks":[四、实施计划（带格式）]}
+5. 简短总结即可（用户已通过工具卡片看到每步结果）
 
 **DSL 格式排版建议（中文商务/公文文档）**：
 - 一级标题：黑体，16pt，居中，段前12pt段后6pt
@@ -1568,6 +2147,13 @@ create 工具只适用于：
 - 三级标题：黑体，12pt，左对齐，加粗
 - 正文段落：仿宋，12pt（小四），首行缩进2em，行距28pt
 - 表格内容：宋体，10.5pt（五号）
+
+**DSL 格式排版建议（英文/西式文档）**：
+- 一级标题：Cambria 或 Georgia，18-22pt，居中或左对齐，加粗，可加颜色
+- 二级标题：Cambria 或 Georgia，14-16pt，左对齐，加粗
+- 三级标题：Calibri 或 Arial，12-13pt，左对齐，加粗
+- 正文段落：Calibri 或 Times New Roman，11-12pt，行距1.15-1.5倍
+- 表格内容：Calibri，10-11pt
 
 **核心规则**：
 - 每步都用 DSL，AI 自主控制每个段落的字体/字号/颜色/行距
@@ -1591,7 +2177,26 @@ dsl: {"blocks":[{"type":"heading","level":1,"content":"标题"},{"type":"paragra
 - image: {"type":"image","src":"https://...","width":"300px","alignment":"center"}
 
 **DSL 行内格式（Run）**: text, bold, italic, underline, strikethrough, fontFamily, fontSize, color, highlight
-**DSL 段落格式（format）**: alignment, firstLineIndent, leftIndent, spaceBefore, spaceAfter, lineHeight
+**DSL 段落格式（format）**: alignment, firstLineIndent, leftIndent, spaceBefore, spaceAfter, lineHeight, backgroundColor
+
+**⚠️ 字体使用规则（极其重要！）**：
+fontFamily 只能使用以下安全字体，其他字体会被自动替换：
+- 中文字体：宋体、黑体、仿宋、楷体、微软雅黑、华文中宋、华文仿宋
+- 英文字体：Times New Roman、Arial、Calibri、Cambria、Georgia、Verdana、Garamond、Palatino Linotype、Trebuchet MS、Segoe UI
+- 禁止使用 Google Fonts 或其他网络字体（如 Montserrat、Playfair Display、Roboto 等），这些字体在用户系统上不存在，会导致乱码！
+
+**⚠️ 正文颜色规则**：
+- 正文文字颜色必须使用 #000000（纯黑）或 #1A1A1A（近黑），禁止使用 #333333、#555555 等灰色！灰色在屏幕和打印中可读性差。
+- 标题颜色可以使用深色主题色（如 #1B3A5C），但正文必须是黑色或近黑色。
+- 表格正文也用 #000000 或 #1A1A1A，表头白色文字 #FFFFFF 配深色背景可以。
+
+**视觉丰富文档的 DSL 技巧**：
+- 标题颜色：用 color 属性设置标题颜色，如 {"text":"标题","color":"#1B3A5C","bold":true,"fontSize":18}
+- 背景高亮框：用段落 format.backgroundColor 创建重点框，如 {"type":"paragraph","content":"重要信息","format":{"backgroundColor":"#F0F4F8","leftIndent":"1cm","spaceBefore":"6pt","spaceAfter":"6pt"}}
+- 表格样式：用 cell.backgroundColor 设置表头背景色，如 {"content":"表头","backgroundColor":"#2C3E50"} + 白色文字 {"text":"表头","color":"#FFFFFF","bold":true}
+- 分隔线：用 {"type":"horizontalRule"} 分隔章节
+- 分页符：用 {"type":"pageBreak"} 在章节间分页
+- 图片居中：{"type":"image","src":"...","alignment":"center","width":"400px"}
 
 **方式二：参考另一个 DOCX 的排版**
 [TOOL_CALL] create
@@ -1655,17 +2260,16 @@ elements: [{"type":"heading","content":"标题","level":1},{"type":"paragraph","
   - 格式问题 → review + 格式参数（fontFamily/fontSize/bold 等）
   - 问题较多时**先处理最重要的 10 处**，然后告知用户可继续审查
 
-**第 4 步：给出审查总结**
-  - 共发现 N 个问题，已提交 N 处修改建议
-  - 按类别统计：语法 X 处、逻辑 X 处、措辞 X 处...
-  - 提醒用户去修订面板逐条接受/拒绝
+**第 4 步：简短总结**
+  - 一句话概括："共修改 N 处（语法 X、措辞 Y、格式 Z）"即可
+  - 用户已通过工具卡片实时看到每步结果，不要重复列举
 
 ## 3. insert - 插入内容
 在文档的指定位置插入新内容。支持**纯文本**和**DSL 结构化格式**两种方式。
 
 **方式一：纯文本插入**
 [TOOL_CALL] insert
-position: start | end | after:锚点文字
+position: start | end | before:锚点文字 | after:锚点文字
 content: 要插入的文本内容
 [/TOOL_CALL]
 
@@ -1687,8 +2291,54 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"二、业务需�
 - \`start\`：在文档开头插入
 - \`end\`：在文档末尾插入（长文档续写时必须用 end）
 - \`after:某段文字\`：在指定文字后面插入
+- \`before:某段文字\`：在指定文字前面插入
+- \`blockIndex:N\`：在第 N 个块之后插入（N 来自文档内容中的 \`_i\` 字段）
+- ⚠️ 锚点文字取 10-20 字即可，不要包含引号
 
 **⚠️ 长文档创建时，第 2 步起必须用 insert + dsl + position:end 来续写，不要用 replace。**
+
+## 3.5 word_chart - 在文档中插入图表
+在当前 Word 文档中插入一个可视化图表（柱状图/折线图/饼图/环形图/散点图/雷达图）。
+当用户说"插入图表"、"画个柱状图"、"做个饼图"、"数据可视化"等需求时，使用此工具。
+
+[TOOL_CALL] word_chart
+type: bar
+title: 2024年各季度销售额
+categories: ["Q1","Q2","Q3","Q4"]
+series: [{"name":"华东区","values":[120,150,180,200],"color":"#4472C4"},{"name":"华南区","values":[90,110,140,160],"color":"#ED7D31"}]
+position: end
+width: 500
+height: 300
+[/TOOL_CALL]
+
+**参数说明：**
+- type: 图表类型
+  - bar（柱状图）⭐用于对比分析
+  - line（折线图）⭐用于趋势分析
+  - pie（饼图）⭐用于占比分析
+  - doughnut（环形图）
+  - scatter（散点图）
+  - radar（雷达图）
+- title: 图表标题（可选）
+- categories: JSON 数组，X 轴分类标签，如 ["Q1","Q2","Q3","Q4"]
+- series: JSON 数组，每个系列包含 name、values、color（可选）
+  - 示例：[{"name":"销售额","values":[100,200,300],"color":"#4472C4"}]
+  - 饼图/环形图只需一个系列，可用 pointColors 为每个扇区指定颜色
+  - color 不填则自动分配 Office 默认配色
+- position: start | end | after:锚点文字 | before:锚点文字 | blockIndex:N（默认 end）
+- width: 图表宽度像素（默认 500）
+- height: 图表高度像素（默认 300）
+- stacking: stacked | percentStacked（可选，仅 bar/line 有效）
+- legendPosition: top | bottom | left | right（可选，默认 bottom）
+
+**饼图示例：**
+[TOOL_CALL] word_chart
+type: pie
+title: 市场份额分布
+categories: ["产品A","产品B","产品C","其他"]
+series: [{"name":"份额","values":[35,28,22,15]}]
+position: end
+[/TOOL_CALL]
 
 ## 4. delete - 删除内容
 删除文档中的指定内容。
@@ -1696,6 +2346,12 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"二、业务需�
 调用格式：
 [TOOL_CALL] delete
 target: 要删除的文字（精确匹配）
+[/TOOL_CALL]
+
+**带 blockIndex 删除整个块**：
+[TOOL_CALL] delete
+blockIndex: 7
+target: （可省略，按块索引删除整个段落）
 [/TOOL_CALL]
 
 ## 5. create_from_template - 基于当前文档创建新文档
@@ -2293,18 +2949,38 @@ replace: 12月
 
 [TOOL_CALL] create
 title: 通知
-content: <h1>通知</h1><p>内容...</p>
+dsl: {"blocks":[{"type":"heading","level":1,"content":[{"text":"通知","fontFamily":"黑体","fontSize":16,"bold":true}],"format":{"alignment":"center"}},{"type":"paragraph","content":[{"text":"    各部门注意，明天下午2点召开全体会议。","fontFamily":"仿宋","fontSize":12}],"format":{"firstLineIndent":"2em","lineHeight":"28pt"}}]}
+[/TOOL_CALL]
+
+### 示例6：撰写长文档（分步创建）
+用户：撰写一份赞助提案
+
+第一步：用 create 创建文档开头
+[TOOL_CALL] create
+title: 赞助提案
+dsl: {"blocks":[{"type":"heading","level":1,"content":[{"text":"赞助提案","fontSize":18,"bold":true}],"format":{"alignment":"center"}},{"type":"paragraph","content":[{"text":"尊敬的赞助商...","fontSize":12}],"format":{"firstLineIndent":"2em"}}]}
+[/TOOL_CALL]
+
+第二步：用 insert 追加后续章节
+[TOOL_CALL] insert
+position: end
+dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","fontSize":14,"bold":true}]},{"type":"table","rows":[{"cells":[{"content":"级别"},{"content":"金额"},{"content":"权益"}],"isHeader":true}]}]}
 [/TOOL_CALL]
 
 </tool_usage_examples>
 
 <constraints>
-- **不要**在没有使用工具的情况下声称已修改文档
+- **不要**在没有使用工具的情况下声称已修改或创建文档
+- **不要**把文档内容直接输出为纯文本！创建文档必须使用 create 工具 + DSL 参数，修改文档必须使用 replace/insert/delete 工具
 - **不要**输出完整的文档内容来"展示"修改，使用 replace 工具进行精准修改
 - **不要**猜测文档内容，根据系统提供的 [当前文档内容] 进行操作
 - **不要**输出冗长的解释，保持简洁
 - **不要**在工具调用前后添加不必要的确认语句
+- **⚠️ 创建文档时绝对不能只输出文字内容！必须调用 [TOOL_CALL] create 工具，用 dsl 参数传入结构化内容。如果你只是把内容写成文字回复，用户将无法得到任何文档文件。**
 - 如果 search 内容在文档中找不到，系统会返回失败，此时应该检查是否有拼写差异并重试
+- Use plain-text search snippets only: no HTML tags, no ... ellipsis, and no truncated excerpts.
+- Prefer short and unique search snippets (about 10-40 chars) instead of very long paragraphs.
+- If replace fails, retry with a shorter exact snippet copied from the latest document context.
 </constraints>
 
 <response_style>
@@ -2338,9 +3014,15 @@ content: <h1>通知</h1><p>内容...</p>
 
   // 单次 API 调用
   const callAPI = async (
-    allMessages: Array<{ role: string; content: string }>,
+    allMessages: Array<{ role: string; content: MessageContent }>,
     signal: AbortSignal,
-    options?: { returnRaw?: boolean }
+    options?: {
+      returnRaw?: boolean
+      onToolCallStart?: (tool: string) => void
+      onToolCallPreview?: (tool: string, args: Record<string, string>) => void
+      maxToolCallPreviews?: number
+      onResponseFinal?: (payload: { raw: string; cleaned: string }) => void
+    }
   ): Promise<string> => {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -2350,6 +3032,11 @@ content: <h1>通知</h1><p>内容...</p>
     }
 
     // Electron 环境：优先走主进程代理（Node fetch/HTTP1.1），避免渲染进程 HTTP/2 的 ERR_HTTP2_PING_FAILED
+    const toolPreviewState = {
+      emitted: new Set<string>(),
+      startedSignatures: new Set<string>(),
+    }
+
     if (window.electronAPI?.isElectron && window.electronAPI.aiChatCompletions && window.electronAPI.onAIStreamDelta) {
       const requestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
       let fullContent = ''
@@ -2367,7 +3054,9 @@ content: <h1>通知</h1><p>内容...</p>
         if (delta) {
           contentDeltaCount += 1
           fullContent += delta
-          // 从内容中提取 <think> 标签内的思考内容
+          emitToolCallStartFromRaw(fullContent, toolPreviewState, options?.onToolCallStart, options?.maxToolCallPreviews)
+          emitToolCallPreviewFromRaw(fullContent, toolPreviewState, options?.onToolCallPreview, options?.maxToolCallPreviews)
+          // ?????? <think> ????????
           const { thinking, cleaned } = extractThinking(fullContent)
           if (thinking && thinking !== fullReasoning) {
             fullReasoning = thinking
@@ -2377,7 +3066,8 @@ content: <h1>通知</h1><p>内容...</p>
           if (parsed.summary) setStreamingSummary(parsed.summary)
           if (parsed.phase === 'editing') setEditPhase('editing')
           if (parsed.phase === 'done') setEditPhase('done')
-          setStreamingContent(parsed.displayText)
+          const safeDisplay = trimTrailingOpenToolCallBlock(parsed.displayText)
+          setStreamingContent(streamPrefixRef.current + safeDisplay)
         }
         
         // 处理思考增量（kimi-k2.5 等思考模型 - 通过单独字段返回）
@@ -2418,7 +3108,14 @@ content: <h1>通知</h1><p>内容...</p>
         }
 
         const content = result.content || fullContent
+        emitToolCallStartFromRaw(content, toolPreviewState, options?.onToolCallStart, options?.maxToolCallPreviews)
+        emitToolCallPreviewFromRaw(content, toolPreviewState, options?.onToolCallPreview, options?.maxToolCallPreviews)
         const cleaned = cleanModelOutput(content)
+        try {
+          options?.onResponseFinal?.({ raw: content, cleaned })
+        } catch {
+          // ignore callback errors
+        }
         const parsed = parseAssistantOutput(cleaned)
         const displayText = parsed.displayText || parsed.summary || cleaned
         if (parsed.summary) setStreamingSummary(parsed.summary)
@@ -2533,7 +3230,9 @@ content: <h1>通知</h1><p>内容...</p>
             }
             if (contentDelta) {
               fullContent += contentDelta
-              // 从内容中提取 <think> 标签内的思考内容
+              emitToolCallStartFromRaw(fullContent, toolPreviewState, options?.onToolCallStart, options?.maxToolCallPreviews)
+              emitToolCallPreviewFromRaw(fullContent, toolPreviewState, options?.onToolCallPreview, options?.maxToolCallPreviews)
+              // ?????? <think> ????????
               const { thinking, cleaned } = extractThinking(fullContent)
               if (thinking && thinking !== fullReasoning) {
                 fullReasoning = thinking
@@ -2543,7 +3242,8 @@ content: <h1>通知</h1><p>内容...</p>
               if (parsed.summary) setStreamingSummary(parsed.summary)
               if (parsed.phase === 'editing') setEditPhase('editing')
               if (parsed.phase === 'done') setEditPhase('done')
-              setStreamingContent(parsed.displayText)
+              const safeDisplay2 = trimTrailingOpenToolCallBlock(parsed.displayText)
+              setStreamingContent(streamPrefixRef.current + safeDisplay2)
             }
           } catch {
             // 忽略解析错误
@@ -2552,7 +3252,14 @@ content: <h1>通知</h1><p>内容...</p>
       }
     }
 
+    emitToolCallStartFromRaw(fullContent, toolPreviewState, options?.onToolCallStart, options?.maxToolCallPreviews)
+    emitToolCallPreviewFromRaw(fullContent, toolPreviewState, options?.onToolCallPreview, options?.maxToolCallPreviews)
     const cleaned = cleanModelOutput(fullContent)
+    try {
+      options?.onResponseFinal?.({ raw: fullContent, cleaned })
+    } catch {
+      // ignore callback errors
+    }
     const parsed = parseAssistantOutput(cleaned)
     if (parsed.summary) setStreamingSummary(parsed.summary)
     if (parsed.phase === 'editing') setEditPhase('editing')
@@ -2601,7 +3308,8 @@ content: <h1>通知</h1><p>内容...</p>
     documentContext?: string,
     filesContext?: string,
     callbacks?: AgentCallbacks,
-    memoryContext?: { workspaceKey?: string; workspaceSummary?: string }
+    memoryContext?: { workspaceKey?: string; workspaceSummary?: string },
+    images?: string[]
   ): Promise<void> => {
     setIsLoading(true)
     setStreamingContent('')
@@ -2615,7 +3323,21 @@ content: <h1>通知</h1><p>内容...</p>
     abortControllerRef.current = new AbortController()
 
     const allToolResults: ToolResult[] = []
-    const conversationMessages: Array<{ role: string; content: string }> = []
+    const conversationMessages: Array<{ role: string; content: MessageContent }> = []
+    const turnId = `turn-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    let iteration = 0
+
+    // ─── 工具调用日志：启动会话 ───
+    toolCallLogger.startSession()
+
+    const emitDebugEvent = async (event: AgentDebugEvent): Promise<void> => {
+      if (!callbacks?.onDebugEvent) return
+      try {
+        await callbacks.onDebugEvent(event)
+      } catch (err) {
+        console.warn('[Agent] debug event callback failed:', err)
+      }
+    }
 
     try {
       // 构建初始用户消息
@@ -2668,6 +3390,19 @@ content: <h1>通知</h1><p>内容...</p>
         }))
         .filter(m => m.content.length > 0)
 
+      await emitDebugEvent({
+        type: 'turn_start',
+        turnId,
+        timestamp: new Date().toISOString(),
+        model: settings.model,
+        baseUrl: settings.baseUrl,
+        userInput: content,
+        hasDocumentContext: !!documentContext,
+        hasFilesContext: !!filesContext,
+        imageCount: images?.length || 0,
+        recentMessagesCount: recentMessages.length,
+      })
+
       if (memoryEnabled && window.electronAPI?.memoryAppend) {
         const flushThreshold = Math.max(2000, settings.memoryFlushThresholdChars || 12000)
         const now = Date.now()
@@ -2696,64 +3431,167 @@ content: <h1>通知</h1><p>内容...</p>
         }
       }
 
-      // 初始化对话
+      // 初始化对话 — 如果有图片则使用 OpenAI 多模态 content 数组格式
+      let userMessageContent: MessageContent = userContent
+      if (images && images.length > 0) {
+        const contentParts: Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }> = [
+          { type: 'text', text: userContent }
+        ]
+        for (const imgUrl of images) {
+          contentParts.push({ type: 'image_url', image_url: { url: imgUrl } })
+        }
+        userMessageContent = contentParts
+      }
+
       conversationMessages.push(
         { role: 'system', content: agentSystemPrompt },
         ...recentMessages,
-        { role: 'user', content: userContent }
+        { role: 'user', content: userMessageContent }
       )
 
+      // ─── 工具调用日志：记录初始上下文 ───
+      toolCallLogger.logRequestContext({
+        documentContentLength: documentContext?.length || 0,
+        documentContentTruncated: (documentContext?.length || 0) > 120_000,
+        attachedFilesCount: filesContext ? 1 : 0,
+        messageCount: conversationMessages.length,
+        totalCharsEstimate: conversationMessages.reduce((sum, m) => sum + (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content).length), 0),
+      })
+      toolCallLogger.logApiRequest({
+        model: settings.model,
+        messageCount: conversationMessages.length,
+        systemPromptLength: agentSystemPrompt.length,
+        temperature: settings.temperature,
+        maxTokens: settings.maxTokens,
+      })
+
       let maxIterations = 20 // 防止无限循环，增加到20次以支持复杂任务
-      let iteration = 0
       let accumulatedContent = '' // 累积所有响应中的文本内容
       let latestSummary = '' // 解析到的最新总结
       let lastResponse = ''
       let finalContentForMemory = ''
 
-      // 【防重复修改】追踪已修改的内容
-      const modifiedSearchTexts = new Set<string>() // 已被替换的原文
-      const modifiedReplaceTexts = new Set<string>() // 替换后的新文本
+      // Track successful edit snippets for in-turn deduplication.
+      const normalizeToolText = (value: string) => (value || '').replace(/\s+/g, ' ').trim()
+      const buildEditKey = (searchText: string, replaceText: string) => `${normalizeToolText(searchText)}=>${normalizeToolText(replaceText)}`
+      const modifiedSearchTexts = new Set<string>() // normalized source snippets processed by replace/review
+      const modifiedReplaceTexts = new Set<string>() // normalized output snippets produced by replace/review
+      const successfulEditPairs = new Set<string>() // normalized search=>replace pairs already succeeded
+
       let totalReplaceCount = 0 // 总 replace 次数
       let consecutiveReplaceCount = 0 // 连续 replace 次数
       const MAX_CONSECUTIVE_REPLACE = 10 // 连续 replace 上限
-      let shouldForceStop = false // 是否强制停止
+      const MAX_TOOL_CALLS_PER_ITERATION = 3 // controlled batching: execute at most three tool calls per round
+      let shouldForceStop = false // force stop flag
+
+      // Cursor 风格：初始化流式累积前缀
+      streamPrefixRef.current = ''
 
       while (iteration < maxIterations && !shouldForceStop) {
         iteration++
+        toolCallLogger.setIteration(iteration)
         
+        // 每轮清空：思考内容 + 流式前缀（文本由 streamItems 管理，前缀只用于当前轮实时显示）
+        setStreamingReasoning('')
+        streamPrefixRef.current = ''
+        setStreamingContent('')
+
         // 安全过滤：确保没有空 content 的消息（API 会拒绝空消息）
         for (let i = conversationMessages.length - 1; i >= 0; i--) {
-          if (!conversationMessages[i].content || !conversationMessages[i].content.trim()) {
+          const c = conversationMessages[i].content
+          if (Array.isArray(c)) {
+            // 多模态数组格式：只要有元素就算非空
+            if (c.length === 0) conversationMessages[i].content = '[空]'
+          } else if (!c || !c.trim()) {
             conversationMessages[i].content = '[空]'
           }
         }
 
-        // 调用 API
+        // 调用 API（streaming 会通过 streamPrefixRef 累积输出，实时更新 UI）
+        let rawResponse = ''
         const response = await callAPI(
           conversationMessages,
           abortControllerRef.current.signal,
-          { returnRaw: true }
+          {
+            returnRaw: true,
+            onToolCallStart: callbacks?.onToolCallStart,
+            onToolCallPreview: callbacks?.onToolCallPreview,
+            maxToolCallPreviews: MAX_TOOL_CALLS_PER_ITERATION,
+            onResponseFinal: ({ raw }) => {
+              rawResponse = raw
+            },
+          }
         )
         lastResponse = response
+        const responseForDebug = rawResponse || response
+        const responseForToolParsing = responseForDebug || response
 
-        // 检查是否有工具调用
-        if (hasToolCall(response)) {
-          const toolCalls = parseToolCalls(response)
-          
+        await emitDebugEvent({
+          type: 'api_response_raw',
+          turnId,
+          timestamp: new Date().toISOString(),
+          iteration,
+          stage: 'loop',
+          response,
+          rawResponse: responseForDebug,
+          hasToolCall: hasToolCall(responseForToolParsing),
+        })
+
+        // ?????????
+        if (hasToolCall(responseForToolParsing)) {
+          const parsedToolCalls = parseToolCalls(responseForToolParsing)
+          const toolCalls = parsedToolCalls.slice(0, MAX_TOOL_CALLS_PER_ITERATION)
+          const deferredToolCalls = parsedToolCalls.slice(MAX_TOOL_CALLS_PER_ITERATION)
+
+          // ─── 工具调用日志：解析出的工具调用 ───
+          toolCallLogger.logToolCallsParsed(
+            parsedToolCalls.map(c => ({ tool: c.tool, args: { ...c.args } }))
+          )
+
+          await emitDebugEvent({
+            type: 'tool_calls_parsed',
+            turnId,
+            timestamp: new Date().toISOString(),
+            iteration,
+            calls: parsedToolCalls.map((call) => ({ tool: call.tool, args: { ...call.args } })),
+          })
+
+          if (deferredToolCalls.length > 0) {
+            const deferReason = `deferred by controlled batching policy: max ${MAX_TOOL_CALLS_PER_ITERATION} tool call(s) per iteration`
+            for (const deferredCall of deferredToolCalls) {
+              await emitDebugEvent({
+                type: 'tool_call_skipped',
+                turnId,
+                timestamp: new Date().toISOString(),
+                iteration,
+                tool: deferredCall.tool,
+                args: { ...deferredCall.args },
+                reason: deferReason,
+              })
+              callbacks?.onToolCallSkipped?.(deferredCall.tool, { ...deferredCall.args }, deferReason)
+            }
+          }
+
           // 提取工具调用之外的文本内容并累积
-          const parsedOutput = parseAssistantOutput(cleanModelOutput(response))
+          const parsedOutput = parseAssistantOutput(cleanModelOutput(responseForToolParsing))
           console.log('[Agent] 提取的文本内容:', parsedOutput.displayText?.substring(0, 200))
           if (parsedOutput.summary) {
             latestSummary = parsedOutput.summary
             setStreamingSummary(parsedOutput.summary)
           }
-          if (parsedOutput.displayText) {
-            accumulatedContent = parsedOutput.displayText // 用最新的内容替换，因为 AI 会在最后给出完整总结
-            console.log('[Agent] 累积内容已更新:', accumulatedContent.substring(0, 200))
+          
+          // 将本轮 AI 的文本推送给 ChatPanel（交替渲染用）并累积到前缀
+          const thisRoundText = parsedOutput.displayText || ''
+          if (thisRoundText) {
+            callbacks?.onTextChunk?.(thisRoundText)
+            accumulatedContent = thisRoundText
+            // 文本已推送到 streamItems，清空前缀让流式框只显示正在生成的新内容
+            streamPrefixRef.current = ''
+            setStreamingContent('')
           }
           
           // 将 AI 响应添加到对话
-          conversationMessages.push({ role: 'assistant', content: response })
+          conversationMessages.push({ role: 'assistant', content: responseForToolParsing })
 
           // 执行每个工具调用
           const results: string[] = []
@@ -2761,55 +3599,143 @@ content: <h1>通知</h1><p>内容...</p>
           let hasReplaceInThisBatch = false
           let skippedCount = 0
           
-          for (const call of toolCalls) {
-            // 【防重复修改】检测 replace 工具的重复调用
+          for (let ti = 0; ti < toolCalls.length; ti++) {
+            const call = toolCalls[ti]
+            
+            const isEditTool = call.tool === 'replace' || call.tool === 'review'
             if (call.tool === 'replace') {
               hasReplaceInThisBatch = true
-              const searchText = call.args.search || ''
-              const replaceText = call.args.replace || ''
-              
-              // 检查是否正在修改之前已经修改过的内容
-              if (modifiedReplaceTexts.has(searchText)) {
-                console.warn(`[Agent] 跳过重复修改: 该内容是之前修改的结果`)
-                results.push(`[TOOL_RESULT]\n工具: replace\n状态: 跳过 - 该内容已被修改过，无需再次修改\n[/TOOL_RESULT]`)
+            }
+
+            if (isEditTool) {
+              const rawSearchText = call.args.search || ''
+              const rawReplaceText = call.args.replace || ''
+              const searchText = normalizeToolText(rawSearchText)
+              const pairKey = buildEditKey(rawSearchText, rawReplaceText)
+
+              // 1) Skip exact duplicate search+replace pairs in the same turn.
+              if (successfulEditPairs.has(pairKey)) {
+                console.warn(`[Agent] skip duplicate ${call.tool}: same search/replace already succeeded`)
+                toolCallLogger.logToolCallSkipped(call.tool, 'duplicate search/replace pair', { ...call.args })
+                results.push(`[TOOL_RESULT]\ntool: ${call.tool}\nstatus: skipped - duplicate search/replace pair in this turn\n[/TOOL_RESULT]`)
                 skippedCount++
+                await emitDebugEvent({
+                  type: 'tool_call_skipped',
+                  turnId,
+                  timestamp: new Date().toISOString(),
+                  iteration,
+                  tool: call.tool,
+                  args: { ...call.args },
+                  reason: 'duplicate search/replace pair in this turn',
+                })
+                callbacks?.onToolCallSkipped?.(call.tool, { ...call.args }, 'duplicate search/replace pair in this turn')
                 continue
               }
-              
-              // 检查是否修改相同的原文
-              if (modifiedSearchTexts.has(searchText)) {
-                console.warn(`[Agent] 跳过重复修改: 相同原文已被修改`)
-                results.push(`[TOOL_RESULT]\n工具: replace\n状态: 跳过 - 相同内容已被修改过\n[/TOOL_RESULT]`)
+
+              // 2) Skip attempts to edit text that was produced by previous edits.
+              if (searchText && modifiedReplaceTexts.has(searchText)) {
+                console.warn(`[Agent] skip duplicate ${call.tool}: search hits text already produced earlier in this turn`)
+                toolCallLogger.logToolCallSkipped(call.tool, 'search hits text already produced', { ...call.args })
+                results.push(`[TOOL_RESULT]\ntool: ${call.tool}\nstatus: skipped - search text has already been produced by an earlier edit\n[/TOOL_RESULT]`)
                 skippedCount++
+                await emitDebugEvent({
+                  type: 'tool_call_skipped',
+                  turnId,
+                  timestamp: new Date().toISOString(),
+                  iteration,
+                  tool: call.tool,
+                  args: { ...call.args },
+                  reason: 'search text has already been produced by an earlier edit in this turn',
+                })
+                callbacks?.onToolCallSkipped?.(call.tool, { ...call.args }, 'search text has already been produced by an earlier edit in this turn')
+                continue
+              }
+
+              // 3) Skip repeated processing of the same source text in one turn.
+              if (searchText && modifiedSearchTexts.has(searchText)) {
+                console.warn(`[Agent] skip duplicate ${call.tool}: original search text already processed`)
+                toolCallLogger.logToolCallSkipped(call.tool, 'original search text already processed', { ...call.args })
+                results.push(`[TOOL_RESULT]\ntool: ${call.tool}\nstatus: skipped - original search text has already been processed in this turn\n[/TOOL_RESULT]`)
+                skippedCount++
+                await emitDebugEvent({
+                  type: 'tool_call_skipped',
+                  turnId,
+                  timestamp: new Date().toISOString(),
+                  iteration,
+                  tool: call.tool,
+                  args: { ...call.args },
+                  reason: 'original search text has already been processed in this turn',
+                })
+                callbacks?.onToolCallSkipped?.(call.tool, { ...call.args }, 'original search text has already been processed in this turn')
                 continue
               }
             }
-            
+
             if (callbacks?.onToolCall) {
+              // 工具卡片由 ChatPanel 的 toolActivity 状态驱动，不再写入 streamPrefixRef
+              // ─── 工具调用日志：执行开始 ───
+              toolCallLogger.logToolExecStart(call.tool, { ...call.args })
+              const execStartTime = Date.now()
+
               const result = await callbacks.onToolCall(call.tool, call.args)
               allToolResults.push(result)
               if (!result.success) allSuccessful = false
+
+              // 每个工具执行后让出一帧，确保 React 渲染中间状态（create 后能看到文档，insert 后能看到新内容）
+              await new Promise(resolve => requestAnimationFrame(resolve))
+
+              // ─── 工具调用日志：执行结果 ───
+              toolCallLogger.logToolExecResult(call.tool, result, Date.now() - execStartTime)
+
+              await emitDebugEvent({
+                type: 'tool_result',
+                turnId,
+                timestamp: new Date().toISOString(),
+                iteration,
+                index: ti + 1,
+                total: toolCalls.length,
+                tool: call.tool,
+                args: { ...call.args },
+                result,
+              })
               
-              // 【追踪修改】记录成功的 replace 操作
-              if (call.tool === 'replace' && result.success) {
-                const searchText = call.args.search || ''
-                const replaceText = call.args.replace || ''
-                modifiedSearchTexts.add(searchText)
-                modifiedReplaceTexts.add(replaceText)
-                totalReplaceCount++
-                console.log(`[Agent] 记录修改 #${totalReplaceCount}: "${searchText.substring(0, 30)}..." → "${replaceText.substring(0, 30)}..."`)
+              // Track successful replace/review edits for in-turn dedup.
+              if ((call.tool === 'replace' || call.tool === 'review') && result.success) {
+                const rawSearchText = call.args.search || ''
+                const rawReplaceText = call.args.replace || ''
+                const searchText = normalizeToolText(rawSearchText)
+                const replaceText = normalizeToolText(rawReplaceText)
+
+                if (searchText) modifiedSearchTexts.add(searchText)
+                if (replaceText) modifiedReplaceTexts.add(replaceText)
+                successfulEditPairs.add(buildEditKey(rawSearchText, rawReplaceText))
+
+                if (call.tool === 'replace') {
+                  totalReplaceCount++
+                  console.log(`[Agent] edit recorded #${totalReplaceCount}: "${searchText.substring(0, 30)}..." -> "${replaceText.substring(0, 30)}..."`)
+                }
               }
-              
-              // 更明确的结果反馈，包含进度信息
-              const statusText = result.success 
-                ? '成功 ✓'
-                : `失败: ${result.message}`
-              
+
+              // Build clearer tool feedback, including contextual failure hints.
+              let failureHint = ''
+              if (!result.success && callbacks?.getLatestDocument && (call.tool === 'replace' || call.tool === 'review')) {
+                try {
+                  const latestDoc = callbacks.getLatestDocument()
+                  failureHint = buildToolFailureHint(latestDoc || '', call.args.search || '')
+                } catch (hintErr) {
+                  console.warn('[Agent] failed to build tool hint:', hintErr)
+                }
+              }
+
+              const statusText = result.success
+                ? 'success'
+                : `failed: ${result.message}${failureHint ? `\n${failureHint}` : ''}`
+
               const progressInfo = call.tool === 'replace' && result.success
-                ? `\n已完成修改: ${totalReplaceCount} 处`
+                ? `\ncompleted replacements: ${totalReplaceCount}`
                 : ''
-              
-              results.push(`[TOOL_RESULT]\n工具: ${call.tool}\n状态: ${statusText}${progressInfo}\n[/TOOL_RESULT]`)
+
+              results.push(`[TOOL_RESULT]\ntool: ${call.tool}\nstatus: ${statusText}${progressInfo}\n[/TOOL_RESULT]`)
             }
           }
           
@@ -2835,87 +3761,185 @@ content: <h1>通知</h1><p>内容...</p>
             shouldForceStop = true
           }
 
-          // 获取最新的文档内容（如果有修改文档的工具调用）
-          let documentUpdate = ''
-          const documentTools = ['replace', 'insert', 'delete', 'review']
-          const hasDocumentChange = toolCalls.some(c => documentTools.includes(c.tool))
-          if (hasDocumentChange && callbacks?.getLatestDocument) {
-            const latestDoc = callbacks.getLatestDocument()
-            if (latestDoc) {
-              // 截取文档内容，避免过长
-              const truncatedDoc = latestDoc.length > 8000 
-                ? latestDoc.substring(0, 8000) + '\n...(文档内容已截断)...'
-                : latestDoc
-              documentUpdate = `\n\n[文档当前状态（仅供参考，不需要再次修改已修改过的内容）]\n${truncatedDoc}`
-            }
+          if (deferredToolCalls.length > 0) {
+            results.push(`
+[SYSTEM] This round executed ${toolCalls.length} tool call(s) under controlled batching. ${deferredToolCalls.length} deferred call(s) should be reconsidered in the next round based on latest results.`)
           }
-          
-          // 添加完成提示
+
+          // Add tool results into conversation, then let model choose: continue tooling or finish.
           let completionHint = ''
           if (allSuccessful && toolCalls.length > 0 && !shouldForceStop) {
-            completionHint = `\n\n[系统提示] 工具调用成功。已完成 ${totalReplaceCount} 处修改。如果用户的请求已全部完成，请直接回复总结，**不要再调用工具**。`
+            completionHint = `
+
+[SYSTEM] Tool calls finished for this round. If further edits are required, emit next [TOOL_CALL]. If done, provide a brief final summary.`
           }
 
-          // 将工具结果添加到对话（附带最新文档内容）
-          const toolResultContent = (results.join('\n\n') + documentUpdate + completionHint).trim()
+          const toolResultContent = (results.join('\n\n') + completionHint).trim()
           conversationMessages.push({
             role: 'user',
-            content: toolResultContent || '[工具调用已完成，无额外输出]'
+            content: toolResultContent || '[Tool calls completed with no extra output]'
           })
 
-          // 如果强制停止，跳出循环
+          // ─── 工具调用日志：发回模型的工具结果 ───
+          toolCallLogger.logToolResultsSent(results, totalReplaceCount)
+
           if (shouldForceStop) {
-            console.log('[Agent] 强制停止，准备输出总结')
-            // 再调用一次 API 让 AI 输出总结
-            const summaryResponse = await callAPI(
-              conversationMessages,
-              abortControllerRef.current.signal
-            )
-            const parsedSummary = parseAssistantOutput(cleanModelOutput(summaryResponse))
-            if (parsedSummary.summary) {
-              latestSummary = parsedSummary.summary
-              setStreamingSummary(parsedSummary.summary)
-            }
-            accumulatedContent = parsedSummary.summary || parsedSummary.displayText || summaryResponse
-            finalContentForMemory = accumulatedContent
+            const forcedStopContent = parsedOutput.summary || parsedOutput.displayText || 'Tool loop stopped by safety guard.'
+            finalContentForMemory = forcedStopContent
+
+            await emitDebugEvent({
+              type: 'final_summary',
+              turnId,
+              timestamp: new Date().toISOString(),
+              iteration,
+              source: 'forced_stop',
+              content: forcedStopContent,
+            })
+
+            await emitDebugEvent({
+              type: 'turn_complete',
+              turnId,
+              timestamp: new Date().toISOString(),
+              totalIterations: iteration,
+              finalContent: forcedStopContent,
+              toolResults: allToolResults.map((item) => ({ ...item })),
+            })
+
+            // ─── 工具调用日志：强制停止 ───
+            toolCallLogger.logTurnComplete({
+              totalIterations: iteration,
+              totalToolCalls: allToolResults.length,
+              totalSkipped: skippedCount,
+              stopReason: 'forced_stop',
+              finalResponseLength: forcedStopContent.length,
+            })
+
+            callbacks?.onContent?.(forcedStopContent)
+            callbacks?.onComplete?.(forcedStopContent, allToolResults)
             break
           }
 
-          // 继续循环，让 AI 处理工具结果
+          // Continue loop: model can emit more tool calls or decide to finish.
           continue
         }
 
-        // 没有工具调用，AI 完成了任务
-        // 优先使用当前响应，如果为空则使用累积的内容
-        console.log('[Agent] 最终响应:', response?.substring(0, 200))
+        // 截断检测：[TOOL_CALL] 数量 > [/TOOL_CALL] 数量，说明最后一个被 max_tokens 截断了
+        const openCount = (responseForToolParsing.match(/\[TOOL_CALL\]/g) || []).length
+        const closeCount = (responseForToolParsing.match(/\[\/TOOL_CALL\]/g) || []).length
+        const hasOpenToolCall = openCount > 0 && openCount > closeCount
+        const hasOpenLegacyTag = (() => {
+          if (!responseForToolParsing.includes('<')) return false
+          const lowered = responseForToolParsing.toLowerCase()
+          if (lowered.includes('<tool_use>') && !lowered.includes('</tool_use>')) return true
+          for (const tool of LEGACY_XML_TOOL_NAMES) {
+            if (lowered.includes(`<${tool}>`) && !lowered.includes(`</${tool}>`)) return true
+          }
+          return false
+        })()
+
+        if (hasOpenToolCall || hasOpenLegacyTag) {
+          console.warn('[Agent] 检测到工具调用被截断（max_tokens），请求 AI 继续输出')
+          // 把截断的响应加入对话，让 AI 从断点继续
+          conversationMessages.push({ role: 'assistant', content: responseForToolParsing })
+          conversationMessages.push({
+            role: 'user',
+            content: '[SYSTEM] Your previous response was truncated mid-tool-call. Please continue from where you left off — complete the [TOOL_CALL]...[/TOOL_CALL] block.'
+          })
+          continue
+        }
+
+        // 无工具调用的最终响应
+        console.log('[Agent] 最终响应:', responseForToolParsing?.substring(0, 200))
         console.log('[Agent] 累积内容:', accumulatedContent?.substring(0, 200))
-        const parsedFinal = parseAssistantOutput(cleanModelOutput(response))
+        const parsedFinal = parseAssistantOutput(cleanModelOutput(responseForToolParsing))
         if (parsedFinal.summary) {
           latestSummary = parsedFinal.summary
           setStreamingSummary(parsedFinal.summary)
         }
-        const finalContent =
-          parsedFinal.summary ||
-          parsedFinal.displayText ||
-          latestSummary ||
-          response.trim() ||
-          accumulatedContent
-        console.log('[Agent] 最终内容:', finalContent?.substring(0, 200))
-        finalContentForMemory = finalContent
-        callbacks?.onContent?.(finalContent)
-        callbacks?.onComplete?.(finalContent, allToolResults)
+
+        const finalText = parsedFinal.summary || parsedFinal.displayText || ''
+
+        // Finalize when assistant stops emitting tool calls.
+        // Push final cleaned text to ChatPanel
+        if (finalText) {
+          callbacks?.onTextChunk?.(finalText)
+        }
+        console.log('[Agent] final response:', finalText?.substring(0, 200))
+        finalContentForMemory = finalText // summary saved to memory
+
+        await emitDebugEvent({
+          type: 'final_summary',
+          turnId,
+          timestamp: new Date().toISOString(),
+          iteration,
+          source: 'normal',
+          content: finalText,
+        })
+
+        await emitDebugEvent({
+          type: 'turn_complete',
+          turnId,
+          timestamp: new Date().toISOString(),
+          totalIterations: iteration,
+          finalContent: finalText,
+          toolResults: allToolResults.map((item) => ({ ...item })),
+        })
+
+        // ─── 工具调用日志：正常结束 ───
+        toolCallLogger.logTurnComplete({
+          totalIterations: iteration,
+          totalToolCalls: allToolResults.length,
+          totalSkipped: 0,
+          stopReason: 'normal',
+          finalResponseLength: finalText.length,
+        })
+
+        callbacks?.onContent?.(finalText)
+        callbacks?.onComplete?.(finalText, allToolResults)
         break
       }
 
-      // 如果达到最大迭代次数，也要调用 onComplete
+      // Ensure onComplete is still called when max iterations is reached
       if (iteration >= maxIterations) {
-        console.warn(`[Agent] 达到最大迭代次数 ${maxIterations}，强制结束`)
-        console.log('[Agent] 累积内容:', accumulatedContent?.substring(0, 200))
-        console.log('[Agent] 最后响应:', lastResponse?.substring(0, 200))
-        // 使用累积的内容或最后的响应
-        const finalContent = latestSummary || accumulatedContent || lastResponse || '任务已完成（达到最大步骤数）'
-        console.log('[Agent] 最终内容:', finalContent?.substring(0, 200))
-        finalContentForMemory = finalContent
+        console.warn(`[Agent] reached max iterations ${maxIterations}, forcing stop`)
+        console.log('[Agent] accumulated content:', accumulatedContent?.substring(0, 200))
+        console.log('[Agent] last response:', lastResponse?.substring(0, 200))
+        // Keep accumulated steps in the final fallback content
+        const maxIterSummary = latestSummary || accumulatedContent || lastResponse || 'Task completed (max iterations reached)'
+        const maxIterSteps = streamPrefixRef.current.trim()
+        const finalContent = maxIterSteps && maxIterSummary
+          ? maxIterSteps + '\n\n---\n\n' + maxIterSummary
+          : maxIterSummary || maxIterSteps
+        console.log('[Agent] final content:', finalContent?.substring(0, 200))
+        finalContentForMemory = maxIterSummary
+
+        await emitDebugEvent({
+          type: 'final_summary',
+          turnId,
+          timestamp: new Date().toISOString(),
+          iteration,
+          source: 'max_iterations',
+          content: finalContent,
+        })
+
+        await emitDebugEvent({
+          type: 'turn_complete',
+          turnId,
+          timestamp: new Date().toISOString(),
+          totalIterations: iteration,
+          finalContent,
+          toolResults: allToolResults.map((item) => ({ ...item })),
+        })
+
+        // ─── 工具调用日志：max iterations 结束 ───
+        toolCallLogger.logTurnComplete({
+          totalIterations: iteration,
+          totalToolCalls: allToolResults.length,
+          totalSkipped: 0,
+          stopReason: 'max_iterations',
+          finalResponseLength: finalContent?.length || 0,
+        })
+
         callbacks?.onComplete?.(finalContent, allToolResults)
       }
 
@@ -2945,15 +3969,32 @@ content: <h1>通知</h1><p>内容...</p>
       }
 
     } catch (error) {
-      if ((error as Error).name === 'AbortError') {
-        console.log('请求已取消')
+      const err = error as Error
+      const aborted = err?.name === 'AbortError'
+
+      await emitDebugEvent({
+        type: 'turn_error',
+        turnId,
+        timestamp: new Date().toISOString(),
+        iteration,
+        aborted,
+        name: err?.name,
+        message: err?.message || String(error),
+        stack: err?.stack,
+      })
+
+      if (aborted) {
+        console.log('Request aborted')
+        toolCallLogger.logTurnComplete({ totalIterations: iteration, totalToolCalls: allToolResults.length, totalSkipped: 0, stopReason: 'aborted' })
       } else {
         console.error('AI request failed:', error)
-        callbacks?.onComplete?.(`请求失败：${(error as Error).message}`, allToolResults)
+        toolCallLogger.logError((error as Error).message, { iteration })
+        callbacks?.onComplete?.(`Request failed: ${(error as Error).message}`, allToolResults)
       }
     } finally {
       setIsLoading(false)
       setStreamingContent('')
+      streamPrefixRef.current = ''  // 清理流式累积前缀
     }
   }, [settings, messages])
 
@@ -3071,6 +4112,7 @@ ${recentText}
         sendAgentMessage,
         getCompletion,
         cancelCompletion,
+        stopGeneration,
       }}
     >
       {children}

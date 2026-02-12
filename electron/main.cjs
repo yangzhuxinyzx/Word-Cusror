@@ -4567,6 +4567,21 @@ ipcMain.handle('write-file', async (event, filePath, content) => {
   }
 })
 
+// ????????????????
+ipcMain.handle('append-file', async (event, filePath, content) => {
+  try {
+    const dir = path.dirname(filePath)
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true })
+    }
+
+    fs.appendFileSync(filePath, content, 'utf-8')
+    return { success: true }
+  } catch (error) {
+    return { success: false, error: error.message }
+  }
+})
+
 // 写入二进制文件（用于 docx）
 ipcMain.handle('write-binary-file', async (event, filePath, base64Data) => {
   try {
@@ -4894,11 +4909,150 @@ ipcMain.handle('ai-chat-completions', async (event, payload = {}) => {
     }
   }
 
+  // ─── 检测是否使用 Anthropic Messages API 格式 ───
+  const isAnthropicFormat = (() => {
+    const urlLower = (baseUrl || '').toLowerCase()
+    const modelLower = (model || '').toLowerCase()
+    // 检测 URL 中包含 claude/anthropic 关键词，或模型名以 claude 开头
+    if (urlLower.includes('/claude') || urlLower.includes('anthropic')) return true
+    if (modelLower.startsWith('claude-') && !urlLower.includes('/v1/chat')) return true
+    return false
+  })()
+
   try {
-    const headers = {
-      'Content-Type': 'application/json',
-    }
-    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
+    if (isAnthropicFormat) {
+      // ═══════ Anthropic Messages API 格式 ═══════
+      const headers = {
+        'Content-Type': 'application/json',
+        'anthropic-version': '2023-06-01',
+      }
+      if (apiKey) headers['x-api-key'] = apiKey
+
+      // 从 messages 中提取 system prompt
+      let systemPrompt = ''
+      const anthropicMessages = []
+      for (const msg of messages) {
+        if (msg.role === 'system') {
+          systemPrompt += (systemPrompt ? '\n\n' : '') + (typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content))
+        } else {
+          // Anthropic 要求 content 为 string 或 content blocks 数组
+          let content = msg.content
+          if (Array.isArray(content)) {
+            // 转换 OpenAI 格式的 content 数组为 Anthropic 格式
+            content = content.map(part => {
+              if (typeof part === 'string') return { type: 'text', text: part }
+              if (part.type === 'text') return part
+              if (part.type === 'image_url' && part.image_url?.url) {
+                const url = part.image_url.url
+                if (url.startsWith('data:')) {
+                  const match = url.match(/^data:(image\/[^;]+);base64,(.+)$/)
+                  if (match) {
+                    return { type: 'image', source: { type: 'base64', media_type: match[1], data: match[2] } }
+                  }
+                }
+                return { type: 'text', text: `[image: ${url}]` }
+              }
+              return part
+            })
+          }
+          anthropicMessages.push({ role: msg.role === 'assistant' ? 'assistant' : 'user', content })
+        }
+      }
+
+      // Anthropic 要求消息必须以 user 开头，如果第一条是 assistant 则补一条
+      if (anthropicMessages.length > 0 && anthropicMessages[0].role === 'assistant') {
+        anthropicMessages.unshift({ role: 'user', content: '请继续。' })
+      }
+
+      const url = `${baseUrl.replace(/\/$/, '')}/v1/messages`
+      const body = {
+        model,
+        messages: anthropicMessages,
+        max_tokens: maxTokens || 4096,
+        stream: true,
+      }
+      if (systemPrompt) body.system = systemPrompt
+      if (temperature !== undefined && temperature !== null) body.temperature = temperature
+
+      console.log(`[AI API] Anthropic 格式请求: ${url}, model=${model}, messages=${anthropicMessages.length}条`)
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers,
+        signal: controller.signal,
+        body: JSON.stringify(body),
+      })
+
+      if (!resp.ok) {
+        const errorText = await resp.text().catch(() => '')
+        console.error(`[AI API] Anthropic 请求失败: HTTP ${resp.status}, ${errorText?.slice(0, 500)}`)
+        return { success: false, error: errorText || `请求失败（HTTP ${resp.status}）` }
+      }
+      console.log(`[AI API] Anthropic 请求成功，开始流式读取...`)
+
+      const reader = resp.body?.getReader?.()
+      if (!reader) {
+        const text = await resp.text().catch(() => '')
+        return { success: false, error: text || '无法读取响应流' }
+      }
+
+      const decoder = new TextDecoder()
+      let fullContent = ''
+      let fullReasoning = ''
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const data = line.slice(6).trim()
+          if (!data || data === '[DONE]') continue
+          try {
+            const json = JSON.parse(data)
+            let contentDelta = ''
+            let reasoningDelta = ''
+
+            // Anthropic SSE 事件类型
+            if (json.type === 'content_block_delta') {
+              const delta = json.delta || {}
+              if (delta.type === 'text_delta') {
+                contentDelta = delta.text || ''
+              } else if (delta.type === 'thinking_delta') {
+                reasoningDelta = delta.thinking || ''
+              }
+            } else if (json.type === 'message_delta') {
+              // 消息结束时的 stop_reason 等，忽略
+            } else if (json.type === 'message_start') {
+              // 消息开始，忽略
+            } else if (json.type === 'content_block_start') {
+              // 内容块开始，忽略
+            }
+
+            if (contentDelta || reasoningDelta) {
+              if (contentDelta) fullContent += contentDelta
+              if (reasoningDelta) fullReasoning += reasoningDelta
+              sendDelta(contentDelta, reasoningDelta, fullContent, fullReasoning)
+            }
+          } catch {
+            // ignore parse errors
+          }
+        }
+      }
+
+      console.log(`[AI API] Anthropic 流式完成: content=${fullContent.length}字, reasoning=${fullReasoning.length}字`)
+      return { success: true, content: fullContent }
+
+    } else {
+      // ═══════ OpenAI 兼容格式（原有逻辑） ═══════
+      const headers = {
+        'Content-Type': 'application/json',
+      }
+      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
 
     const url = `${baseUrl.replace(/\/$/, '')}/chat/completions`
     console.log(`[AI API] 请求: ${url}, model=${model}, temperature=${temperature}, messages=${messages?.length}条`)
@@ -5017,6 +5171,7 @@ ipcMain.handle('ai-chat-completions', async (event, payload = {}) => {
 
     console.log(`[AI API] 流式完成: content=${fullContent.length}字, reasoning=${fullReasoning.length}字`)
     return { success: true, content: fullContent }
+    } // end else (OpenAI format)
   } catch (error) {
     console.error(`[AI API] 错误: ${error?.name} - ${error?.message}`)
     console.error(error?.stack || error)

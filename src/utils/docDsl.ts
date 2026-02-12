@@ -646,7 +646,17 @@ function runToStyle(run: DslRun): string {
   if (run.fontSize) styles.push(`font-size: ${run.fontSize}pt`)
   if (run.color) {
     const hex = dslColorToHex(run.color)
-    if (hex) styles.push(`color: #${hex}`)
+    if (hex) {
+      // 接近黑色的颜色（亮度 < 25%）不输出 inline color，让 CSS --word-ink 控制
+      // 这样暗色主题下文字自动变白，亮色主题下自动变黑
+      const r = parseInt(hex.substring(0, 2), 16)
+      const g = parseInt(hex.substring(2, 4), 16)
+      const b = parseInt(hex.substring(4, 6), 16)
+      const luminance = (r * 0.299 + g * 0.587 + b * 0.114) / 255
+      if (luminance > 0.25) {
+        styles.push(`color: #${hex}`)
+      }
+    }
   }
   if (run.highlight) {
     const hex = dslColorToHex(run.highlight)
@@ -671,18 +681,48 @@ function renderInlineToHtml(content: string | DslInline[]): string {
     }
     
     const run = item
-    let html = escapeHtml(run.text)
-    
+    // 清理 run text 中的 \n：DOCX 的 TextRun 会忽略 \n，HTML 中也应一致
+    // 纯空白/换行的 run 跳过，混合内容中的 \n 替换为空格
+    const cleanedText = run.text.replace(/\n/g, ' ').replace(/\s+/g, ' ')
+    if (!cleanedText.trim() && !run.text.trim()) {
+      return '' // 纯空白 run，跳过
+    }
+    let html = escapeHtml(cleanedText || run.text)
+
     // 上标/下标
     if (run.superscript) html = `<sup>${html}</sup>`
     if (run.subscript) html = `<sub>${html}</sub>`
-    
+
     // 应用样式
     const style = runToStyle(run)
     if (style) {
       html = `<span style="${style}">${html}</span>`
     }
-    
+
+    // _meta: diff 标记
+    if (run._meta?.diffType) {
+      const cls = run._meta.diffType === 'old' ? 'diff-old' : 'diff-new'
+      const idAttr = run._meta.diffId ? ` data-diff-id="${run._meta.diffId}"` : ''
+      html = `<span class="${cls}"${idAttr}>${html}</span>`
+    }
+
+    // _meta: 修订标记
+    if (run._meta?.trackType) {
+      const attrs = [
+        `class="docx-track"`,
+        `data-track-type="${run._meta.trackType}"`,
+        run._meta.trackId ? `data-track-id="${run._meta.trackId}"` : '',
+        run._meta.trackAuthor ? `data-track-author="${run._meta.trackAuthor}"` : '',
+        run._meta.trackDate ? `data-track-date="${run._meta.trackDate}"` : '',
+      ].filter(Boolean).join(' ')
+      html = `<span ${attrs}>${html}</span>`
+    }
+
+    // _meta: 批注标记
+    if (run._meta?.commentIds?.length) {
+      html = `<span class="docx-comment" data-comment-ids="${run._meta.commentIds.join(',')}">${html}</span>`
+    }
+
     return html
   }).join('')
 }
@@ -741,9 +781,10 @@ function paragraphFormatToStyle(format: DslParagraphFormat | undefined): string 
 function renderHeadingToHtml(block: DslHeading): string {
   const tag = `h${block.level}`
   const style = paragraphFormatToStyle(block.format)
+  const metaAttrs = renderBlockMetaAttrs(block._meta)
   const styleAttr = style ? ` style="${style}"` : ''
   const content = renderInlineToHtml(block.content)
-  return `<${tag}${styleAttr}>${content}</${tag}>`
+  return `<${tag}${styleAttr}${metaAttrs}>${content}</${tag}>`
 }
 
 /**
@@ -751,9 +792,19 @@ function renderHeadingToHtml(block: DslHeading): string {
  */
 function renderParagraphToHtml(block: DslParagraph): string {
   const style = paragraphFormatToStyle(block.format)
+  const metaAttrs = renderBlockMetaAttrs(block._meta)
   const styleAttr = style ? ` style="${style}"` : ''
   const content = renderInlineToHtml(block.content)
-  return `<p${styleAttr}>${content}</p>`
+  return `<p${styleAttr}${metaAttrs}>${content}</p>`
+}
+
+/** 渲染块级 _meta 为 HTML 属性 */
+function renderBlockMetaAttrs(meta?: import('../types/docDsl').DslBlockMeta): string {
+  if (!meta) return ''
+  const attrs: string[] = []
+  if (meta.diffRole) attrs.push(`data-diff-role="${meta.diffRole}"`)
+  if (meta.diffId) attrs.push(`data-diff-id="${meta.diffId}"`)
+  return attrs.length > 0 ? ' ' + attrs.join(' ') : ''
 }
 
 /**

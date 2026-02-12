@@ -13,6 +13,7 @@ import { TableRow } from '@tiptap/extension-table-row'
 import { TableHeader } from '@tiptap/extension-table-header'
 import { TableCell } from '@tiptap/extension-table-cell'
 import { DocxImage } from '../extensions/DocxImage'
+import { DocxChart } from '../extensions/DocxChart'
 import { Link } from '@tiptap/extension-link'
 import { Placeholder } from '@tiptap/extension-placeholder'
 import { FontFamily } from '@tiptap/extension-font-family'
@@ -522,19 +523,28 @@ const PagedLayout = Extension.create({
         },
         view(view) {
           let raf = 0
+          let isDispatching = false
           const schedule = () => {
+            if (isDispatching) return
             cancelAnimationFrame(raf)
             raf = requestAnimationFrame(() => {
               const next = buildDecorations(view)
               const current = key.getState(view.state)
               // 避免无意义 dispatch
               if (current && next && current.eq(next)) return
+              isDispatching = true
               view.dispatch(view.state.tr.setMeta(key, { decorations: next }))
+              isDispatching = false
             })
           }
           schedule()
           return {
-            update: schedule,
+            update(view, prevState) {
+              // 只在文档内容变化时重建分页装饰，滚动/选区变化不触发
+              if (view.state.doc !== prevState.doc) {
+                schedule()
+              }
+            },
             destroy() {
               cancelAnimationFrame(raf)
             },
@@ -888,6 +898,7 @@ export default function WordEditor() {
       DocxTableHeader,
       DocxTableCell,
       DocxImage,
+      DocxChart,
       Link.configure({
         openOnClick: false,
       }),
@@ -2204,6 +2215,37 @@ ${contentToProcess}
           onOpenRevisionPanel={() => setShowRevisionPanel(true)}
           acceptAllChanges={acceptAllChanges}
           rejectAllChanges={rejectAllChanges}
+          onAddComment={() => {
+            const { from, to } = editor.state.selection
+            if (from === to) return
+            applyCommentToSelection('批注')
+          }}
+          onOpenCommentPanel={() => setShowCommentPanel(true)}
+          onNavigateChange={(dir) => {
+            // 找到编辑器中所有 track-insert / track-delete 标记并跳转
+            const marks = editor.view.dom.querySelectorAll('[data-track-id]')
+            if (marks.length === 0) return
+            const { from } = editor.state.selection
+            const positions = Array.from(marks).map(el => {
+              const pos = editor.view.posAtDOM(el, 0)
+              return pos
+            }).sort((a, b) => a - b)
+            let target: number | undefined
+            if (dir === 'next') {
+              target = positions.find(p => p > from) ?? positions[0]
+            } else {
+              target = [...positions].reverse().find(p => p < from) ?? positions[positions.length - 1]
+            }
+            if (target != null) {
+              editor.commands.setTextSelection(target)
+              editor.commands.scrollIntoView()
+            }
+          }}
+          onAIReview={() => {
+            // 触发 AI 审查 — 通过 window 事件让 ChatPanel 接收
+            window.dispatchEvent(new CustomEvent('ai-quick-command', { detail: { command: '/审查' } }))
+          }}
+          docStats={docStats}
           editorMode={editorMode}
           setEditorMode={setEditorMode}
         />
@@ -2409,27 +2451,28 @@ ${contentToProcess}
                 
                 {/* 修改预览 */}
                 <div className="px-4 py-3 max-h-28 overflow-y-auto bg-black/5 dark:bg-white/5">
-                  <div className="flex items-start gap-3 text-xs">
-                    <div className="flex-1 min-w-0">
-                      <div className="text-[10px] text-text-dim mb-1">删除</div>
-                      <div className="text-red-400/90 line-through break-all bg-red-500/10 px-2 py-1 rounded border border-red-500/20" title={(pendingChanges[pendingChanges.length - 1]?.meta as any)?.searchText || ''}>
-                        {(() => {
-                          const searchText = ((pendingChanges[pendingChanges.length - 1]?.meta as any)?.searchText || '') as string
-                          return searchText.length > 60 ? searchText.slice(0, 60) + '...' : searchText
-                        })()}
+                  {(() => {
+                    const lastChange = pendingChanges[pendingChanges.length - 1]
+                    const beforeText = (lastChange?.beforePreview || (lastChange?.meta as any)?.searchText || '') as string
+                    const afterText = (lastChange?.afterPreview || (lastChange?.meta as any)?.replaceText || '') as string
+                    return (
+                      <div className="flex items-start gap-3 text-xs">
+                        <div className="flex-1 min-w-0">
+                          <div className="text-[10px] text-text-dim mb-1">删除</div>
+                          <div className="text-red-400/90 line-through break-all bg-red-500/10 px-2 py-1 rounded border border-red-500/20" title={beforeText}>
+                            {beforeText.length > 60 ? beforeText.slice(0, 60) + '...' : beforeText || '—'}
+                          </div>
+                        </div>
+                        <div className="text-text-dim pt-5">→</div>
+                        <div className="flex-1 min-w-0">
+                          <div className="text-[10px] text-text-dim mb-1">替换为</div>
+                          <div className="text-success/90 break-all bg-success/10 px-2 py-1 rounded border border-success/20" title={afterText}>
+                            {afterText.length > 60 ? afterText.slice(0, 60) + '...' : afterText || '—'}
+                          </div>
+                        </div>
                       </div>
-                    </div>
-                    <div className="text-text-dim pt-5">→</div>
-                    <div className="flex-1 min-w-0">
-                      <div className="text-[10px] text-text-dim mb-1">替换为</div>
-                      <div className="text-success/90 break-all bg-success/10 px-2 py-1 rounded border border-success/20" title={(pendingChanges[pendingChanges.length - 1]?.meta as any)?.replaceText || ''}>
-                        {(() => {
-                          const replaceText = ((pendingChanges[pendingChanges.length - 1]?.meta as any)?.replaceText || '') as string
-                          return replaceText.length > 60 ? replaceText.slice(0, 60) + '...' : replaceText
-                        })()}
-                      </div>
-                    </div>
-                  </div>
+                    )
+                  })()}
                 </div>
                 
                 {/* 快捷键提示 */}

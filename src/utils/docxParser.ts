@@ -1,5 +1,6 @@
 import JSZip from 'jszip'
 import mammoth from 'mammoth'
+import { parseChartXml } from './chartParser'
 
 // 图片数据映射类型
 interface ImageMap {
@@ -25,6 +26,7 @@ type ImageParseContext = {
   embedImages: boolean
   relsMap?: Record<string, string>
   images?: DocxImageMeta[]
+  chartConfigs?: Record<string, string>  // rId → JSON-serialized ChartConfig
 }
 
 // 脚注/尾注数据类型
@@ -2292,6 +2294,25 @@ async function parseDocxCustomComplete(bytes: Uint8Array): Promise<DocxParseResu
     const relsMap = await parseRelationships(zip)
     const imageMap = await extractImages(zip, relsMap)
 
+    // 预提取图表数据
+    const chartConfigs: Record<string, string> = {}
+    for (const [rId, target] of Object.entries(relsMap)) {
+      if (target.includes('charts/') && target.endsWith('.xml')) {
+        try {
+          const chartPath = target.startsWith('/') ? target.slice(1) : target.replace(/^\.\.\//, '')
+          const normalizedPath = chartPath.startsWith('word/') ? chartPath : 'word/' + chartPath
+          const chartXml = await zip.file(normalizedPath)?.async('string')
+          if (chartXml) {
+            const config = parseChartXml(chartXml, currentThemeColorMap || undefined)
+            chartConfigs[rId] = JSON.stringify(config)
+          }
+        } catch (e) {
+          console.warn(`[Chart] Failed to parse chart ${target}:`, e)
+        }
+      }
+    }
+    const chartImageCtx: ImageParseContext = { embedImages: true, relsMap, chartConfigs }
+
     // 解析脚注和尾注
     const footnoteMap = await parseFootnotesAndEndnotes(zip, styles)
 
@@ -2302,7 +2323,7 @@ async function parseDocxCustomComplete(bytes: Uint8Array): Promise<DocxParseResu
     if (parseError) {
       throw new Error('XML 解析失败')
     }
-    
+
     // 解析页面设置
     const pageSettings = parsePageSettings(doc)
 
@@ -2319,9 +2340,9 @@ async function parseDocxCustomComplete(bytes: Uint8Array): Promise<DocxParseResu
     for (let i = 0; i < children.length; i++) {
       const child = children[i] as Element
       if (child.nodeName === 'w:p') {
-        bodyHtml += parseParagraph(child, styles, imageMap, footnoteMap, undefined, numberingState)
+        bodyHtml += parseParagraph(child, styles, imageMap, footnoteMap, chartImageCtx, numberingState)
       } else if (child.nodeName === 'w:tbl') {
-        bodyHtml += parseTable(child, styles, imageMap, footnoteMap)
+        bodyHtml += parseTable(child, styles, imageMap, footnoteMap, chartImageCtx)
       } else if (child.nodeName === 'w:sdt') {
         const sdtContent = child.getElementsByTagName('w:sdtContent')[0]
         if (sdtContent) {
@@ -2329,9 +2350,9 @@ async function parseDocxCustomComplete(bytes: Uint8Array): Promise<DocxParseResu
           for (let j = 0; j < sdtChildren.length; j++) {
             const sdtChild = sdtChildren[j] as Element
             if (sdtChild.nodeName === 'w:p') {
-              bodyHtml += parseParagraph(sdtChild, styles, imageMap, footnoteMap, undefined, numberingState)
+              bodyHtml += parseParagraph(sdtChild, styles, imageMap, footnoteMap, chartImageCtx, numberingState)
             } else if (sdtChild.nodeName === 'w:tbl') {
-              bodyHtml += parseTable(sdtChild, styles, imageMap, footnoteMap)
+              bodyHtml += parseTable(sdtChild, styles, imageMap, footnoteMap, chartImageCtx)
             }
           }
         }
@@ -3691,7 +3712,7 @@ function parseParagraph(
       } else if (val === 'right') {
         paraStyle.alignment = 'right'
         styleProps.push('text-align: right')
-      } else if (val === 'both' || val === 'distribute') {
+      } else if ((val === 'both' || val === 'distribute') && !isTocParagraph) {
         paraStyle.alignment = 'justify'
         styleProps.push('text-align: justify')
       }
@@ -4067,6 +4088,46 @@ function parseDrawing(drawing: Element, imageMap: ImageMap, imageCtx?: ImagePars
   // 查找图片引用 (a:blip 或 blip)
   const blip = findElementByLocalName(drawing, 'blip')
   if (!blip) {
+    // 没有 a:blip — 可能是图表 (Chart) 或 SmartArt (Diagram)
+    // 提取尺寸用于占位符
+    const extent = findElementByLocalName(drawing, 'extent')
+    let phW = 400, phH = 250
+    if (extent) {
+      const cx = extent.getAttribute('cx')
+      const cy = extent.getAttribute('cy')
+      if (cx) phW = Math.max(100, emuToPixels(parseInt(cx)))
+      if (cy) phH = Math.max(60, emuToPixels(parseInt(cy)))
+    }
+    // 获取名称
+    const docPr = findElementByLocalName(drawing, 'docPr')
+    const objName = docPr?.getAttribute('name') || ''
+
+    // 检测图表
+    const chartEl = findElementByLocalName(drawing, 'chart')
+    if (chartEl) {
+      // 尝试从预提取的图表配置中获取数据
+      const chartRId = getAttributeNS(chartEl, 'id')
+      const chartJson = chartRId && imageCtx?.chartConfigs?.[chartRId]
+      if (chartJson) {
+        try {
+          const config = JSON.parse(chartJson)
+          config.widthPx = phW
+          config.heightPx = phH
+          const encoded = encodeURIComponent(JSON.stringify(config))
+          return `<div data-type="docx-chart" data-chart-config="${encoded}" style="width:${phW}px;height:${phH}px;max-width:100%;margin:8px auto;"></div>`
+        } catch (_e) {
+          // fall through to placeholder
+        }
+      }
+      const label = objName || '图表'
+      return `<div style="display:flex;align-items:center;justify-content:center;width:${phW}px;height:${phH}px;max-width:100%;background:#f8f9fa;border:1px dashed #ccc;border-radius:4px;margin:8px auto;color:#666;font-size:13px;">[${escapeHtml(label)}]</div>`
+    }
+    // 检测 SmartArt
+    const dgmEl = findElementByLocalName(drawing, 'relIds')
+    if (dgmEl) {
+      const label = objName || '图示'
+      return `<div style="display:flex;align-items:center;justify-content:center;width:${phW}px;height:${phH}px;max-width:100%;background:#f8f9fa;border:1px dashed #ccc;border-radius:4px;margin:8px auto;color:#666;font-size:13px;">[${escapeHtml(label)}]</div>`
+    }
     return ''
   }
   
@@ -4160,7 +4221,20 @@ function parseDrawing(drawing: Element, imageMap: ImageMap, imageCtx?: ImagePars
   const shouldEmbed = imageCtx?.embedImages !== false
   const imageData = shouldEmbed ? imageMap[rId] : undefined
   if (!imageData && shouldEmbed) {
+    // 检查是否是浏览器不支持的格式（EMF/WMF）
+    const ext = (target || '').split('.').pop()?.toLowerCase() || ''
+    if (ext === 'emf' || ext === 'wmf') {
+      const placeholderStyle = `display: inline-block; width: ${width || 200}px; height: ${height || 100}px; background: #f0f0f0; border: 1px dashed #ccc; text-align: center; line-height: ${height || 100}px; color: #999; font-size: 12px;`
+      return `<span style="${placeholderStyle}">[EMF/WMF 图片]</span>`
+    }
     return `<span style="color: #999; font-style: italic;">[图片: ${escapeHtml(rId)}]</span>`
+  }
+
+  // 检查浏览器不支持的图片格式（EMF/WMF 有 base64 数据但浏览器无法渲染）
+  const imgExt = (target || '').split('.').pop()?.toLowerCase() || ''
+  if ((imgExt === 'emf' || imgExt === 'wmf') && imageData) {
+    const placeholderStyle = `display: inline-block; width: ${width || 200}px; height: ${height || 100}px; background: #f0f0f0; border: 1px dashed #ccc; text-align: center; line-height: ${height || 100}px; color: #999; font-size: 12px;`
+    return `<span style="${placeholderStyle}" data-rid="${escapeHtml(rId)}">[EMF/WMF 图片]</span>`
   }
 
   const src = imageData || 'about:blank'
@@ -4372,11 +4446,45 @@ function parseRun(run: Element, imageMap: ImageMap = {}, footnoteMap?: FootnoteM
       }
     } else if (child.nodeName === 'mc:AlternateContent' || child.localName === 'AlternateContent') {
       // 处理备用内容（通常包含图片）
-      const choice = findElementByLocalName(child, 'Choice') || findElementByLocalName(child, 'Fallback')
+      // 优先用 Choice（DrawingML），回退到 Fallback（VML）
+      const choice = findElementByLocalName(child, 'Choice')
+      const fallback = findElementByLocalName(child, 'Fallback')
+      let altHandled = false
       if (choice) {
-        const drawing = findElementByLocalName(choice, 'drawing')
-        if (drawing) {
-          imageHtml += parseDrawing(drawing, imageMap, imageCtx)
+        const choiceDrawing = findElementByLocalName(choice, 'drawing')
+        if (choiceDrawing) {
+          imageHtml += parseDrawing(choiceDrawing, imageMap, imageCtx)
+          altHandled = true
+        } else {
+          // Choice 中可能是 w:pict (VML)
+          const choicePict = findElementByLocalName(choice, 'pict')
+          if (choicePict) {
+            const imgData = findElementByLocalName(choicePict, 'imagedata')
+            if (imgData) {
+              const altRId = getAttributeNS(imgData, 'id') || getAttributeNS(imgData, 'embed')
+              if (altRId && imageMap[altRId]) {
+                imageHtml += `<img src="${imageMap[altRId]}" alt="文档图片" style="max-width: 100%; height: auto; display: block; margin: 10px auto;" />`
+                altHandled = true
+              }
+            }
+          }
+        }
+      }
+      if (!altHandled && fallback) {
+        const fbDrawing = findElementByLocalName(fallback, 'drawing')
+        if (fbDrawing) {
+          imageHtml += parseDrawing(fbDrawing, imageMap, imageCtx)
+        } else {
+          const fbPict = findElementByLocalName(fallback, 'pict')
+          if (fbPict) {
+            const imgData = findElementByLocalName(fbPict, 'imagedata')
+            if (imgData) {
+              const altRId = getAttributeNS(imgData, 'id') || getAttributeNS(imgData, 'embed')
+              if (altRId && imageMap[altRId]) {
+                imageHtml += `<img src="${imageMap[altRId]}" alt="文档图片" style="max-width: 100%; height: auto; display: block; margin: 10px auto;" />`
+              }
+            }
+          }
         }
       }
     } else if (child.nodeName === 'w:footnoteReference') {

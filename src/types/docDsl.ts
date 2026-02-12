@@ -28,6 +28,32 @@ export type DslColor = string // e.g. "#FF0000", "rgb(255,0,0)", "red"
 
 // ============== 行内格式（Run） ==============
 
+/** 运行时元数据（diff/track/comments，不持久化到 DOCX） */
+export interface DslRunMeta {
+  /** diff 类型 */
+  diffType?: 'old' | 'new'
+  /** diff ID */
+  diffId?: string
+  /** 修订类型 */
+  trackType?: 'insert' | 'delete'
+  /** 修订 ID */
+  trackId?: string
+  /** 修订作者 */
+  trackAuthor?: string
+  /** 修订日期 */
+  trackDate?: string
+  /** 批注 ID 列表 */
+  commentIds?: string[]
+}
+
+/** 块级元数据 */
+export interface DslBlockMeta {
+  /** diff 角色（新增块） */
+  diffRole?: 'new'
+  /** diff ID */
+  diffId?: string
+}
+
 /** 行内文本片段 */
 export interface DslRun {
   /** 文本内容 */
@@ -54,6 +80,8 @@ export interface DslRun {
   highlight?: DslColor
   /** 字符间距 (pt) */
   letterSpacing?: number
+  /** 运行时元数据（diff/track/comments） */
+  _meta?: DslRunMeta
 }
 
 /** 行内元素：可以是纯文本或带格式的 Run */
@@ -117,6 +145,8 @@ export interface DslHeading {
   content: string | DslInline[]
   /** 覆盖格式 */
   format?: DslParagraphFormat
+  /** 块级元数据 */
+  _meta?: DslBlockMeta
 }
 
 /** 段落块 */
@@ -126,6 +156,8 @@ export interface DslParagraph {
   content: string | DslInline[]
   /** 段落格式 */
   format?: DslParagraphFormat
+  /** 块级元数据 */
+  _meta?: DslBlockMeta
 }
 
 /** 列表项 */

@@ -1,7 +1,6 @@
 import { useState, useRef, useEffect, useCallback, type ReactNode } from 'react'
 import { 
-  Send, 
-  Trash2, 
+  Send,
   FileText,
   X,
   Settings,
@@ -14,14 +13,17 @@ import {
   CheckCircle2,
   Circle,
   Bot,
-  Table
+  Table,
+  ImagePlus,
+  Folder,
+  Square
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { motion, AnimatePresence } from 'framer-motion'
-import { useAI, ToolResult } from '../context/AIContext'
+import { useAI, ToolResult, type AgentDebugEvent } from '../context/AIContext'
 import { useDocument } from '../context/DocumentContext'
-import { FileItem, AgentStep, AgentFileChange } from '../types'
+import { FileItem, AgentStep, AgentFileChange, ChatMessage } from '../types'
 import { runWebSearch, WebSearchResponse } from '../utils/webSearch'
 import { parseDocxToHtmlForAgent } from '../utils/docxParser'
 import { generateDocxAgentContextFromFilePath } from '../utils/docxAgentContext'
@@ -30,6 +32,10 @@ import { docxHtmlToElements, elementsToHtmlPreview } from '../utils/docxHtmlToEl
 import { validateDocDsl, dslToHtml } from '../utils/docDsl'
 import { DOC_EDIT_START, DOC_EDIT_END, DOC_SUMMARY_START, DOC_SUMMARY_END } from '../utils/aiMarkers'
 import type { DocDsl } from '../types/docDsl'
+import type { ChartConfig, ChartSeries } from '../utils/chartParser'
+import { toolCallLogger } from '../utils/toolCallLogger'
+import { htmlToDsl } from '../utils/htmlToDsl'
+import { serializeDslForAI } from '../utils/dslSerializer'
 import JSZip from 'jszip'
 import CinematicTyper from './CinematicTyper'
 
@@ -45,6 +51,8 @@ type PptOutlineSlideDraft = {
 
 const TOOL_CALL_BLOCK_REGEX = /\[TOOL_CALL\][\s\S]*?\[\/TOOL_CALL\]/g
 const TOOL_RESULT_BLOCK_REGEX = /\[TOOL_RESULT\][\s\S]*?\[\/TOOL_RESULT\]/g
+const LEGACY_XML_TOOL_BLOCK_REGEX = /<((?:replace|review|insert|delete|word_edit_ops|create|copy_template|create_from_template|ppt_create|ppt_edit|workspace_list|workspace_open|workspace_summarize|workspace_read|web_search|excel_read|excel_search|excel_write|excel_insert_rows|excel_insert_columns|excel_delete_rows|excel_delete_columns|excel_add_sheet|excel_delete_sheet|excel_merge|excel_unmerge|excel_create|excel_formula|excel_sort|excel_autofill|excel_dimensions|excel_conditional_format|excel_calculate|excel_filter|excel_validation|excel_hyperlink|excel_find_replace|excel_chart))>[\s\S]*?<\/\1>/gi
+const TOOL_USE_BLOCK_REGEX = /<tool_use>[\s\S]*?<\/tool_use>/gi
 
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const EDIT_START_REGEX = new RegExp(escapeRegExp(DOC_EDIT_START), 'g')
@@ -55,7 +63,11 @@ const SUMMARY_BLOCK_REGEX = new RegExp(
 )
 
 const stripToolBlocks = (text: string) =>
-  text.replace(TOOL_CALL_BLOCK_REGEX, '').replace(TOOL_RESULT_BLOCK_REGEX, '')
+  text
+    .replace(TOOL_CALL_BLOCK_REGEX, '')
+    .replace(TOOL_RESULT_BLOCK_REGEX, '')
+    .replace(LEGACY_XML_TOOL_BLOCK_REGEX, '')
+    .replace(TOOL_USE_BLOCK_REGEX, '')
 
 const stripMarkers = (text: string) =>
   text
@@ -65,6 +77,266 @@ const stripMarkers = (text: string) =>
 
 const sanitizeAssistantText = (text: string) =>
   stripMarkers(stripToolBlocks(text)).replace(/\n{3,}/g, '\n\n').trim()
+
+const unwrapOuterQuotes = (value: string): string => {
+  const trimmed = (value || '').trim()
+  const pairs: Array<[string, string]> = [
+    ['"', '"'],
+    ["'", "'"],
+    ['“', '”'],
+    ['‘', '’'],
+    ['「', '」'],
+    ['『', '』'],
+    ['《', '》'],
+  ]
+
+  for (const [left, right] of pairs) {
+    if (trimmed.length > left.length + right.length && trimmed.startsWith(left) && trimmed.endsWith(right)) {
+      return trimmed.slice(left.length, trimmed.length - right.length).trim()
+    }
+  }
+
+  return trimmed
+}
+
+const stripHtmlLikeSearch = (value: string): string => {
+  return (value || '')
+    .replace(/<br\s*\/?\s*>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .trim()
+}
+
+const normalizeSmartQuotesToAscii = (value: string): string => {
+  return (value || '')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+}
+
+const normalizeAsciiQuotesToCnPairs = (value: string): string => {
+  let doubleOpen = true
+  let singleOpen = true
+
+  return (value || '').replace(/["']/g, (ch) => {
+    if (ch === '"') {
+      const token = doubleOpen ? '“' : '”'
+      doubleOpen = !doubleOpen
+      return token
+    }
+
+    const token = singleOpen ? '‘' : '’'
+    singleOpen = !singleOpen
+    return token
+  })
+}
+
+const HALF_TO_FULL_PUNCT: Record<string, string> = {
+  ',': '，',
+  '.': '。',
+  ':': '：',
+  ';': '；',
+  '!': '！',
+  '?': '？',
+  '(': '（',
+  ')': '）',
+  '[': '【',
+  ']': '】',
+}
+
+const FULL_TO_HALF_PUNCT: Record<string, string> = {
+  '，': ',',
+  '。': '.',
+  '：': ':',
+  '；': ';',
+  '！': '!',
+  '？': '?',
+  '（': '(',
+  '）': ')',
+  '【': '[',
+  '】': ']',
+}
+
+const mapChars = (value: string, mapping: Record<string, string>): string => {
+  if (!value) return ''
+  return value
+    .split('')
+    .map((char) => mapping[char] || char)
+    .join('')
+}
+
+const removeEllipsisMarkers = (value: string): string => {
+  return (value || '').replace(/(?:\.\.\.|…)+/g, '').trim()
+}
+
+const buildReplaceSearchCandidates = (search: string): string[] => {
+  const base = (search || '').trim()
+  if (!base) return []
+
+  const variants = [
+    base,
+    unwrapOuterQuotes(base),
+    stripHtmlLikeSearch(base),
+    stripHtmlLikeSearch(unwrapOuterQuotes(base)),
+    normalizeSmartQuotesToAscii(base),
+    normalizeSmartQuotesToAscii(stripHtmlLikeSearch(unwrapOuterQuotes(base))),
+    normalizeAsciiQuotesToCnPairs(base),
+    normalizeAsciiQuotesToCnPairs(stripHtmlLikeSearch(unwrapOuterQuotes(base))),
+    mapChars(base, HALF_TO_FULL_PUNCT),
+    mapChars(base, FULL_TO_HALF_PUNCT),
+    mapChars(normalizeSmartQuotesToAscii(base), HALF_TO_FULL_PUNCT),
+    mapChars(normalizeSmartQuotesToAscii(base), FULL_TO_HALF_PUNCT),
+    removeEllipsisMarkers(base),
+    removeEllipsisMarkers(stripHtmlLikeSearch(unwrapOuterQuotes(base))),
+  ]
+
+  const deduped: string[] = []
+  const seen = new Set<string>()
+
+  for (const candidate of variants) {
+    const normalized = (candidate || '').trim()
+    if (!normalized || normalized.length < 2) continue
+    if (seen.has(normalized)) continue
+    seen.add(normalized)
+    deduped.push(normalized)
+  }
+
+  return deduped
+}
+
+// Keep full model/tool debug logs by default so trace files contain complete payloads.
+const AGENT_DEBUG_MAX_CHARS: number | null = null
+
+const truncateDebugText = (value: string, max: number | null = AGENT_DEBUG_MAX_CHARS): string => {
+  const text = value || ''
+  if (max == null || max <= 0) return text
+  if (text.length <= max) return text
+  const extra = text.length - max
+  return `${text.slice(0, max)}\n... [truncated ${extra} chars]`
+}
+
+const stringifyDebugData = (value: unknown, max: number | null = AGENT_DEBUG_MAX_CHARS): string => {
+  try {
+    return truncateDebugText(JSON.stringify(value, null, 2), max)
+  } catch (error) {
+    return `Unserializable debug payload: ${String(error)}`
+  }
+}
+
+const toDebugCodeBlock = (content: string, lang = 'text') => [
+  `\`\`\`${lang}`,
+  truncateDebugText(content),
+  '```',
+].join('\n')
+
+const formatAgentDebugEventMarkdown = (event: AgentDebugEvent): string => {
+  switch (event.type) {
+    case 'turn_start':
+      return [
+        `## Turn ${event.turnId}`,
+        `- time: ${event.timestamp}`,
+        `- model: ${event.model}`,
+        `- baseUrl: ${event.baseUrl}`,
+        `- recentMessages: ${event.recentMessagesCount}`,
+        `- hasDocumentContext: ${event.hasDocumentContext}`,
+        `- hasFilesContext: ${event.hasFilesContext}`,
+        `- imageCount: ${event.imageCount}`,
+        '',
+        '### User Input',
+        toDebugCodeBlock(event.userInput || ''),
+        '',
+      ].join('\n')
+
+    case 'api_response_raw': {
+      const rawResponse = event.rawResponse ?? event.response ?? ''
+      const cleanedResponse = event.response || ''
+      const isIdentical = rawResponse === cleanedResponse
+
+      return [
+        `### API Response [iter ${event.iteration}]`,
+        `- time: ${event.timestamp}`,
+        `- stage: ${event.stage}`,
+        `- hasToolCall: ${event.hasToolCall}`,
+        `- rawLength: ${rawResponse.length}`,
+        `- cleanedLength: ${cleanedResponse.length}`,
+        '',
+        '#### Raw Response',
+        toDebugCodeBlock(rawResponse),
+        '',
+        `#### Cleaned Response${isIdentical ? ' (same as raw)' : ''}`,
+        toDebugCodeBlock(cleanedResponse),
+        '',
+      ].join('\n')
+    }
+
+    case 'tool_calls_parsed':
+      return [
+        `### Tool Calls Parsed [iter ${event.iteration}]`,
+        `- time: ${event.timestamp}`,
+        `- count: ${event.calls.length}`,
+        toDebugCodeBlock(stringifyDebugData(event.calls), 'json'),
+        '',
+      ].join('\n')
+
+    case 'tool_call_skipped':
+      return [
+        `### Tool Call Skipped [iter ${event.iteration}]`,
+        `- time: ${event.timestamp}`,
+        `- tool: ${event.tool}`,
+        `- reason: ${event.reason}`,
+        toDebugCodeBlock(stringifyDebugData({ args: event.args }), 'json'),
+        '',
+      ].join('\n')
+
+    case 'tool_result':
+      return [
+        `### Tool Result [iter ${event.iteration}]`,
+        `- time: ${event.timestamp}`,
+        `- tool: ${event.tool}`,
+        `- index: ${event.index}/${event.total}`,
+        `- success: ${event.result.success}`,
+        `- message: ${event.result.message}`,
+        toDebugCodeBlock(stringifyDebugData({ args: event.args, result: event.result }), 'json'),
+        '',
+      ].join('\n')
+
+    case 'final_summary':
+      return [
+        `### Final Summary [${event.source}]`,
+        `- time: ${event.timestamp}`,
+        `- iteration: ${event.iteration}`,
+        toDebugCodeBlock(event.content || ''),
+        '',
+      ].join('\n')
+
+    case 'turn_complete':
+      return [
+        `### Turn Complete`,
+        `- time: ${event.timestamp}`,
+        `- totalIterations: ${event.totalIterations}`,
+        `- toolResults: ${event.toolResults.length}`,
+        toDebugCodeBlock(stringifyDebugData(event.toolResults), 'json'),
+        '',
+        '---',
+        '',
+      ].join('\n')
+
+    case 'turn_error':
+      return [
+        `### Turn Error`,
+        `- time: ${event.timestamp}`,
+        `- iteration: ${event.iteration}`,
+        `- aborted: ${event.aborted}`,
+        `- name: ${event.name || 'UnknownError'}`,
+        `- message: ${event.message}`,
+        toDebugCodeBlock(event.stack || ''),
+        '',
+        '---',
+        '',
+      ].join('\n')
+
+    default:
+      return ''
+  }
+}
 
 type TableCardData = {
   headers: string[]
@@ -294,13 +566,29 @@ type ToolActivityItem = {
   id: string
   tool: string
   label: string
-  status: 'running' | 'success' | 'error'
+  status: 'running' | 'success' | 'error' | 'skipped'
   detail?: string
+  searchText?: string
+  replaceText?: string
 }
+
+type StreamItem =
+  | { type: 'text'; id: string; content: string }
+  | { type: 'tool'; id: string; data: ToolActivityItem }
 
 const truncateLabel = (text: string, limit = 32) => {
   if (!text) return ''
   return text.length > limit ? `${text.slice(0, limit)}…` : text
+}
+
+const buildToolCallSignature = (tool: string, args: Record<string, string>) => {
+  const normalizedArgs = Object.keys(args || {})
+    .sort()
+    .map((key) => {
+      const value = String(args[key] ?? '').replace(/\s+/g, ' ').trim()
+      return `${key}=${value}`
+    })
+  return `${tool}::${normalizedArgs.join('||')}`
 }
 
 const formatSearchResults = (response: WebSearchResponse, query: string) => {
@@ -370,7 +658,7 @@ const formatSearchResults = (response: WebSearchResponse, query: string) => {
 }
 
 export default function ChatPanel() {
-  const { messages, isLoading, streamingContent, streamingReasoning, editPhase, streamingSummary, settings, addMessage, sendAgentMessage, clearMessages } = useAI()
+  const { messages, isLoading, streamingContent, streamingReasoning, editPhase, streamingSummary, settings, addMessage, sendAgentMessage, clearMessages, stopGeneration } = useAI()
 
   const { 
     document, 
@@ -378,9 +666,12 @@ export default function ChatPanel() {
     createDocumentFromDsl,
     isElectron, 
     currentFile, 
-    replaceInDocument, 
-    insertInDocument, 
-    deleteInDocument, 
+    replaceInDocument,
+    insertInDocument,
+    deleteInDocument,
+    replaceViaDsl,
+    insertViaDsl,
+    deleteViaDsl,
     openFile, 
     files, 
     workspacePath,
@@ -397,9 +688,13 @@ export default function ChatPanel() {
     getLatestContent
   } = useDocument()
   const [input, setInput] = useState('')
+  const [pendingImages, setPendingImages] = useState<string[]>([]) // 待发送的图片 base64 URL
   const [attachedFiles, setAttachedFiles] = useState<FileItem[]>([])
+  const [attachedFolders, setAttachedFolders] = useState<FileItem[]>([])
   const [isDragOver, setIsDragOver] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const chatContainerRef = useRef<HTMLDivElement>(null)
+  const userScrolledUpRef = useRef(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const [outlineJsonOpen, setOutlineJsonOpen] = useState<Record<string, boolean>>({})
   const [pendingPptOutline, setPendingPptOutline] = useState<{
@@ -503,26 +798,332 @@ export default function ChatPanel() {
     thinkingTime: 0
   })
   const [toolActivity, setToolActivity] = useState<ToolActivityItem[]>([])
+  const [streamItems, setStreamItems] = useState<StreamItem[]>([])
+  const streamItemsRef = useRef<StreamItem[]>([])
+  const previewToolActivityBySignatureRef = useRef<Map<string, string>>(new Map())
+  const pendingPreviewToolIdsRef = useRef<string[]>([])
+  const startedPreviewToolQueueRef = useRef<Map<string, string[]>>(new Map())
+
+  // Keep ref in sync with state
+  useEffect(() => {
+    streamItemsRef.current = streamItems
+  }, [streamItems])
 
   const resetToolActivity = useCallback(() => {
     setToolActivity([])
+    setStreamItems([])
+    streamItemsRef.current = []
+    previewToolActivityBySignatureRef.current.clear()
+    pendingPreviewToolIdsRef.current = []
+    startedPreviewToolQueueRef.current.clear()
   }, [])
 
-  const registerToolActivity = useCallback((tool: string, label: string) => {
+  const resetCurrentTurnToolActivity = useCallback(() => {
+    // Keep previous stream cards in chat history; only reset current-turn matching state.
+    previewToolActivityBySignatureRef.current.clear()
+    pendingPreviewToolIdsRef.current = []
+    startedPreviewToolQueueRef.current.clear()
+  }, [])
+
+  const clearTrailingStreamTextItems = useCallback(() => {
+    setStreamItems((prev) => {
+      let cut = prev.length
+      while (cut > 0 && prev[cut - 1].type === 'text') {
+        cut--
+      }
+      const next = prev.slice(0, cut)
+      streamItemsRef.current = next
+      return next
+    })
+  }, [])
+
+  const removeLatestMatchingStreamTextItem = useCallback((targetText: string) => {
+    const normalizedTarget = sanitizeAssistantText(stripToolBlocks(targetText || '')).trim()
+    if (!normalizedTarget) return
+
+    setStreamItems((prev) => {
+      let targetIndex = -1
+      for (let i = prev.length - 1; i >= 0; i--) {
+        const item = prev[i]
+        if (item.type !== 'text') continue
+        const normalizedItem = sanitizeAssistantText(stripToolBlocks(item.content || '')).trim()
+        if (normalizedItem === normalizedTarget) {
+          targetIndex = i
+          break
+        }
+      }
+
+      if (targetIndex === -1) return prev
+      const next = [...prev.slice(0, targetIndex), ...prev.slice(targetIndex + 1)]
+      streamItemsRef.current = next
+      return next
+    })
+  }, [])
+
+  const flushUiFrame = useCallback(async () => {
+    await new Promise<void>((resolve) => {
+      if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+        window.requestAnimationFrame(() => resolve())
+        return
+      }
+      setTimeout(() => resolve(), 0)
+    })
+  }, [])
+
+  const handleNewConversation = useCallback(() => {
+    clearMessages()
+    resetToolActivity()
+
+    setInput('')
+    setAttachedFiles([])
+    setAttachedFolders([])
+    setPendingImages([])
+    setPendingWordOps(null)
+    setPendingPptOutline(null)
+    setPptEditContext(null)
+    setWordOpsApplying(false)
+
+    setAgentProgress({
+      isActive: false,
+      currentAction: '',
+      steps: [],
+      fileChanges: [],
+      startTime: null,
+      thinkingTime: 0,
+    })
+  }, [clearMessages, resetToolActivity])
+
+  const registerToolActivity = useCallback((tool: string, label: string, extra?: { searchText?: string; replaceText?: string }) => {
     const id = `${tool}-${Date.now()}-${Math.random().toString(16).slice(2)}`
-    setToolActivity(prev => [...prev, { id, tool, label, status: 'running' }])
+    const item: ToolActivityItem = { id, tool, label, status: 'running', ...extra }
+    setToolActivity(prev => [...prev, item])
+    // Push tool card into streamItems for interleaved rendering
+    setStreamItems(prev => [...prev, { type: 'tool', id, data: item }])
     return id
   }, [])
 
-  const completeToolActivity = useCallback((id: string, status: 'success' | 'error', detail?: string) => {
+  const completeToolActivity = useCallback((id: string, status: 'success' | 'error' | 'skipped', detail?: string) => {
     setToolActivity(prev =>
       prev.map(item =>
         item.id === id ? { ...item, status, detail: detail ?? item.detail } : item
       )
     )
+    // Keep streamItems tool card state in sync for interleaved rendering
+    setStreamItems(prev => prev.map(item =>
+      item.type === 'tool' && item.id === id
+        ? { ...item, data: { ...item.data, status, detail: detail ?? item.data.detail } }
+        : item
+    ))
   }, [])
 
-  // 更新思考时间
+  const patchToolActivity = useCallback((id: string, patch: Partial<ToolActivityItem>) => {
+    setToolActivity((prev) =>
+      prev.map((item) => (item.id === id ? { ...item, ...patch } : item))
+    )
+    setStreamItems((prev) =>
+      prev.map((item) =>
+        item.type === 'tool' && item.id === id
+          ? { ...item, data: { ...item.data, ...patch } }
+          : item
+      )
+    )
+  }, [])
+
+  const enqueueStartedToolPreview = useCallback((tool: string, activityId: string) => {
+    const queue = startedPreviewToolQueueRef.current.get(tool) || []
+    if (!queue.includes(activityId)) {
+      queue.push(activityId)
+      startedPreviewToolQueueRef.current.set(tool, queue)
+    }
+  }, [])
+
+  const shiftStartedToolPreview = useCallback((tool: string): string | null => {
+    const queue = startedPreviewToolQueueRef.current.get(tool)
+    if (!queue || queue.length === 0) return null
+    const activityId = queue.shift() || null
+    if (queue.length === 0) {
+      startedPreviewToolQueueRef.current.delete(tool)
+    } else {
+      startedPreviewToolQueueRef.current.set(tool, queue)
+    }
+    return activityId
+  }, [])
+
+  const removeStartedToolPreview = useCallback((tool: string, activityId: string) => {
+    const queue = startedPreviewToolQueueRef.current.get(tool)
+    if (!queue || queue.length === 0) return
+    const next = queue.filter((id) => id !== activityId)
+    if (next.length === 0) {
+      startedPreviewToolQueueRef.current.delete(tool)
+    } else {
+      startedPreviewToolQueueRef.current.set(tool, next)
+    }
+  }, [])
+
+  const clearPreviewMappingsForActivityId = useCallback((activityId: string) => {
+    for (const [signature, mappedId] of previewToolActivityBySignatureRef.current.entries()) {
+      if (mappedId === activityId) {
+        previewToolActivityBySignatureRef.current.delete(signature)
+      }
+    }
+  }, [])
+
+  const resolvePreviewToolMeta = useCallback((tool: string, args: Record<string, string>) => {
+    if (tool === 'replace') {
+      const searchText = args.search || ''
+      return {
+        label: `Replace: ${truncateLabel(searchText, 24)}`,
+        searchText,
+        replaceText: args.replace || '',
+      }
+    }
+
+    if (tool === 'review') {
+      const searchText = args.search || ''
+      const reason = args.reason || searchText
+      const type = args.type || 'review'
+      return {
+        label: `[${type}] ${truncateLabel(reason, 30)}`,
+        searchText,
+        replaceText: args.replace || '',
+      }
+    }
+
+    if (tool === 'insert') {
+      return {
+        label: `Insert: ${args.position || 'after'}`,
+        searchText: args.target || '',
+        replaceText: args.content || '',
+      }
+    }
+
+    if (tool === 'word_chart') {
+      return {
+        label: `Chart: ${args.type || 'bar'}`,
+        searchText: '',
+        replaceText: args.title || args.type || 'chart',
+      }
+    }
+
+    if (tool === 'delete') {
+      const target = args.target || ''
+      return {
+        label: `Delete: ${truncateLabel(target, 24)}`,
+        searchText: target,
+        replaceText: '',
+      }
+    }
+
+    if (tool === 'word_edit_ops') {
+      let opsCount = 0
+      if (args.ops) {
+        try {
+          const parsed = JSON.parse(args.ops)
+          if (Array.isArray(parsed)) {
+            opsCount = parsed.length
+          }
+        } catch {
+          // ignore parse error for preview label
+        }
+      }
+      return {
+        label: `WordOps: ${opsCount > 0 ? `${opsCount} ops` : 'running'}`,
+      }
+    }
+
+    const hint = args.search || args.target || args.title || ''
+    return {
+      label: `${tool}: ${truncateLabel(hint || 'running', 24)}`,
+      searchText: args.search || args.target || '',
+      replaceText: args.replace || args.content || '',
+    }
+  }, [])
+
+  const registerToolStart = useCallback((tool: string) => {
+    const trackedTools = new Set(['replace', 'review', 'insert', 'delete', 'word_edit_ops', 'word_chart'])
+    if (!trackedTools.has(tool)) return
+
+    const startLabel = tool === 'word_edit_ops' ? 'WordOps: running' : `${tool}: running`
+    const activityId = registerToolActivity(tool, startLabel)
+    enqueueStartedToolPreview(tool, activityId)
+
+    if (!pendingPreviewToolIdsRef.current.includes(activityId)) {
+      pendingPreviewToolIdsRef.current.push(activityId)
+    }
+  }, [enqueueStartedToolPreview, registerToolActivity])
+
+  const registerToolPreview = useCallback((tool: string, args: Record<string, string>) => {
+    const trackedTools = new Set(['replace', 'review', 'insert', 'delete', 'word_edit_ops', 'word_chart'])
+    if (!trackedTools.has(tool)) return
+
+    const signature = buildToolCallSignature(tool, args)
+    if (previewToolActivityBySignatureRef.current.has(signature)) return
+
+    const meta = resolvePreviewToolMeta(tool, args)
+    const startedActivityId = shiftStartedToolPreview(tool)
+
+    if (startedActivityId) {
+      patchToolActivity(startedActivityId, {
+        tool,
+        label: meta.label,
+        status: 'running',
+        detail: undefined,
+        searchText: meta.searchText,
+        replaceText: meta.replaceText,
+      })
+      previewToolActivityBySignatureRef.current.set(signature, startedActivityId)
+      return
+    }
+
+    const activityId = registerToolActivity(tool, meta.label, {
+      searchText: meta.searchText,
+      replaceText: meta.replaceText,
+    })
+    previewToolActivityBySignatureRef.current.set(signature, activityId)
+    if (!pendingPreviewToolIdsRef.current.includes(activityId)) {
+      pendingPreviewToolIdsRef.current.push(activityId)
+    }
+  }, [patchToolActivity, registerToolActivity, resolvePreviewToolMeta, shiftStartedToolPreview])
+
+  const markToolPreviewSkipped = useCallback((tool: string, args: Record<string, string>, reason: string) => {
+    const signature = buildToolCallSignature(tool, args)
+    const mappedActivityId = previewToolActivityBySignatureRef.current.get(signature)
+    const activityId = mappedActivityId || shiftStartedToolPreview(tool)
+    if (!activityId) return
+
+    clearPreviewMappingsForActivityId(activityId)
+    removeStartedToolPreview(tool, activityId)
+    const shortReason = reason.length > 30 ? `${reason.slice(0, 30)}...` : reason
+    completeToolActivity(activityId, 'skipped', shortReason)
+  }, [clearPreviewMappingsForActivityId, completeToolActivity, removeStartedToolPreview, shiftStartedToolPreview])
+
+  const claimOrRegisterToolActivity = useCallback((
+    tool: string,
+    args: Record<string, string>,
+    label: string,
+    extra?: { searchText?: string; replaceText?: string }
+  ) => {
+    const signature = buildToolCallSignature(tool, args)
+    const mappedActivityId = previewToolActivityBySignatureRef.current.get(signature)
+    const previewActivityId = mappedActivityId || shiftStartedToolPreview(tool)
+
+    if (previewActivityId) {
+      clearPreviewMappingsForActivityId(previewActivityId)
+      removeStartedToolPreview(tool, previewActivityId)
+      patchToolActivity(previewActivityId, {
+        tool,
+        label,
+        status: 'running',
+        detail: undefined,
+        searchText: extra?.searchText,
+        replaceText: extra?.replaceText,
+      })
+      return previewActivityId
+    }
+
+    return registerToolActivity(tool, label, extra)
+  }, [clearPreviewMappingsForActivityId, patchToolActivity, registerToolActivity, removeStartedToolPreview, shiftStartedToolPreview])
+
   useEffect(() => {
     let interval: NodeJS.Timeout
     if (agentProgress.startTime) {
@@ -604,8 +1205,8 @@ export default function ChatPanel() {
       fileChanges: prev.fileChanges.map(f => ({ ...f, status: 'done' as const })),
       startTime: null
     }))
-    resetToolActivity()
-  }, [resetToolActivity])
+    // 不清空 toolActivity —— 卡片在完成后仍需保持可见，直到下次发送消息时才清除
+  }, [])
 
   // ========== 直接执行 PPT 生成（确认按钮用） ==========
   const executePptCreate = useCallback(async (draft: PptOutlineDraft, rawJson: string) => {
@@ -931,7 +1532,9 @@ export default function ChatPanel() {
   }, [])
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (!userScrolledUpRef.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
   }, [messages, agentProgress, streamingContent, toolActivity]) // 更新依赖，使用 streamingContent
 
   // 自动识别"阶段1：PPT 大纲 JSON"
@@ -956,7 +1559,7 @@ export default function ChatPanel() {
   // 检测操作类型
   const detectOperation = (text: string): 'create' | 'edit' | 'analyze' | 'chat' => {
     // 创建类关键词 - 包含"总结文档"、"做一个总结"等需要创建新文件的操作
-    const createKeywords = ['创建', '新建', '生成', '写一份', '帮我写', '起草', '总结文档', '做一个总结', '做个总结', '写总结', '生成总结', '/会议纪要']
+    const createKeywords = ['创建', '新建', '生成', '写一份', '帮我写', '起草', '撰写', '编写', '拟写', '拟定', '总结文档', '做一个总结', '做个总结', '写总结', '生成总结', '/会议纪要']
     // 编辑类关键词 - 包含快捷命令
     const editKeywords = [
       '修改', '编辑', '润色', '优化', '改成', '替换', '删除', '添加', '扩展', '精简', '翻译', '重写',
@@ -1171,6 +1774,51 @@ export default function ChatPanel() {
     return filePath.includes('\\') ? dir.replace(/\//g, '\\') : dir
   }
 
+  const debugLogQueueRef = useRef<Promise<void>>(Promise.resolve())
+
+  const resolveAgentDebugLogPath = useCallback((): string | null => {
+    const rootPath = workspacePath || (currentFile?.path ? getParentDir(currentFile.path) : '')
+    if (!rootPath) return null
+
+    const dateTag = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+    const fileName = `agent-trace-${dateTag}.md`
+    const needsSeparator = !rootPath.endsWith('\\') && !rootPath.endsWith('/')
+    const separator = rootPath.includes('\\') ? '\\' : '/'
+    return `${rootPath}${needsSeparator ? separator : ''}${fileName}`
+  }, [workspacePath, currentFile?.path])
+
+  const appendAgentDebugLog = useCallback(async (content: string) => {
+    if (!content || !isElectron || !window.electronAPI) return
+
+    const logPath = resolveAgentDebugLogPath()
+    if (!logPath) return
+
+    debugLogQueueRef.current = debugLogQueueRef.current
+      .then(async () => {
+        if (window.electronAPI?.appendFile) {
+          const appendResult = await window.electronAPI.appendFile(logPath, content)
+          if (!appendResult.success) {
+            console.warn('[AgentDebug] appendFile failed:', appendResult.error)
+          }
+          return
+        }
+
+        if (window.electronAPI?.readFile && window.electronAPI?.writeFile) {
+          const readResult = await window.electronAPI.readFile(logPath)
+          const previous = readResult.success ? (readResult.data || '') : ''
+          const writeResult = await window.electronAPI.writeFile(logPath, previous + content)
+          if (!writeResult.success) {
+            console.warn('[AgentDebug] writeFile fallback failed:', writeResult.error)
+          }
+        }
+      })
+      .catch((error) => {
+        console.warn('[AgentDebug] queue write failed:', error)
+      })
+
+    await debugLogQueueRef.current
+  }, [isElectron, resolveAgentDebugLogPath])
+
   const flattenFileTree = (items: FileItem[]) => {
     const out: FileItem[] = []
     const walk = (nodes: FileItem[]) => {
@@ -1368,20 +2016,21 @@ export default function ChatPanel() {
     return truncateWithNote(lines.join('\n'), maxChars, 'Excel 摘要')
   }
 
-  const summarizeWorkspaceFile = useCallback(async (file: FileItem, options?: { maxChars?: number; maxSlides?: number }) => {
+  const summarizeWorkspaceFile = useCallback(async (file: FileItem, options?: { maxChars?: number; maxSlides?: number; format?: string }) => {
     if (!isElectron || !window.electronAPI) {
       return '⚠️ 当前环境不支持读取工作夹文件'
     }
     const maxChars = options?.maxChars || WORKSPACE_SUMMARY_MAX_CHARS
     const maxSlides = options?.maxSlides || WORKSPACE_PPTX_MAX_SLIDES
+    const format = options?.format || 'summary'
 
-    let cacheKey = `${file.path}:${maxChars}:${maxSlides}`
+    let cacheKey = `${file.path}:${maxChars}:${maxSlides}:${format}`
     if (window.electronAPI.getFileInfo) {
       try {
         const infoResult = await window.electronAPI.getFileInfo(file.path)
         const info = infoResult?.data
         if (infoResult?.success && info) {
-          cacheKey = `${file.path}:${String(info.modified || '')}:${info.size || ''}:${maxChars}:${maxSlides}`
+          cacheKey = `${file.path}:${String(info.modified || '')}:${info.size || ''}:${maxChars}:${maxSlides}:${format}`
         }
       } catch {
         // ignore
@@ -1396,7 +2045,21 @@ export default function ChatPanel() {
     const ext = (file.extension || file.name.split('.').pop() || '').toLowerCase()
     let summary = ''
 
-    if (ext === 'docx') {
+    if (ext === 'docx' && format === 'dsl') {
+      // DSL 格式：解析 docx → HTML → DSL → 序列化，保留完整格式信息
+      try {
+        const result = await window.electronAPI.readFile(file.path)
+        if (result.success && result.data) {
+          const parsed = await parseDocxToHtmlForAgent(result.data)
+          const dsl = htmlToDsl(parsed.html, { stripDiffMarkers: true })
+          summary = `【Word 文档 DSL】${file.name}\n` + serializeDslForAI(dsl, { maxLength: maxChars - 100 })
+        } else {
+          summary = `⚠️ 无法读取 .docx：${result.error || '未知错误'}`
+        }
+      } catch (e) {
+        summary = `⚠️ DSL 解析失败：${(e as Error).message}`
+      }
+    } else if (ext === 'docx') {
       summary = await generateDocxAgentContextFromFilePath(file.name, file.path, {
         maxLength: maxChars,
         maxParagraphs: 30,
@@ -1494,13 +2157,23 @@ export default function ChatPanel() {
     return contents.join('\n\n')
   }, [attachedFiles, getFileContent, truncateWithNote])
 
-  const handleSend = useCallback(async () => {
-    if (!input.trim() || isLoading) return
+  // 构建文件夹上下文（只提供路径，让 AI 用工具自行查看）
+  const buildFoldersContext = useCallback(() => {
+    if (attachedFolders.length === 0) return ''
+    const lines = attachedFolders.map(f =>
+      `📁 文件夹：${f.name}\n   路径：${f.path}\n   请使用 workspace_list 工具（folder 参数填此路径）查看文件列表，再用 workspace_read 读取需要的文件。`
+    )
+    return `=== 用户拖入的文件夹 ===\n${lines.join('\n\n')}\n\n⚠️ 不要一次性读取所有文件，请根据需要选择性查看。`
+  }, [attachedFolders])
 
-    const userMessage = input.trim()
+  const handleSend = useCallback(async () => {
+    if ((!input.trim() && pendingImages.length === 0) || isLoading) return
+
+    const userMessage = input.trim() || 'Please analyze the attached image(s).'
     setInput('')
     resetToolActivity()
-    
+    userScrolledUpRef.current = false
+
     // 保存 PPT 编辑上下文（如果有）并清除状态
     const currentPptEditContext = pptEditContext
     if (pptEditContext) {
@@ -1509,13 +2182,20 @@ export default function ChatPanel() {
     
     const operation = detectOperation(userMessage)
     const fileNames = attachedFiles.map(f => f.name).join(', ')
+    const allImages = [
+      ...(currentPptEditContext?.imageBase64 ? [currentPptEditContext.imageBase64] : []),
+      ...pendingImages
+    ]
     
     // 构建用户消息内容（包含 PPT 编辑上下文标记）
     let displayMessage = userMessage
     if (currentPptEditContext) {
       displayMessage = `🖼️ [第 ${currentPptEditContext.pageNumber} 页${currentPptEditContext.isRegion ? '（框选区域）' : ''}] ${userMessage}`
-    } else if (attachedFiles.length > 0) {
-      displayMessage = `${userMessage}\n📎 ${fileNames}`
+    } else if (attachedFiles.length > 0 || attachedFolders.length > 0) {
+      const parts: string[] = []
+      if (attachedFiles.length > 0) parts.push(`📎 ${fileNames}`)
+      if (attachedFolders.length > 0) parts.push(`📁 ${attachedFolders.map(f => f.name).join(', ')}`)
+      displayMessage = `${userMessage}\n${parts.join('  ')}`
     }
     
     // 添加用户消息
@@ -1523,6 +2203,10 @@ export default function ChatPanel() {
       role: 'user', 
       content: displayMessage
     })
+
+    if (pendingImages.length > 0) {
+      setPendingImages([])
+    }
 
     // 启动 Agent 进度（在聊天中显示）
     if (operation === 'create' || operation === 'edit') {
@@ -1538,7 +2222,9 @@ export default function ChatPanel() {
     // 构建完整的文档上下文
     // 1. 当前编辑器中的文档内容（默认始终包含）
     // 2. 用户拖拽的附加文件内容
-    let fullContext = attachedContext || ''
+    // 3. 用户拖拽的文件夹路径（AI 用工具自行查看）
+    const foldersContext = buildFoldersContext()
+    let fullContext = [attachedContext, foldersContext].filter(Boolean).join('\n\n')
     // 给 Agent 的“当前文档内容”（由 AIContext 附加到 user 消息）；需要严格控大小，避免图片 base64 撑爆上下文
     let documentContextForAI: string | undefined
     
@@ -1673,14 +2359,25 @@ export default function ChatPanel() {
         }
         
         if (docContent) {
-          // 给 AI：文档正文走 documentContext（更符合 Agent prompt 的 [当前文档内容]），fullContext 里只放结构/元信息，避免重复与超大 payload
-          documentContextForAI = truncateWithNote(
-            sanitizeHtmlForAI(docContent),
-            120_000,
-            '当前文档 HTML（已移除图片 base64）'
-          )
+          // 给 AI：将 HTML 转为 DSL JSON 发给模型（结构化、token 更少、模型理解更好）
+          try {
+            const docDsl = htmlToDsl(docContent, { stripDiffMarkers: true })
+            documentContextForAI = truncateWithNote(
+              serializeDslForAI(docDsl),
+              120_000,
+              '当前文档内容（DSL 格式）'
+            )
+          } catch (e) {
+            // DSL 转换失败时回退到 HTML
+            console.warn('[ChatPanel] htmlToDsl failed, falling back to sanitizeHtmlForAI:', e)
+            documentContextForAI = truncateWithNote(
+              sanitizeHtmlForAI(docContent),
+              120_000,
+              '当前文档 HTML（已移除图片 base64）'
+            )
+          }
 
-          const formatNote = '\n\n[提示：AI 编辑使用内置编辑器。支持 HTML 格式，可使用 <h1>/<h2>/<strong>/<em> 等标签。' +
+          const formatNote = '\n\n[提示：文档内容以 DSL JSON 格式提供，每个块有 _i 索引。编辑时可使用 blockIndex 精确定位。' +
             (editorMode === 'onlyoffice' ? ' 当前预览模式为 ONLYOFFICE。]' : ']')
           const currentFileContext = `=== ${currentFile.name} (当前编辑) ===\n${docStructure}${onlyOfficeExtra}${formatNote}`
           fullContext = fullContext ? `${currentFileContext}\n\n${fullContext}` : currentFileContext
@@ -1718,29 +2415,127 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
       ? truncateWithNote(workspaceContext, 1200, '工作夹摘要')
       : ''
 
+    // ─── 工具调用日志：记录发给模型的文档上下文 ───
+    toolCallLogger.setWorkDir(workspacePath || (currentFile?.path ? getParentDir(currentFile.path) : ''))
+    toolCallLogger.log({
+      type: 'request_context',
+      data: {
+        userMessage: userMessage.slice(0, 500),
+        documentContextLength: documentContextForAI?.length || 0,
+        fullContextLength: fullContext?.length || 0,
+        hasPptEditContext: !!currentPptEditContext,
+        currentFileName: currentFile?.name || null,
+      },
+    })
+
     // 使用 Agent 模式发送消息
     await sendAgentMessage(
       userMessage,
       documentContextForAI,
       fullContext || undefined,
       {
+        onDebugEvent: async (event) => {
+          const markdown = formatAgentDebugEventMarkdown(event)
+          if (!markdown) return
+          await appendAgentDebugLog(markdown)
+        },
+
+        onTextChunk: (text) => {
+          const cleaned = sanitizeAssistantText(stripToolBlocks(text || '')).trim()
+          if (!cleaned) {
+            pendingPreviewToolIdsRef.current = []
+            return
+          }
+
+          const id = `text-${Date.now()}-${Math.random().toString(16).slice(2)}`
+          const pendingIds = new Set(pendingPreviewToolIdsRef.current)
+
+          setStreamItems((prev) => {
+            const last = prev[prev.length - 1]
+            if (last?.type === 'text' && last.content === cleaned) {
+              return prev
+            }
+
+            if (pendingIds.size > 0) {
+              const firstPendingToolIndex = prev.findIndex(
+                (item) => item.type === 'tool' && pendingIds.has(item.id)
+              )
+              if (firstPendingToolIndex >= 0) {
+                return [
+                  ...prev.slice(0, firstPendingToolIndex),
+                  { type: 'text', id, content: cleaned },
+                  ...prev.slice(firstPendingToolIndex),
+                ]
+              }
+            }
+
+            return [...prev, { type: 'text', id, content: cleaned }]
+          })
+
+          pendingPreviewToolIdsRef.current = []
+        },
+
         // 工具调用处理
+        onToolCallStart: (tool) => {
+          registerToolStart(tool)
+        },
+
+        onToolCallPreview: (tool, args) => {
+          registerToolPreview(tool, args)
+        },
+
+        onToolCallSkipped: (tool, args, reason) => {
+          markToolPreviewSkipped(tool, args, reason)
+        },
+
         onToolCall: async (tool, args): Promise<ToolResult> => {
           if (tool === 'replace') {
             const search = args.search || ''
             const replaceText = args.replace || ''
-            
+            const blockIndex = args.blockIndex ? parseInt(args.blockIndex) : undefined
+
             if (!search) {
               return { tool, success: false, message: '缺少 search 参数' }
             }
 
-            const activityId = registerToolActivity('replace', `替换：${truncateLabel(search, 24)}`)
+            const activityId = claimOrRegisterToolActivity('replace', args, `Replace: ${truncateLabel(search, 24)}`, { searchText: search, replaceText })
+            await flushUiFrame()
 
             // 如果当前是 ONLYOFFICE 模式，自动切换到内置编辑器以显示 diff 标记
             if (editorMode === 'onlyoffice') {
               setEditorMode('tiptap')
               // 等待编辑器切换完成
               await new Promise(resolve => setTimeout(resolve, 100))
+            }
+
+            // 如果提供了 blockIndex，优先走 DSL 路径
+            if (blockIndex !== undefined && !isNaN(blockIndex)) {
+              const format = args.bold === 'true' || args.italic === 'true' || args.underline === 'true' || args.color || args.fontSize
+                ? {
+                    bold: args.bold === 'true' || undefined,
+                    italic: args.italic === 'true' || undefined,
+                    underline: args.underline === 'true' || undefined,
+                    color: args.color || undefined,
+                    fontSize: args.fontSize ? parseFloat(args.fontSize) : undefined,
+                  }
+                : undefined
+
+              updateAgentAction(`正在替换 [块${blockIndex}]「${search.slice(0, 20)}...」`)
+              completeAgentStep()
+              updateAgentFile({ status: 'writing', name: fileName })
+
+              const dslResult = replaceViaDsl(search, replaceText, { blockIndex, format: format as any })
+
+              if (dslResult.success) {
+                totalReplacements += dslResult.count
+                updateAgentFile({ additions: dslResult.count, status: 'writing', name: fileName })
+                if (isElectron && currentFile) silentSaveToFile().catch(() => {})
+                completeToolActivity(activityId, 'success', `${dslResult.count} 处`)
+                return { tool, success: true, message: dslResult.message, data: { count: dslResult.count, blockIndex } }
+              } else {
+                // DSL 失败，回退到 HTML 路径
+                console.warn('[replace] DSL path failed, falling back to HTML:', dslResult.message)
+              }
             }
 
             // 解析格式化参数
@@ -1764,40 +2559,75 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
 
             // AI 编辑始终使用内置编辑器（Tiptap）的方法
             // ONLYOFFICE 仅用于预览，不参与 AI 编辑
-            let result
-            if (hasFormat) {
-              result = replaceWithFormat(search, replaceText, format)
-            } else {
-              result = replaceInDocument(search, replaceText)
+            const attemptedSearches = buildReplaceSearchCandidates(search)
+            const maxAttempts = Math.min(8, attemptedSearches.length)
+
+            let result: ReturnType<typeof replaceInDocument> | ReturnType<typeof replaceWithFormat> | null = null
+            let usedSearch = search
+
+            for (let i = 0; i < maxAttempts; i++) {
+              const candidateSearch = attemptedSearches[i]
+              const attemptResult = hasFormat
+                ? replaceWithFormat(candidateSearch, replaceText, format)
+                : replaceInDocument(candidateSearch, replaceText)
+
+              result = attemptResult
+              usedSearch = candidateSearch
+
+              if (attemptResult.success && attemptResult.count > 0) {
+                break
+              }
             }
-            
-            if (result.success && result.count > 0) {
+
+            const fallbackCount = attemptedSearches.slice(0, maxAttempts).length
+
+            if (result && result.success && result.count > 0) {
               totalReplacements += result.count
               updateAgentFile({ additions: result.count, status: 'writing', name: fileName })
-              
+
               // 自动保存到磁盘
               if (isElectron && currentFile) {
                 silentSaveToFile().catch(() => {})
               }
-              
+
               completeToolActivity(activityId, 'success', `${result.count} 处`)
-              return { 
-                tool, 
-                success: true, 
-                message: `成功替换 ${result.count} 处：「${search}」→「${replaceText}」`,
-                data: { 
+
+              const fallbackHint = usedSearch !== search
+                ? `（自动修正 search 后命中）`
+                : ''
+
+              return {
+                tool,
+                success: true,
+                message: `成功替换 ${result.count} 处${fallbackHint}：「${search}」→「${replaceText}」`,
+                data: {
                   count: result.count,
-                  searchText: search,
-                  replaceText: replaceText,
-                  positions: result.positions
+                  searchText: usedSearch,
+                  originalSearchText: search,
+                  replaceText,
+                  positions: result.positions,
+                  attemptedSearches: attemptedSearches.slice(0, maxAttempts),
                 }
               }
-            } else {
-              completeToolActivity(activityId, 'error', '未找到匹配')
-              return { 
-                tool, 
-                success: false, 
-                message: `未找到「${search}」，请检查是否与文档内容完全匹配` 
+            }
+
+            const failMessageCore = result?.message || `未找到「${search}」，请检查是否与文档内容完全匹配`
+            const failMessage = `${failMessageCore}；已自动尝试 ${fallbackCount} 种 search 变体`
+            const shortReason = failMessage.length > 26 ? `${failMessage.slice(0, 26)}...` : failMessage
+            completeToolActivity(activityId, 'error', shortReason)
+
+            return {
+              tool,
+              success: false,
+              message: failMessage,
+              data: {
+                count: result?.count || 0,
+                searchText: result?.searchText || search,
+                originalSearchText: search,
+                usedSearch,
+                replaceText,
+                attemptedSearches: attemptedSearches.slice(0, maxAttempts),
+                debug: result?.debug,
               }
             }
           }
@@ -1818,7 +2648,8 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             }
             const typeLabel = reviewTypeLabels[reviewType] || reviewType
 
-            const activityId = registerToolActivity('review', `[${typeLabel}] ${truncateLabel(reason || search, 30)}`)
+            const activityId = claimOrRegisterToolActivity('review', args, `[${typeLabel}] ${truncateLabel(reason || search, 30)}`, { searchText: search, replaceText: replaceText })
+            await flushUiFrame()
 
             // 如果当前是 ONLYOFFICE 模式，自动切换到内置编辑器以显示 diff 标记
             if (editorMode === 'onlyoffice') {
@@ -1867,32 +2698,48 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                 data: { count: result.count, reason, type: reviewType }
               }
             } else {
-              completeToolActivity(activityId, 'error', '未找到匹配')
+              const failMessage = result.message || `未找到「${search}」，请检查是否与文档内容完全匹配`
+              const shortReason = failMessage.length > 26 ? `${failMessage.slice(0, 26)}...` : failMessage
+              completeToolActivity(activityId, 'error', shortReason)
               return {
                 tool,
                 success: false,
-                message: `未找到「${search}」，请检查是否与文档内容完全匹配`
+                message: failMessage,
+                data: {
+                  count: result.count,
+                  reason,
+                  type: reviewType,
+                  searchText: result.searchText || search,
+                  replaceText,
+                  debug: result.debug,
+                }
               }
             }
           }
 
           if (tool === 'word_edit_ops') {
-            // 统一格式/样式/字符格式的结构化操作：支持 dryRun 预览 → 用户确认 → 应用修订
+            // Structured document operations: support dry-run preview and then apply.
             const rawOps = args.ops || ''
             const dryRunTop = (args.dryRun || '').toLowerCase() === 'true'
+            const activityId = claimOrRegisterToolActivity('word_edit_ops', args, 'WordOps: running')
+            await flushUiFrame()
 
             let ops: any[] = []
             if (rawOps) {
               try {
                 ops = JSON.parse(rawOps)
-              } catch (e) {
-                return { tool, success: false, message: 'ops 解析失败：不是合法 JSON 数组' }
+              } catch {
+                completeToolActivity(activityId, 'error', 'ops JSON invalid')
+                return { tool, success: false, message: 'ops parse failed: expected a JSON array' }
               }
             }
 
             if (!Array.isArray(ops) || ops.length === 0) {
-              return { tool, success: false, message: '缺少 ops 或 ops 为空（必须是 JSON 数组）' }
+              completeToolActivity(activityId, 'error', 'ops empty')
+              return { tool, success: false, message: 'missing ops: expected a non-empty JSON array' }
             }
+
+            patchToolActivity(activityId, { label: `WordOps: ${ops.length} ops` })
 
             const inferredDryRun = ops.some((op) => op?.dryRun === true)
             const isDryRun = dryRunTop || inferredDryRun
@@ -1905,11 +2752,12 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                 previewMessage: preview.message,
                 previewLines: lines,
               })
+              completeToolActivity(activityId, preview.success ? 'success' : 'error', preview.success ? `${ops.length} ops preview` : 'preview failed')
               return {
                 tool,
                 success: preview.success,
                 message: preview.success
-                  ? `${preview.message}\n${lines.length ? '- ' + lines.join('\n- ') : ''}\n\n请在下方点击「应用修订」以执行。`
+                  ? `${preview.message}${lines.length ? `\n- ${lines.join('\n- ')}` : ''}\n\nClick Apply Revisions below to execute.`
                   : preview.message,
                 data: preview.data,
               }
@@ -1917,10 +2765,16 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
 
             const prep = await prepareTemplateFillOutput(ops)
             if (!prep.success) {
-              return { tool, success: false, message: prep.message || '模板填充准备失败' }
+              completeToolActivity(activityId, 'error', 'prepare failed')
+              return { tool, success: false, message: prep.message || 'template fill preparation failed' }
             }
 
             const result = applyWordOps(ops)
+            const createdCount = Number((result.data as { created?: number } | undefined)?.created ?? -1)
+            const activityDetail = result.success
+              ? (createdCount >= 0 ? `${createdCount} changes` : `${ops.length} ops`)
+              : (createdCount === 0 ? '0 changes' : 'apply failed')
+            completeToolActivity(activityId, result.success ? 'success' : 'error', activityDetail)
             return {
               tool,
               success: result.success,
@@ -1928,7 +2782,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               data: result.data,
             }
           }
-          
+
           if (tool === 'create') {
             const title = args.title || '新文档'
             const content = args.content || ''
@@ -2412,7 +3266,74 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               return { tool, success: false, message: `PPT 编辑失败: ${e}` }
             }
           }
-          
+
+          // ── word_chart: 在 Word 文档中插入图表 ──
+          if (tool === 'word_chart') {
+            const chartType = (args.type || 'bar') as ChartConfig['type']
+            const title = args.title || ''
+            const position = args.position || 'end'
+            const width = args.width ? parseInt(args.width) : 500
+            const height = args.height ? parseInt(args.height) : 300
+
+            let categories: string[]
+            let series: ChartSeries[]
+            try {
+              categories = JSON.parse(args.categories || '[]')
+              series = JSON.parse(args.series || '[]')
+            } catch (e) {
+              return { tool, success: false, message: `图表参数解析失败: ${(e as Error).message}` }
+            }
+
+            if (!categories.length || !series.length) {
+              return { tool, success: false, message: '缺少 categories 或 series 数据' }
+            }
+
+            const chartConfig: ChartConfig = {
+              type: chartType,
+              title: title || undefined,
+              categories,
+              series,
+              widthPx: width,
+              heightPx: height,
+              stacking: args.stacking as ChartConfig['stacking'],
+              legendPosition: (args.legendPosition || 'bottom') as ChartConfig['legendPosition'],
+            }
+
+            const encoded = encodeURIComponent(JSON.stringify(chartConfig))
+            const chartHtml = `<div data-type="docx-chart" data-chart-config="${encoded}" style="width:${width}px;height:${height}px"></div>`
+
+            const activityId = claimOrRegisterToolActivity('word_chart', args, `Chart: ${chartType}`, { searchText: '', replaceText: title || chartType })
+            await flushUiFrame()
+
+            if (editorMode === 'onlyoffice') {
+              setEditorMode('tiptap')
+              await new Promise(resolve => setTimeout(resolve, 100))
+            }
+
+            updateAgentAction(`正在插入${title || chartType}图表`)
+            completeAgentStep()
+
+            const result = insertInDocument(position, chartHtml)
+
+            if (result.success) {
+              updateAgentFile({ additions: 1, status: 'writing', name: fileName })
+              let savedMsg = ''
+              if (isElectron && currentFile) {
+                const saveResult = await silentSaveToFile()
+                savedMsg = saveResult.success ? '（已自动保存）' : `（保存失败: ${saveResult.error}）`
+              }
+              completeToolActivity(activityId, 'success', `${chartType} 图表`)
+              return {
+                tool,
+                success: true,
+                message: `已插入${title ? `"${title}"` : ''}${chartType}图表到${position === 'end' ? '末尾' : position === 'start' ? '开头' : position}${savedMsg}`,
+              }
+            } else {
+              completeToolActivity(activityId, 'error', result.message)
+              return { tool, success: false, message: result.message }
+            }
+          }
+
           if (tool === 'insert') {
             const position = args.position || 'end'
             let content = args.content || ''
@@ -2439,7 +3360,8 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               return { tool, success: false, message: '缺少 content 或 dsl 参数' }
             }
 
-            const activityId = registerToolActivity('insert', `插入：${position}`)
+            const activityId = claimOrRegisterToolActivity('insert', args, `Insert: ${position}`, { searchText: args.target || position, replaceText: content })
+            await flushUiFrame()
 
             // 如果当前是 ONLYOFFICE 模式，自动切换到内置编辑器
             if (editorMode === 'onlyoffice') {
@@ -2453,7 +3375,18 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             addAgentFileOperation(`插入: ${dslBlockCount ? `${dslBlockCount} 个 DSL 块` : content.slice(0, 30) + '...'}`)
             
             // AI 编辑始终使用内置编辑器（Tiptap）的方法
-            const result = insertInDocument(position, content)
+            // 如果有 DSL 参数且 position 支持 blockIndex，走 DSL 路径
+            let result: { success: boolean; message: string }
+            if (args.dsl && (position.startsWith('blockIndex:') || position === 'start' || position === 'end' || position.startsWith('after:') || position.startsWith('before:'))) {
+              try {
+                const dslObj: DocDsl = JSON.parse(args.dsl)
+                result = insertViaDsl(position, dslObj.blocks || [])
+              } catch (e) {
+                result = insertInDocument(position, content)
+              }
+            } else {
+              result = insertInDocument(position, content)
+            }
             
             if (result.success) {
               updateAgentFile({ additions: 1, status: 'writing', name: fileName })
@@ -2482,12 +3415,14 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
           
           if (tool === 'delete') {
             const target = args.target || ''
-            
-            if (!target) {
-              return { tool, success: false, message: '缺少 target 参数' }
+            const blockIndex = args.blockIndex ? parseInt(args.blockIndex) : undefined
+
+            if (!target && blockIndex === undefined) {
+              return { tool, success: false, message: '缺少 target 或 blockIndex 参数' }
             }
 
-            const activityId = registerToolActivity('delete', `删除：${truncateLabel(target, 24)}`)
+            const activityId = claimOrRegisterToolActivity('delete', args, `Delete: ${truncateLabel(target, 24)}`, { searchText: target })
+            await flushUiFrame()
 
             // 如果当前是 ONLYOFFICE 模式，自动切换到内置编辑器
             if (editorMode === 'onlyoffice') {
@@ -2500,7 +3435,10 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             completeAgentStep()
             addAgentFileOperation(`删除: "${target.slice(0, 30)}..."`)
             
-            const result = deleteInDocument(target)
+            // 如果有 blockIndex，走 DSL 路径
+            const result = (blockIndex !== undefined && !isNaN(blockIndex))
+              ? deleteViaDsl(target, { blockIndex })
+              : deleteInDocument(target)
             
             if (result.success) {
               updateAgentFile({ deletions: result.count, status: 'writing', name: fileName })
@@ -2710,6 +3648,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             const targetPath = (args.path || args.file || args.filePath || '').trim()
             const targetName = (args.name || '').trim()
             const targetRel = (args.relativePath || '').trim()
+            const format = (args.format || '').trim().toLowerCase()
             const file = await resolveWorkspaceFile({ path: targetPath || targetRel, name: targetName, relativePath: targetRel })
             if (!file) {
               return { tool, success: false, message: '未找到指定文件，请先使用 workspace_list 查看路径' }
@@ -2720,13 +3659,13 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             const maxSlides = Math.min(Math.max(maxSlidesArg || WORKSPACE_PPTX_MAX_SLIDES, 1), 20)
             const activityId = registerToolActivity(tool, `读取：${truncateLabel(file.name, 24)}`)
             updateAgentAction(`正在读取 ${file.name}`)
-            const content = await summarizeWorkspaceFile(file, { maxChars, maxSlides })
+            const content = await summarizeWorkspaceFile(file, { maxChars, maxSlides, format: format || undefined })
             completeToolActivity(activityId, 'success')
             return {
               tool,
               success: true,
               message: content,
-              data: { filePath: file.path, fileName: file.name, maxChars }
+              data: { filePath: file.path, fileName: file.name, maxChars, format }
             }
           }
 
@@ -3678,14 +4617,33 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
         onComplete: (content, toolResults) => {
           // 完成 Agent 进度
           finishAgentProgress()
-          
+
+          // 快照当前 streamItems 中的工具卡片，附加到消息上用于历史内联展示
+          const toolCards = streamItemsRef.current
+            .filter((si): si is { type: 'tool'; id: string; data: ToolActivityItem } => si.type === 'tool')
+            .map(si => ({ ...si.data }))
+
+          // 构建完整的交替快照（文字 + 工具卡片按原始顺序），用于历史消息交替渲染
+          const streamSnapshot = streamItemsRef.current.map(si => {
+            if (si.type === 'text') {
+              return { type: 'text' as const, id: si.id, content: si.content }
+            }
+            return { type: 'tool' as const, id: si.id, toolCard: { ...si.data } }
+          })
+
           console.log('[onComplete] content:', content?.substring(0, 200))
           console.log('[onComplete] toolResults:', toolResults.length)
-          
+
+          // streamItems 由交替卡片实时展示，消息只放简短总结
           // 如果有工具调用结果，显示统计
           if (toolResults.length > 0) {
+            // Remove duplicated final summary from stream cards (it may be inserted before tool cards).
+            removeLatestMatchingStreamTextItem(content || '')
+            // Also remove any trailing text-only stream cards.
+            clearTrailingStreamTextItems()
             const successCount = toolResults.filter(r => r.success).length
             const replaceResults = toolResults.filter(r => r.tool === 'replace' && r.success)
+            const reviewResults = toolResults.filter(r => r.tool === 'review' && r.success)
             const createResults = toolResults.filter(r => r.tool === 'create' && r.success)
             const excelCreateResults = toolResults.filter(r => r.tool === 'excel_create' && r.success)
             
@@ -3701,8 +4659,9 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               const created = excelCreateResults[0]
               statusBadge = `\n\n---\n✅ **已创建表格** 📊 \`${created.data?.fileName}\``
               resultFileName = created.data?.fileName as string
-            } else if (replaceResults.length > 0) {
-              const diffChanges = replaceResults.map(r => ({
+            } else if (replaceResults.length > 0 || reviewResults.length > 0) {
+              const diffSource = [...replaceResults, ...reviewResults]
+              const diffChanges = diffSource.map(r => ({
                 searchText: r.data?.searchText as string || '',
                 replaceText: r.data?.replaceText as string || '',
                 count: (r.data?.count as number) || 0
@@ -3710,13 +4669,16 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               const totalCount = diffChanges.reduce((sum, d) => sum + d.count, 0)
               statusBadge = `\n\n---\n✅ **已更新文档** 📄 \`${fileName}\` (~${totalCount} 处修改)`
               
-              // 替换操作保留 diffChanges
+              // 消息只放简短总结（步骤内容由 toolCards 在历史消息中内联展示）
               addMessage({
                 role: 'assistant',
-                content: (content?.trim() ? content : '已按你的要求完成修改，下面是变更结果：') + statusBadge,
+                content: content?.trim() || 'Edit completed',
                 diffChanges,
-                fileName
+                fileName,
+                toolCards,
+                streamSnapshot
               })
+              resetToolActivity()
               return
             } else {
               // PPT 编辑：补齐状态徽章（避免只有“已更新”卡片/无总结）
@@ -3739,42 +4701,48 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             }
             
             if (successCount === 0 && toolResults.length > 0) {
-              // 所有工具调用都失败了
               addMessage({
                 role: 'assistant',
-                content: content || '操作未能完成，请检查文档内容是否匹配'
+                content: content || '操作未能完成，请检查文档内容是否匹配',
+                toolCards,
+                streamSnapshot
               })
             } else {
-              // 显示 AI 的总结内容 + 状态标签
-              // 如果 content 为空，至少显示操作结果
-              const finalContent = content?.trim() 
-                ? content + statusBadge 
+              const summaryText = content?.trim()
+                ? content + statusBadge
                 : (statusBadge ? `任务已完成！${statusBadge}` : '任务已完成')
-              
-              console.log('[onComplete] finalContent:', finalContent?.substring(0, 200))
-              
               addMessage({
                 role: 'assistant',
-                content: finalContent,
-                fileName: resultFileName
+                content: summaryText,
+                fileName: resultFileName,
+                toolCards,
+                streamSnapshot
               })
             }
+            resetToolActivity()
           } else {
-            // 没有工具调用，普通对话
+            // No tool calls in this turn: if model claims doc updates, show explicit warning.
+            const rawContent = content || 'Done'
+            const claimsDocChanged = /\b(completed|updated|modified|replaced|formatted|created)\b/i.test(rawContent) || /已(创建|修改|替换|生成|完成|更新|删除|插入|添加|写好|写完)/.test(rawContent)
+            const needsToolButMissing = (operation === 'edit' || operation === 'create') && claimsDocChanged
+
             addMessage({
               role: 'assistant',
-              content: content || '完成'
+              content: needsToolButMissing
+                ? `⚠️ 未检测到工具调用，文档实际未被创建或修改。请重新发送指令，确保模型使用 create 工具。\n\n${rawContent}`
+                : rawContent
             })
+            resetToolActivity()
           }
         },
         
-        // 获取最新文档内容（用于在工具调用后让 AI 知道文档已更新）
-        // 使用 getLatestContent() 而不是 document.content 避免闭包问题
+        // 获取最新文档内容（结构化纯文本+格式标注，不含 HTML）
         getLatestDocument: () => {
-          return getLatestContent()
+          return getTiptapDocumentStructure()
         }
       },
-      { workspaceKey: memoryWorkspaceKey, workspaceSummary: memoryWorkspaceSummary }
+      { workspaceKey: memoryWorkspaceKey, workspaceSummary: memoryWorkspaceSummary },
+      allImages.length > 0 ? allImages : undefined
     )
   }, [
     input,
@@ -3783,6 +4751,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
     attachedFiles,
     addMessage,
     sendAgentMessage,
+    appendAgentDebugLog,
     document.content,
     buildFilesContext,
     buildWorkspaceContext,
@@ -3796,11 +4765,18 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
     updateAgentFile,
     addAgentFileOperation,
     finishAgentProgress,
+    flushUiFrame,
+    clearTrailingStreamTextItems,
+    removeLatestMatchingStreamTextItem,
     insertInDocument,
     deleteInDocument,
     currentFile?.path,
-    resetToolActivity,
+    resetCurrentTurnToolActivity,
     registerToolActivity,
+    claimOrRegisterToolActivity,
+    registerToolStart,
+    registerToolPreview,
+    markToolPreviewSkipped,
     completeToolActivity,
     excelData,
     refreshExcelData,
@@ -3809,7 +4785,8 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
     openFile,
     workspacePath,
     prepareTemplateFillOutput,
-    getLatestContent
+    getLatestContent,
+    pendingImages
   ])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -3820,6 +4797,46 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
   }, [handleSend])
 
   // 拖拽处理
+  // image upload/paste helpers
+  const imageInputRef = useRef<HTMLInputElement>(null)
+
+  const handlePaste = useCallback((e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items
+    if (!items) return
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      if (!item.type.startsWith('image/')) continue
+      e.preventDefault()
+      const file = item.getAsFile()
+      if (!file) continue
+      const reader = new FileReader()
+      reader.onload = () => {
+        const base64Url = reader.result as string
+        setPendingImages(prev => [...prev, base64Url])
+      }
+      reader.readAsDataURL(file)
+    }
+  }, [])
+
+  const handleImageUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files
+    if (!files) return
+    Array.from(files).forEach((file) => {
+      if (!file.type.startsWith('image/')) return
+      const reader = new FileReader()
+      reader.onload = () => {
+        const base64Url = reader.result as string
+        setPendingImages(prev => [...prev, base64Url])
+      }
+      reader.readAsDataURL(file)
+    })
+    e.target.value = ''
+  }, [])
+
+  const removePendingImage = useCallback((index: number) => {
+    setPendingImages(prev => prev.filter((_, i) => i !== index))
+  }, [])
+
   const handleDragOver = (e: React.DragEvent) => {
     // PPT 页面拖拽：交给输入框区域处理，避免整面板闪烁遮挡
     if (e.dataTransfer.types.includes('application/ppt-page')) return
@@ -3844,6 +4861,8 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
         const file = JSON.parse(data) as FileItem
         if (file && file.type === 'file' && !attachedFiles.find(f => f.path === file.path)) {
           setAttachedFiles(prev => [...prev, file])
+        } else if (file && file.type === 'folder' && !attachedFolders.find(f => f.path === file.path)) {
+          setAttachedFolders(prev => [...prev, file])
         }
       }
     } catch (error) {
@@ -3853,6 +4872,10 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
 
   const removeAttachedFile = (path: string) => {
     setAttachedFiles(prev => prev.filter(f => f.path !== path))
+  }
+
+  const removeAttachedFolder = (path: string) => {
+    setAttachedFolders(prev => prev.filter(f => f.path !== path))
   }
 
   // 快捷命令
@@ -4008,6 +5031,131 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
     td: ({ children }: { children?: ReactNode }) => <td className="ai-markdown-td">{children}</td>,
   }
 
+  // 渲染历史消息中内联的工具卡片（从 onComplete 快照）
+  const renderInlineToolCards = (cards: ChatMessage['toolCards']) => {
+    if (!cards || cards.length === 0) return null
+    return (
+      <div className="space-y-1.5 mb-2">
+        {cards.map(card => {
+          const jumpTarget = card.replaceText || card.searchText || ''
+          const canJump = !!jumpTarget
+          const cardClass = `glass-card-soft rounded-xl border border-border px-3 py-2 ${canJump ? 'hover:border-accent/40 hover:bg-accent/5 cursor-pointer' : ''}`
+          const cardBody = (
+            <>
+              <div className="flex items-center gap-2 text-[12px]">
+                {card.status === 'success' ? (
+                  <CheckCircle2 className="w-3.5 h-3.5 text-success flex-shrink-0" />
+                ) : card.status === 'skipped' ? (
+                  <Circle className="w-3.5 h-3.5 text-text-muted flex-shrink-0" />
+                ) : card.status === 'error' ? (
+                  <X className="w-3.5 h-3.5 text-error flex-shrink-0" />
+                ) : (
+                  <CheckCircle2 className="w-3.5 h-3.5 text-text-muted flex-shrink-0" />
+                )}
+                <span className="px-1.5 py-0.5 rounded bg-accent/10 text-accent text-[11px] font-medium">
+                  {card.tool}
+                </span>
+                <span className="text-text truncate flex-1" title={card.label}>
+                  {card.label}
+                </span>
+                {card.detail && (
+                  <span className="text-[10px] text-text-muted flex-shrink-0">{card.detail}</span>
+                )}
+              </div>
+              {(card.searchText || card.replaceText) && (
+                <div className="mt-1.5 text-[11px] text-text-secondary flex items-center gap-2">
+                  <span className="text-error truncate max-w-[40%]" title={card.searchText}>
+                    {card.searchText || '-'}
+                  </span>
+                  <span className="text-text-muted">&rarr;</span>
+                  <span className="text-success truncate max-w-[40%]" title={card.replaceText}>
+                    {card.replaceText || '-'}
+                  </span>
+                </div>
+              )}
+            </>
+          )
+          if (canJump) {
+            return (
+              <button key={card.id} type="button" onClick={() => scrollToChange(jumpTarget)} className={`${cardClass} w-full text-left`}>
+                {cardBody}
+              </button>
+            )
+          }
+          return <div key={card.id} className={cardClass}>{cardBody}</div>
+        })}
+      </div>
+    )
+  }
+
+  // 渲染交替快照（文字 + 工具卡片按原始执行顺序）
+  const renderStreamSnapshot = (snapshot: NonNullable<ChatMessage['streamSnapshot']>) => {
+    return (
+      <div className="space-y-2">
+        {snapshot.map(item => {
+          if (item.type === 'text') {
+            return (
+              <div key={item.id} className="glass-card-soft rounded-2xl rounded-tl-sm px-4 py-3 border border-border">
+                <div className="text-[13px] leading-relaxed text-text prose prose-sm max-w-none">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                    {item.content}
+                  </ReactMarkdown>
+                </div>
+              </div>
+            )
+          }
+          const card = item.toolCard
+          const jumpTarget = card.replaceText || card.searchText || ''
+          const canJump = !!jumpTarget
+          const cardClass = `glass-card-soft rounded-xl border border-border px-3 py-2 ${canJump ? 'hover:border-accent/40 hover:bg-accent/5 cursor-pointer' : ''}`
+          const cardBody = (
+            <>
+              <div className="flex items-center gap-2 text-[12px]">
+                {card.status === 'success' ? (
+                  <CheckCircle2 className="w-3.5 h-3.5 text-success flex-shrink-0" />
+                ) : card.status === 'skipped' ? (
+                  <Circle className="w-3.5 h-3.5 text-text-muted flex-shrink-0" />
+                ) : card.status === 'error' ? (
+                  <X className="w-3.5 h-3.5 text-error flex-shrink-0" />
+                ) : (
+                  <CheckCircle2 className="w-3.5 h-3.5 text-text-muted flex-shrink-0" />
+                )}
+                <span className="px-1.5 py-0.5 rounded bg-accent/10 text-accent text-[11px] font-medium">
+                  {card.tool}
+                </span>
+                <span className="text-text truncate flex-1" title={card.label}>
+                  {card.label}
+                </span>
+                {card.detail && (
+                  <span className="text-[10px] text-text-muted flex-shrink-0">{card.detail}</span>
+                )}
+              </div>
+              {(card.searchText || card.replaceText) && (
+                <div className="mt-1.5 text-[11px] text-text-secondary flex items-center gap-2">
+                  <span className="text-error truncate max-w-[40%]" title={card.searchText}>
+                    {card.searchText || '-'}
+                  </span>
+                  <span className="text-text-muted">&rarr;</span>
+                  <span className="text-success truncate max-w-[40%]" title={card.replaceText}>
+                    {card.replaceText || '-'}
+                  </span>
+                </div>
+              )}
+            </>
+          )
+          if (canJump) {
+            return (
+              <button key={card.id} type="button" onClick={() => scrollToChange(jumpTarget)} className={`${cardClass} w-full text-left`}>
+                {cardBody}
+              </button>
+            )
+          }
+          return <div key={card.id} className={cardClass}>{cardBody}</div>
+        })}
+      </div>
+    )
+  }
+
   return (
     <div 
       className={`flex flex-col h-full bg-transparent ${isDragOver ? 'ring-2 ring-accent/40 ring-inset' : ''}`}
@@ -4032,11 +5180,11 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             <Settings className="w-4 h-4" />
           </button>
           <button
-            onClick={clearMessages}
+            onClick={handleNewConversation}
             className="p-2 rounded-xl text-text-muted hover:text-text hover:bg-black/5 dark:hover:bg-white/5 transition-all"
-            title="清空对话"
+            title="New chat"
           >
-            <Trash2 className="w-4 h-4" />
+            <FilePlus className="w-4 h-4" />
           </button>
         </div>
       </div>
@@ -4066,7 +5214,15 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
       )}
 
       {/* 消息列表 - 更清爽：减少硬编码深色块 */}
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4 chat-scrollbar">
+      <div 
+        ref={chatContainerRef}
+        className="flex-1 overflow-y-auto px-4 py-4 space-y-4 chat-scrollbar"
+        onScroll={(e) => {
+          const el = e.currentTarget
+          const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+          userScrolledUpRef.current = !isNearBottom
+        }}
+      >
         <AnimatePresence mode="popLayout">
         {displayMessages.map((message) => {
           const displayContent =
@@ -4095,14 +5251,16 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               ) : displayContent.includes('\n---\n✅') ? (
               /* 操作完成消息 - 显示 AI 总结 + 状态卡片 */
               <div className="w-full space-y-3">
-                {/* AI 总结内容 */}
+                {message.streamSnapshot?.length ? renderStreamSnapshot(message.streamSnapshot) : renderInlineToolCards(message.toolCards)}
+                {/* AI 总结内容 — streamSnapshot 已包含文字，只渲染状态卡片 */}
                 {(() => {
                   const parts = displayContent.split('\n---\n')
                   const summaryContent = parts[0]
                   const statusContent = parts.slice(1).join('\n---\n')
+                  const hasSnapshot = !!message.streamSnapshot?.length
                   return (
                     <>
-                      {summaryContent && (
+                      {!hasSnapshot && summaryContent && (
                         <div className="text-[13px] leading-relaxed text-text prose prose-sm max-w-none">
                           <ReactMarkdown
                             remarkPlugins={[remarkGfm]}
@@ -4163,6 +5321,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             ) : displayContent.startsWith('✅') ? (
               /* 简单操作完成消息 - Cursor 风格卡片 */
               <div className="w-full">
+                {message.streamSnapshot?.length ? renderStreamSnapshot(message.streamSnapshot) : renderInlineToolCards(message.toolCards)}
                 <div className="glass-card-soft rounded-2xl overflow-hidden border border-border">
                   {/* 成功标题栏 */}
                   <div className="flex items-center gap-2 px-3 py-2 bg-white/5 border-b border-border">
@@ -4260,6 +5419,8 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             ) : (
               /* AI 普通消息 - 使用 Markdown 渲染 */
               <div className="w-full">
+                {message.streamSnapshot?.length ? renderStreamSnapshot(message.streamSnapshot) : renderInlineToolCards(message.toolCards)}
+                {!message.streamSnapshot?.length && (
                 <div className="glass-card-soft border border-border rounded-2xl rounded-tl-sm px-3 py-2">
                   <div className="ai-markdown text-[13px] text-text leading-relaxed">
                     {(() => {
@@ -4367,6 +5528,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                     })()}
                   </div>
                 </div>
+                )}
                 <span className="text-[10px] text-text-dim mt-1 block pl-1">
                   {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                 </span>
@@ -4375,26 +5537,131 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             </motion.div>
           )
         })}
+        {streamItems.map((item) => (
+          <motion.div
+            key={`stream-${item.id}`}
+            layout
+            variants={messageVariants}
+            initial="hidden"
+            animate="visible"
+            exit="exit"
+            className="group"
+          >
+            {item.type === 'text' ? (
+              <div className="w-full">
+                <div className="glass-card-soft rounded-2xl rounded-tl-sm px-4 py-3 border border-border">
+                  <div className="text-[13px] leading-relaxed text-text prose prose-sm max-w-none">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                      {item.content}
+                    </ReactMarkdown>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="w-full">
+                {(() => {
+                  const jumpTarget = item.data.replaceText || item.data.searchText || ''
+                  const canJump = !!jumpTarget
+                  const cardClass = `glass-card-soft rounded-xl border border-border px-3 py-2.5 ${canJump ? 'hover:border-accent/40 hover:bg-accent/5 cursor-pointer' : ''}`
+
+                  const cardBody = (
+                    <>
+                      <div className="flex items-center gap-2 text-[12px]">
+                        {item.data.status === 'running' ? (
+                          <Loader2 className="w-3.5 h-3.5 text-accent animate-spin flex-shrink-0" />
+                        ) : item.data.status === 'success' ? (
+                          <CheckCircle2 className="w-3.5 h-3.5 text-success flex-shrink-0" />
+                        ) : item.data.status === 'skipped' ? (
+                          <Circle className="w-3.5 h-3.5 text-text-muted flex-shrink-0" />
+                        ) : (
+                          <X className="w-3.5 h-3.5 text-error flex-shrink-0" />
+                        )}
+                        <span className="px-1.5 py-0.5 rounded bg-accent/10 text-accent text-[11px] font-medium">
+                          {item.data.tool}
+                        </span>
+                        <span className="text-text truncate flex-1" title={item.data.label}>
+                          {item.data.label}
+                        </span>
+                        {item.data.detail && (
+                          <span className="text-[10px] text-text-muted flex-shrink-0">{item.data.detail}</span>
+                        )}
+                      </div>
+                      {(item.data.searchText || item.data.replaceText) && (
+                        <div className="mt-2 text-[11px] text-text-secondary flex items-center gap-2">
+                          <span className="text-error truncate max-w-[40%]" title={item.data.searchText}>
+                            {item.data.searchText || '-'}
+                          </span>
+                          <span className="text-text-muted">-&gt;</span>
+                          <span className="text-success truncate max-w-[40%]" title={item.data.replaceText}>
+                            {item.data.replaceText || '-'}
+                          </span>
+                        </div>
+                      )}
+                      {canJump && (
+                        <div className="mt-1 text-[10px] text-accent">Click to jump to modified location</div>
+                      )}
+                    </>
+                  )
+
+                  if (canJump) {
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => scrollToChange(jumpTarget)}
+                        className={`${cardClass} w-full text-left`}
+                      >
+                        {cardBody}
+                      </button>
+                    )
+                  }
+
+                  return <div className={cardClass}>{cardBody}</div>
+                })()}
+              </div>
+            )}
+          </motion.div>
+        ))}
+        {/* 实时流式文本 — 跟在 streamItems 后面交替显示 */}
+        {isLoading && streamItems.length > 0 && streamingContent && (
+          <motion.div
+            key="stream-live-text"
+            layout
+            variants={messageVariants}
+            initial="hidden"
+            animate="visible"
+            exit="exit"
+            className="group"
+          >
+            <div className="w-full">
+              <div className="glass-card-soft rounded-2xl rounded-tl-sm px-4 py-3 border border-border">
+                <div className="text-[13px] leading-relaxed text-text prose prose-sm max-w-none">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                    {streamingContent}
+                  </ReactMarkdown>
+                </div>
+              </div>
+            </div>
+          </motion.div>
+        )}
         </AnimatePresence>
 
-        {/* 流式输出 - 实时显示 AI 响应 (使用 Framer Motion) */}
+        {/* 流式输出 - 实时显示 AI 响应（去掉 layout 防抖动） */}
         <AnimatePresence mode="wait">
           {isLoading && (
             <motion.div 
               className="w-full"
-              layout
               variants={streamingVariants}
               initial="hidden"
               animate="visible"
               exit="exit"
             >
-              {/* 思考过程展示区域 - 默认展开，用户可手动折叠 */}
-              <details className="thinking-section" open>
+              {/* 思考过程展示区域 - 有流式内容时自动折叠 */}
+              <details className="thinking-section" open={!streamingContent || streamingContent.length < 10}>
                 <summary className="thinking-summary">
                   <span className="thinking-indicator">
                     <span className="thinking-pulse"></span>
                   </span>
-                  <span>正在思考</span>
+                  <span>{streamingContent && streamingContent.length >= 10 ? '正在处理' : '正在思考'}</span>
                   <svg className="thinking-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <path d="M9 18l6-6-6-6" />
                   </svg>
@@ -4407,8 +5674,19 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                   )}
                 </div>
               </details>
+
+              {streamingContent && streamItems.length === 0 && (
+                <div className="glass-card-soft rounded-2xl rounded-tl-sm px-4 py-3 border border-border mt-2">
+                  <div className="text-[11px] text-text-dim mb-1">Streaming output</div>
+                  <div className="text-[13px] leading-relaxed text-text prose prose-sm max-w-none">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                      {streamingContent}
+                    </ReactMarkdown>
+                  </div>
+                </div>
+              )}
               
-              {editPhase === 'editing' && (
+              {editPhase === 'editing' && !streamingContent && (
                 <div className="glass-card-soft rounded-2xl rounded-tl-sm px-4 py-3 border border-border">
                   <div className="flex items-center gap-2">
                     <span className="thinking-indicator">
@@ -4430,14 +5708,6 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                 </div>
               )}
 
-              {/* 正式回复内容 */}
-              {editPhase === 'idle' && streamingContent && (
-                <div className="glass-card-soft rounded-2xl rounded-tl-sm px-4 py-3">
-                  <div className="streaming-container">
-                    <div className="cinematic-typer">{streamingContent}</div>
-                  </div>
-                </div>
-              )}
             </motion.div>
           )}
         </AnimatePresence>
@@ -4467,23 +5737,42 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                 </div>
                 {toolActivity.length > 0 && (
                   <div className="mt-2 border-t border-border pt-2">
-                    <div className="text-[10px] text-text-dim uppercase tracking-wider mb-1">工具调用</div>
-                    <div className="space-y-1">
-                      {toolActivity.slice(-4).map(activity => (
-                        <div key={activity.id} className="flex items-center gap-1.5 text-[11px] text-text-secondary">
-                          {activity.status === 'running' ? (
-                            <Loader2 className="w-3 h-3 text-accent animate-spin flex-shrink-0" />
-                          ) : activity.status === 'success' ? (
-                            <CheckCircle2 className="w-3 h-3 text-success flex-shrink-0" />
-                          ) : (
-                            <X className="w-3 h-3 text-error flex-shrink-0" />
-                          )}
-                          <span className="truncate flex-1">{activity.label}</span>
-                          {activity.detail && (
-                            <span className="text-[10px] text-text-muted flex-shrink-0">{activity.detail}</span>
-                          )}
-                        </div>
-                      ))}
+                    <div className="text-[10px] text-text-dim uppercase tracking-wider mb-1">工具调用 ({toolActivity.length})</div>
+                    <div className="space-y-1 max-h-[240px] overflow-y-auto">
+                      {toolActivity.map(activity => {
+                        const jumpTarget = activity.replaceText || activity.searchText || ''
+                        const canJump = !!jumpTarget
+
+                        return (
+                          <button
+                            key={activity.id}
+                            type="button"
+                            onClick={() => {
+                              if (canJump) scrollToChange(jumpTarget)
+                            }}
+                            className={`w-full text-left rounded px-1.5 py-1 transition-colors ${canJump ? 'hover:bg-white/8 cursor-pointer' : 'cursor-default'}`}
+                          >
+                            <div className="flex items-center gap-1.5 text-[11px] text-text-secondary">
+                              {activity.status === 'running' ? (
+                                <Loader2 className="w-3 h-3 text-accent animate-spin flex-shrink-0" />
+                              ) : activity.status === 'success' ? (
+                                <CheckCircle2 className="w-3 h-3 text-success flex-shrink-0" />
+                              ) : (
+                                <X className="w-3 h-3 text-error flex-shrink-0" />
+                              )}
+                              <span className="truncate flex-1">{activity.label}</span>
+                              {activity.detail && (
+                                <span className="text-[10px] text-text-muted flex-shrink-0">{activity.detail}</span>
+                              )}
+                            </div>
+                            {(activity.searchText || activity.replaceText) && (
+                              <div className="mt-0.5 text-[10px] text-text-dim truncate">
+                                {activity.searchText || '-'} -&gt; {activity.replaceText || '-'}
+                              </div>
+                            )}
+                          </button>
+                        )
+                      })}
                     </div>
                   </div>
                 )}
@@ -4510,7 +5799,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
           
           {/* 用户拖拽的附加文件 */}
           {attachedFiles.map((file) => (
-            <div 
+            <div
               key={file.path}
               className="flex items-center gap-1 px-1.5 py-0.5 bg-accent/10 text-accent text-[10px] rounded border border-accent/20"
             >
@@ -4521,9 +5810,23 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               </button>
             </div>
           ))}
-          
-          {!currentFile && attachedFiles.length === 0 && (
-            <span className="text-[10px] text-text-dim">拖拽文件添加上下文</span>
+
+          {/* 用户拖拽的文件夹 */}
+          {attachedFolders.map((folder) => (
+            <div
+              key={folder.path}
+              className="flex items-center gap-1 px-1.5 py-0.5 bg-amber-500/10 text-amber-400 text-[10px] rounded border border-amber-500/20"
+            >
+              <Folder className="w-2.5 h-2.5" />
+              <span className="max-w-[60px] truncate">{folder.name}</span>
+              <button onClick={() => removeAttachedFolder(folder.path)} className="hover:bg-amber-500/15 rounded p-0.5 -mr-0.5">
+                <X className="w-2.5 h-2.5" />
+              </button>
+            </div>
+          ))}
+
+          {!currentFile && attachedFiles.length === 0 && attachedFolders.length === 0 && (
+            <span className="text-[10px] text-text-dim">拖拽文件或文件夹添加上下文</span>
           )}
         </div>
       </div>
@@ -4814,36 +6117,72 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
           </div>
         )}
         
+        {/* 粘贴/上传的图片预览 */}
+        {pendingImages.length > 0 && (
+          <div className="flex gap-2 mb-2 flex-wrap">
+            {pendingImages.map((img, idx) => (
+              <div key={idx} className="relative group w-16 h-16 rounded-lg overflow-hidden border border-border/40 bg-bg-secondary">
+                <img src={img} alt={`图片 ${idx + 1}`} className="w-full h-full object-cover" />
+                <button
+                  onClick={() => removePendingImage(idx)}
+                  className="absolute top-0 right-0 p-0.5 bg-black/60 text-white rounded-bl-md opacity-0 group-hover:opacity-100 transition-opacity"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
         <div className="relative">
           <textarea
             ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
             placeholder={
               pptEditContext 
                 ? `描述如何修改第 ${pptEditContext.pageNumber} 页...` 
                 : isLoading 
                   ? "AI 正在处理中..." 
-                  : "输入问题或 / 查看命令..."
+                  : "输入问题或 / 查看命令...（可粘贴图片）"
             }
-            className={`w-full glass-input rounded-2xl pl-4 pr-12 py-3 text-[13px] text-text placeholder-text-dim focus:outline-none transition-all resize-none scrollbar-none ${
+            className={`w-full glass-input rounded-2xl pl-10 pr-12 py-3 text-[13px] text-text placeholder-text-dim focus:outline-none transition-all resize-none scrollbar-none ${
               isLoading ? 'border-accent/20' : pptEditContext ? 'border-accent/35 focus:border-accent/50' : ''
             }`}
             rows={2}
             disabled={isLoading}
           />
+          {/* 图片上传按钮 */}
           <button
-            onClick={handleSend}
-            disabled={isLoading || !input.trim()}
+            onClick={() => imageInputRef.current?.click()}
+            disabled={isLoading}
+            className="absolute left-3 bottom-3 p-1.5 rounded-lg text-text-muted hover:text-text hover:bg-black/10 dark:hover:bg-white/10 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+            title="上传图片"
+          >
+            <ImagePlus className="w-4 h-4" />
+          </button>
+          <input
+            ref={imageInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={handleImageUpload}
+          />
+          <button
+            onClick={isLoading ? stopGeneration : handleSend}
+            disabled={!isLoading && (!input.trim() && pendingImages.length === 0)}
             className={`absolute right-3 bottom-3 p-2 rounded-xl transition-all disabled:cursor-not-allowed ${
-              isLoading 
-                ? 'text-accent bg-accent/10' 
+              isLoading
+                ? 'text-red-400 bg-red-500/10 hover:bg-red-500/20'
                 : 'text-text-muted hover:text-text hover:bg-black/10 dark:hover:bg-white/10 disabled:opacity-30'
             }`}
+            title={isLoading ? '停止生成' : '发送'}
           >
             {isLoading ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
+              <Square className="w-4 h-4 fill-current" />
             ) : (
               <Send className="w-4 h-4" />
             )}

@@ -36,11 +36,9 @@ function FileTreeItem({ item, level, onSelect, onDragStart, selectedPath }: File
   const isSelected = item.path === selectedPath
 
   const handleDragStart = (e: React.DragEvent) => {
-    if (item.type === 'file') {
-      e.dataTransfer.setData('application/json', JSON.stringify(item))
-      e.dataTransfer.effectAllowed = 'copy'
-      onDragStart(item)
-    }
+    e.dataTransfer.setData('application/json', JSON.stringify(item))
+    e.dataTransfer.effectAllowed = 'copy'
+    onDragStart(item)
   }
 
   // Finder 风格：按文件类型给 icon 轻量点缀色（避免整体太单一）
@@ -74,13 +72,13 @@ function FileTreeItem({ item, level, onSelect, onDragStart, selectedPath }: File
   return (
     <div>
       <div
-        draggable={item.type === 'file'}
+        draggable
         onDragStart={handleDragStart}
         className={`group flex items-center gap-2 px-3 py-2 mx-2 cursor-pointer rounded-lg transition-all duration-200 select-none ${
-          isSelected 
-            ? 'bg-accent/18 text-text border border-accent/25 shadow-sm' 
+          isSelected
+            ? 'bg-accent/18 text-text border border-accent/25 shadow-sm'
             : 'text-text-secondary hover:bg-black/5 dark:hover:bg-white/10 hover:text-text'
-        } ${item.type === 'file' ? 'cursor-grab active:cursor-grabbing' : ''}`}
+        } cursor-grab active:cursor-grabbing`}
         style={{ paddingLeft: `${level * 12 + 12}px` }}
         onClick={() => {
           if (isFolder) {

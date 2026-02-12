@@ -1,6 +1,6 @@
 {
   "name": "word-cursor",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "AI驱动的Word文档编辑器 - Cursor的Word版本",
   "main": "electron/main.cjs",
   "type": "module",
@@ -53,6 +53,7 @@
     "@tiptap/react": "^3.11.1",
     "@tiptap/starter-kit": "^3.11.1",
     "better-sqlite3": "^12.6.2",
+    "chart.js": "^4.5.1",
     "chokidar": "^3.5.3",
     "docx": "^8.5.0",
     "docx-preview": "^0.3.7",

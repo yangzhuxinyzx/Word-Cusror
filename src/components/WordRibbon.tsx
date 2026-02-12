@@ -25,6 +25,12 @@ import {
   Eye,
   ZoomIn,
   ZoomOut,
+  MessageSquarePlus,
+  ChevronUp,
+  ChevronDown,
+  SpellCheck,
+  FileSearch,
+  Type,
 } from 'lucide-react'
 
 export type WordRibbonTab = 'home' | 'insert' | 'layout' | 'references' | 'review' | 'view'
@@ -61,6 +67,11 @@ type WordRibbonProps = {
   onOpenRevisionPanel: () => void
   acceptAllChanges: () => void
   rejectAllChanges: () => void
+  onAddComment?: () => void
+  onOpenCommentPanel?: () => void
+  onNavigateChange?: (direction: 'prev' | 'next') => void
+  onAIReview?: () => void
+  docStats?: { words: number; chars: number }
 
   // editor mode (optional, for App integrate)
   editorMode?: 'tiptap' | 'onlyoffice'
@@ -156,6 +167,11 @@ export default function WordRibbon(props: WordRibbonProps) {
     onOpenRevisionPanel,
     acceptAllChanges,
     rejectAllChanges,
+    onAddComment,
+    onOpenCommentPanel,
+    onNavigateChange,
+    onAIReview,
+    docStats,
     editorMode,
     setEditorMode,
   } = props
@@ -555,6 +571,28 @@ export default function WordRibbon(props: WordRibbonProps) {
 
           {tab === 'review' && (
             <>
+              <RibbonGroup label="校对">
+                <RibbonButton title="AI 审查文档" onClick={() => onAIReview?.()}>
+                  <SpellCheck className="w-4 h-4" />
+                </RibbonButton>
+                <RibbonButton title="字数统计" onClick={() => {}} disabled>
+                  <Type className="w-4 h-4" />
+                </RibbonButton>
+                {docStats && (
+                  <div className="text-[10px] text-text-dim leading-tight px-1">
+                    <div>字 {docStats.chars}</div>
+                    <div>词 {docStats.words}</div>
+                  </div>
+                )}
+              </RibbonGroup>
+              <RibbonGroup label="批注">
+                <RibbonButton title="添加批注" onClick={() => onAddComment?.()}>
+                  <MessageSquarePlus className="w-4 h-4" />
+                </RibbonButton>
+                <RibbonButton title="批注面板" onClick={() => onOpenCommentPanel?.()}>
+                  <FileSearch className="w-4 h-4" />
+                </RibbonButton>
+              </RibbonGroup>
               <RibbonGroup label="修订">
                 <RibbonButton title="打开修订面板" onClick={onOpenRevisionPanel}>
                   <Eye className="w-4 h-4" />
@@ -564,6 +602,14 @@ export default function WordRibbon(props: WordRibbonProps) {
                 </RibbonButton>
                 <RibbonButton title="全部拒绝" onClick={rejectAllChanges} disabled={pendingChangesTotal === 0}>
                   <X className="w-4 h-4" />
+                </RibbonButton>
+              </RibbonGroup>
+              <RibbonGroup label="更改">
+                <RibbonButton title="上一处修订" onClick={() => onNavigateChange?.('prev')} disabled={pendingChangesTotal === 0}>
+                  <ChevronUp className="w-4 h-4" />
+                </RibbonButton>
+                <RibbonButton title="下一处修订" onClick={() => onNavigateChange?.('next')} disabled={pendingChangesTotal === 0}>
+                  <ChevronDown className="w-4 h-4" />
                 </RibbonButton>
               </RibbonGroup>
             </>

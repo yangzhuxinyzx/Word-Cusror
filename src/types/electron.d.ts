@@ -329,6 +329,7 @@ export interface ElectronAPI {
   // 文件操作
   readFile: (filePath: string) => Promise<FileReadResult>
   writeFile: (filePath: string, content: string) => Promise<FileWriteResult>
+  appendFile: (filePath: string, content: string) => Promise<FileWriteResult>
   writeBinaryFile: (filePath: string, base64Data: string) => Promise<FileWriteResult>
   
   // 对话框
