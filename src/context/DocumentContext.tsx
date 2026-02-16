@@ -13,6 +13,7 @@ import type { DocDsl, DslBlock, DslRun, DslInline, DslBlockMeta, DslRunMeta } fr
 import { validateDocDsl, dslToHtml, normalizeContent, extractPlainText } from '../utils/docDsl'
 import { dslToDocxBlob } from '../utils/docDslToDocx'
 import { htmlToDsl } from '../utils/htmlToDsl'
+import { useMcpBridge } from '../hooks/useMcpBridge'
 
 // 将 ArrayBuffer 转换为 Base64（分块处理，避免大文件导致栈溢出）
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -1561,7 +1562,11 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
             path: filePath,
             type: 'file',
           }
-          
+
+          // 同步更新 ref（关键！保证下一次工具调用拿到最新内容）
+          documentContentRef.current = content
+          dslCacheRef.current = null
+
           setCurrentFileState(newFile)
           setDocument({
             title: safeTitle,
@@ -1586,6 +1591,11 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         type: 'file',
         content,
       }
+
+      // 同步更新 ref（关键！保证下一次工具调用拿到最新内容）
+      documentContentRef.current = content
+      dslCacheRef.current = null
+
       setFiles(prev => [...prev, newFile])
       setCurrentFileState(newFile)
       setDocument({
@@ -1657,6 +1667,10 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           // 生成 HTML 预览用于编辑器
           const htmlContent = dslToHtml(dsl)
 
+          // 同步更新 ref（关键！保证下一次工具调用拿到最新内容）
+          documentContentRef.current = htmlContent
+          dslCacheRef.current = null
+
           // 创建文件项并设置为当前文件
           const newFile: FileItem = {
             name: fileName,
@@ -1700,6 +1714,11 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     } else {
       // Web 模式：只在内存中创建
       const htmlContent = dslToHtml(dsl)
+
+      // 同步更新 ref（关键！保证下一次工具调用拿到最新内容）
+      documentContentRef.current = htmlContent
+      dslCacheRef.current = null
+
       const newFile: FileItem = {
         name: `${safeTitle}.docx`,
         path: `/${safeTitle}.docx`,
@@ -6689,6 +6708,20 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       return { success: false, message: `添加表格失败: ${e}` }
     }
   }, [])
+
+  // MCP Bridge: 让外部 agent 通过 MCP 协议操控文档
+  useMcpBridge({
+    getContent: () => documentContentRef.current,
+    workspacePath,
+    insertViaDsl,
+    replaceViaDsl,
+    deleteViaDsl,
+    insertInDocument,
+    silentSaveToFile,
+    openFile,
+    getTiptapDocumentStructure,
+    currentFile,
+  })
 
   return (
     <DocumentContext.Provider

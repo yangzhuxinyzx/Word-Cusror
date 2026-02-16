@@ -119,7 +119,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   
   // 平台信息
   platform: process.platform,
-  isElectron: true
+  isElectron: true,
+
+  // MCP Bridge: 主进程 → 渲染进程的桥接通道
+  mcpBridgeResponse: (requestId, result) => ipcRenderer.send('mcp-bridge-response', { requestId, result }),
+  onMcpBridgeRequest: (callback) => {
+    const handler = (_event, payload) => callback(payload)
+    ipcRenderer.on('mcp-bridge-request', handler)
+    return () => ipcRenderer.removeListener('mcp-bridge-request', handler)
+  },
 })
 
 // 通知渲染进程 Electron 已就绪

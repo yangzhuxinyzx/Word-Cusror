@@ -23,6 +23,8 @@ dotenv.config({ path: path.join(__dirname, '..', '.env') })
 let mainWindow
 let fileServer = null
 let fileServerPort = 9090
+let mcpBridgeServer = null
+let mcpBridgePort = 19527
 let memoryManager = null
 
 const getMemoryManager = () => {
@@ -415,6 +417,133 @@ function createFileServer(startPort = 9090) {
   tryListen(startPort)
 }
 
+// ============== MCP Bridge Server ==============
+// HTTP bridge for external MCP server to communicate with renderer
+
+const pendingMcpRequests = new Map()
+
+ipcMain.on('mcp-bridge-response', (_event, { requestId, result }) => {
+  const pending = pendingMcpRequests.get(requestId)
+  if (pending) {
+    clearTimeout(pending.timer)
+    pendingMcpRequests.delete(requestId)
+    pending.resolve(result)
+  }
+})
+
+function requestFromRenderer(action, params, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return reject(new Error('编辑器窗口未就绪'))
+    }
+    const requestId = crypto.randomUUID()
+    const timer = setTimeout(() => {
+      pendingMcpRequests.delete(requestId)
+      reject(new Error('渲染进程响应超时'))
+    }, timeoutMs)
+    pendingMcpRequests.set(requestId, { resolve, reject, timer })
+    mainWindow.webContents.send('mcp-bridge-request', { requestId, action, params })
+  })
+}
+
+async function handleMcpBridgeAction(action, params) {
+  switch (action) {
+    case 'ping':
+      return { success: true, message: 'Word-Cursor is running' }
+
+    case 'list_files': {
+      // 从 renderer 获取当前工作区路径
+      try {
+        const wsResult = await requestFromRenderer('get_workspace_path', {})
+        if (!wsResult.success || !wsResult.data) return { success: false, error: '没有打开的工作区' }
+        const items = await readFolderRecursive(wsResult.data, wsResult.data)
+        const filtered = params.filter
+          ? items.filter(f => f.name && f.name.endsWith(params.filter))
+          : items
+        return { success: true, data: filtered }
+      } catch (e) {
+        return { success: false, error: e.message }
+      }
+    }
+
+    case 'read_document':
+    case 'insert':
+    case 'replace':
+    case 'delete':
+    case 'save':
+    case 'open_file':
+    case 'insert_chart':
+    case 'get_workspace_path':
+      try {
+        return await requestFromRenderer(action, params)
+      } catch (e) {
+        return { success: false, error: e.message }
+      }
+
+    default:
+      return { success: false, error: `未知操作: ${action}` }
+  }
+}
+
+function createMcpBridgeServer(startPort = 19527) {
+  const handler = (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(200)
+      res.end()
+      return
+    }
+
+    if (req.method !== 'POST') {
+      res.writeHead(405)
+      res.end(JSON.stringify({ error: 'Method not allowed' }))
+      return
+    }
+
+    let body = ''
+    req.on('data', chunk => { body += chunk })
+    req.on('end', async () => {
+      try {
+        const { action, params } = JSON.parse(body)
+        const result = await handleMcpBridgeAction(action, params || {})
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(result))
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: e.message }))
+      }
+    })
+  }
+
+  const tryListen = (port) => {
+    try {
+      mcpBridgePort = port
+      mcpBridgeServer = http.createServer(handler)
+
+      mcpBridgeServer.on('error', (err) => {
+        if (err && err.code === 'EADDRINUSE') {
+          console.warn(`MCP Bridge 端口 ${port} 被占用，尝试 ${port + 1}...`)
+          tryListen(port + 1)
+          return
+        }
+        console.error('MCP Bridge 服务器错误:', err)
+      })
+
+      mcpBridgeServer.listen(port, '127.0.0.1', () => {
+        mcpBridgePort = port
+        console.log(`🔌 MCP Bridge 已启动: http://127.0.0.1:${mcpBridgePort}`)
+      })
+    } catch (e) {
+      console.error('MCP Bridge 启动失败:', e)
+    }
+  }
+
+  tryListen(startPort)
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1400,
@@ -458,6 +587,7 @@ function createWindow() {
 
 app.whenReady().then(() => {
   createFileServer()
+  createMcpBridgeServer()
   createWindow()
   
   // 注册全局快捷键打开 DevTools
@@ -485,6 +615,9 @@ app.on('before-quit', () => {
   if (braveMcpConnection) {
     braveMcpConnection.client?.close?.().catch((err) => console.error('关闭 MCP 客户端失败:', err))
     braveMcpConnection.server?.close?.().catch((err) => console.error('关闭 MCP 服务失败:', err))
+  }
+  if (mcpBridgeServer) {
+    mcpBridgeServer.close()
   }
 })
 

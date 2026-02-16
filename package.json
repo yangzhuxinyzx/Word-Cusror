@@ -3,6 +3,9 @@
   "version": "1.0.1",
   "description": "AI驱动的Word文档编辑器 - Cursor的Word版本",
   "main": "electron/main.cjs",
+  "bin": {
+    "word-cursor-mcp": "electron/mcp-server.cjs"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",

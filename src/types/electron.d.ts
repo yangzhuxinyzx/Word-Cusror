@@ -613,6 +613,14 @@ export interface ElectronAPI {
   // 平台信息
   platform: string
   isElectron: boolean
+
+  // MCP Bridge
+  mcpBridgeResponse: (requestId: string, result: any) => void
+  onMcpBridgeRequest: (callback: (payload: {
+    requestId: string
+    action: string
+    params: Record<string, any>
+  }) => void) => () => void
 }
 
 declare global {

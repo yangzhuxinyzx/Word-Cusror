@@ -2498,6 +2498,12 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               return { tool, success: false, message: '缺少 search 参数' }
             }
 
+            // 如果没有打开的文档，先自动创建一个新文档
+            if (!currentFile) {
+              await createNewDocument('新建文档', '')
+              await new Promise(resolve => setTimeout(resolve, 300))
+            }
+
             const activityId = claimOrRegisterToolActivity('replace', args, `Replace: ${truncateLabel(search, 24)}`, { searchText: search, replaceText })
             await flushUiFrame()
 
@@ -2718,6 +2724,11 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
           }
 
           if (tool === 'word_edit_ops') {
+            // 没有打开的文档时，先自动创建
+            if (!currentFile) {
+              await createNewDocument('新建文档', '')
+              await new Promise(resolve => setTimeout(resolve, 300))
+            }
             // Structured document operations: support dry-run preview and then apply.
             const rawOps = args.ops || ''
             const dryRunTop = (args.dryRun || '').toLowerCase() === 'true'
@@ -3338,6 +3349,16 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             const position = args.position || 'end'
             let content = args.content || ''
 
+            // 如果没有打开的文档，先自动创建一个新文档
+            let justCreated = false
+            if (!currentFile) {
+              const docTitle = args.title || '新建文档'
+              await createNewDocument(docTitle, '')
+              // 等待编辑器挂载
+              await new Promise(resolve => setTimeout(resolve, 300))
+              justCreated = true
+            }
+
             // 支持 DSL 参数：解析为带格式的 HTML 后插入
             let dslBlockCount = 0
             if (args.dsl) {
@@ -3393,7 +3414,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               
               // 自动保存到磁盘（确保 .docx 文件包含插入的内容）
               let savedMsg = ''
-              if (isElectron && currentFile) {
+              if (isElectron && (currentFile || justCreated)) {
                 const saveResult = await silentSaveToFile()
                 savedMsg = saveResult.success ? '（已自动保存）' : `（保存失败: ${saveResult.error}）`
               }
