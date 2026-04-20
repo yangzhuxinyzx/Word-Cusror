@@ -1,0 +1,1810 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Word-Cursor — CG</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#fff;font-family:-apple-system,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;overflow:hidden;width:100vw;height:100vh}
+#loader{position:fixed;inset:0;z-index:999;background:#050508;display:flex;flex-direction:column;justify-content:center;align-items:center;transition:opacity .6s}
+#loader .ring{width:36px;height:36px;border:2px solid rgba(79,142,255,.12);border-top-color:#4f8eff;border-radius:50%;animation:spin .8s linear infinite}
+#loader .txt{margin-top:14px;font-size:11px;color:#333;letter-spacing:3px}
+@keyframes spin{to{transform:rotate(360deg)}}
+canvas#bg{position:fixed;inset:0;width:100%;height:100%;z-index:0}
+#vignette{position:fixed;inset:0;z-index:1;pointer-events:none;background:radial-gradient(ellipse at center,transparent 40%,rgba(0,0,0,.7) 100%)}
+#scanlines{position:fixed;inset:0;z-index:2;pointer-events:none;opacity:.02;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(255,255,255,.05) 2px,rgba(255,255,255,.05) 4px)}
+#lightStreak{position:fixed;inset:0;z-index:3;pointer-events:none;opacity:0}
+#gradBg{position:fixed;inset:0;z-index:0;opacity:.25;transition:background 2s;background:radial-gradient(ellipse at 30% 50%,rgba(79,142,255,.15),transparent 60%)}
+#heroGlow{position:fixed;width:700px;height:700px;border-radius:50%;z-index:1;pointer-events:none;opacity:0;background:radial-gradient(circle,rgba(79,142,255,.2) 0%,rgba(168,85,247,.08) 40%,transparent 70%);left:50%;top:50%;transform:translate(-50%,-50%) scale(.4);filter:blur(50px)}
+#beatPulse{position:fixed;width:100px;height:100px;border-radius:50%;border:1px solid rgba(79,142,255,.08);left:50%;top:50%;transform:translate(-50%,-50%) scale(1);z-index:1;pointer-events:none;opacity:0}
+#beatBar{position:fixed;bottom:3px;left:50%;transform:translateX(-50%);z-index:91;display:flex;gap:2px;pointer-events:none}
+.beat-dot{width:3px;height:8px;background:rgba(79,142,255,.15);border-radius:1px;transition:height .08s,background .08s}
+.beat-dot.on{height:18px;background:rgba(79,142,255,.6)}
+.scene{position:fixed;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center;z-index:10;opacity:0;pointer-events:none}
+#progressWrap{position:fixed;bottom:0;left:0;width:100%;height:2px;background:rgba(255,255,255,0.04);z-index:90}
+#progressBar{height:100%;width:0;background:linear-gradient(90deg,#4f8eff,#a855f7,#ff6b4a);border-radius:1px}
+#timeCode{position:fixed;bottom:10px;right:20px;font-size:11px;color:#2a2a2a;z-index:90;font-variant-numeric:tabular-nums}
+#controls{position:fixed;bottom:8px;left:20px;z-index:90;display:flex;gap:10px;align-items:center}
+#controls button{background:rgba(255,255,255,.04);border:1px solid #222;color:#555;padding:3px 12px;border-radius:5px;cursor:pointer;font-size:11px;font-family:inherit;transition:all .2s}
+#controls button:hover{color:#aaa;border-color:#444}
+#soundToggle{position:fixed;top:14px;right:16px;z-index:95;background:rgba(255,255,255,.04);border:1px solid #222;color:#555;padding:4px 12px;border-radius:5px;cursor:pointer;font-size:11px;font-family:inherit}
+/* Typography */
+.hero-line{overflow:hidden;display:block}
+.hero-line span{display:inline-block;font-size:clamp(36px,5vw,64px);font-weight:700;letter-spacing:-.02em;line-height:1.15}
+.sub-line{overflow:hidden;display:block}
+.sub-line span{display:inline-block;font-size:clamp(14px,1.8vw,20px);color:rgba(255,255,255,.45);letter-spacing:.08em;line-height:1.6}
+.tag{display:inline-block;padding:3px 14px;border:1px solid rgba(79,142,255,.2);border-radius:20px;font-size:11px;color:rgba(79,142,255,.7);letter-spacing:.1em;margin:4px}
+.stat-num{font-size:clamp(32px,4vw,56px);font-weight:700;background:linear-gradient(135deg,#4f8eff,#a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-variant-numeric:tabular-nums}
+.stat-label{font-size:12px;color:rgba(255,255,255,.3);letter-spacing:.15em;margin-top:4px}
+/* Floating decorative elements */
+.float-dot{position:absolute;width:4px;height:4px;border-radius:50%;background:rgba(79,142,255,.3)}
+.float-ring{position:absolute;width:40px;height:40px;border-radius:50%;border:1px solid rgba(79,142,255,.08)}
+.float-line{position:absolute;width:60px;height:1px;background:linear-gradient(90deg,transparent,rgba(79,142,255,.15),transparent)}
+.float-cross{position:absolute;width:12px;height:12px;opacity:.15}
+.float-cross::before,.float-cross::after{content:'';position:absolute;background:rgba(79,142,255,.5)}
+.float-cross::before{width:12px;height:1px;top:5.5px}
+.float-cross::after{width:1px;height:12px;left:5.5px}
+/* Grid overlay */
+.grid-overlay{position:absolute;inset:0;opacity:.03;background-image:linear-gradient(rgba(79,142,255,.3) 1px,transparent 1px),linear-gradient(90deg,rgba(79,142,255,.3) 1px,transparent 1px);background-size:60px 60px;pointer-events:none}
+/* Pain cards */
+.pain-card{position:absolute;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:16px 20px;backdrop-filter:blur(8px);opacity:0}
+.pain-card .icon{font-size:24px;margin-bottom:8px}
+.pain-card .label{font-size:13px;color:rgba(255,255,255,.5);line-height:1.5}
+.pain-card.error{border-color:rgba(255,80,80,.15);background:rgba(255,50,50,.04)}
+.pain-card.error .label{color:rgba(255,120,120,.6)}
+.pain-card.warn{border-color:rgba(255,180,50,.15);background:rgba(255,160,30,.04)}
+.pain-card.warn .label{color:rgba(255,180,80,.6)}
+/* Version cards */
+.ver-card{position:absolute;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:10px 16px;font-size:12px;color:rgba(255,255,255,.4);white-space:nowrap;opacity:0}
+.ver-card.active{border-color:rgba(79,142,255,.3);color:rgba(79,142,255,.7)}
+.ver-card .dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:8px;background:rgba(255,255,255,.15)}
+.ver-card.active .dot{background:#4f8eff}
+/* Mock editor */
+.mock-editor{position:relative;width:min(900px,85vw);height:min(480px,65vh);background:rgba(10,10,18,.85);border:1px solid rgba(255,255,255,.06);border-radius:12px;overflow:hidden;opacity:0}
+.mock-sidebar{position:absolute;left:0;top:0;bottom:0;width:180px;background:rgba(255,255,255,.02);border-right:1px solid rgba(255,255,255,.05)}
+.mock-sidebar .file{padding:6px 14px;font-size:11px;color:rgba(255,255,255,.25);border-left:2px solid transparent;cursor:default}
+.mock-sidebar .file.active{color:rgba(79,142,255,.7);border-left-color:#4f8eff;background:rgba(79,142,255,.04)}
+.mock-main{position:absolute;left:180px;top:0;right:280px;bottom:0;padding:24px 30px;overflow:hidden}
+.mock-main .line{height:18px;margin-bottom:6px;border-radius:3px;opacity:.12}
+.mock-main .line.text{background:rgba(255,255,255,.5);width:80%}
+.mock-main .line.heading{background:rgba(79,142,255,.5);width:45%;height:22px}
+.mock-main .line.short{width:55%}
+.mock-main .diff-add{background:rgba(34,197,94,.12);border-left:2px solid rgba(34,197,94,.4);padding:2px 8px;margin:4px 0;border-radius:3px;font-size:11px;color:rgba(34,197,94,.6);opacity:0}
+.mock-main .diff-del{background:rgba(239,68,68,.08);border-left:2px solid rgba(239,68,68,.3);padding:2px 8px;margin:4px 0;border-radius:3px;font-size:11px;color:rgba(239,68,68,.5);text-decoration:line-through;opacity:0}
+.mock-chat{position:absolute;right:0;top:0;bottom:0;width:280px;background:rgba(255,255,255,.015);border-left:1px solid rgba(255,255,255,.05);padding:16px;display:flex;flex-direction:column;gap:8px}
+.mock-chat .msg{padding:8px 12px;border-radius:8px;font-size:11px;line-height:1.5;opacity:0}
+.mock-chat .msg.user{background:rgba(79,142,255,.08);color:rgba(79,142,255,.7);align-self:flex-end;border-bottom-right-radius:2px}
+.mock-chat .msg.ai{background:rgba(255,255,255,.04);color:rgba(255,255,255,.4);align-self:flex-start;border-bottom-left-radius:2px}
+.mock-chat .typing{font-size:11px;color:rgba(79,142,255,.4);opacity:0}
+.mock-chat .typing::after{content:'...';animation:dots 1.2s infinite}
+@keyframes dots{0%,20%{content:'.'}40%{content:'..'}60%,100%{content:'...'}}
+/* Spreadsheet mock */
+.mock-sheet{position:relative;width:min(700px,80vw);background:rgba(10,10,18,.8);border:1px solid rgba(255,255,255,.06);border-radius:10px;overflow:hidden;opacity:0}
+.mock-sheet .toolbar{height:32px;background:rgba(255,255,255,.02);border-bottom:1px solid rgba(255,255,255,.05);display:flex;align-items:center;padding:0 12px;gap:8px}
+.mock-sheet .toolbar span{width:20px;height:20px;border-radius:4px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06)}
+.sheet-grid{display:grid;grid-template-columns:40px repeat(5,1fr);font-size:11px}
+.sheet-grid .cell{padding:6px 10px;border:1px solid rgba(255,255,255,.04);color:rgba(255,255,255,.3);min-height:28px}
+.sheet-grid .cell.header{background:rgba(255,255,255,.02);color:rgba(255,255,255,.2);font-weight:600;text-align:center}
+.sheet-grid .cell.error{color:rgba(255,80,80,.6);background:rgba(255,50,50,.04)}
+.sheet-grid .cell.formula{color:rgba(79,142,255,.5)}
+/* PPT slide mocks */
+.ppt-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;width:min(750px,80vw);opacity:0}
+.ppt-slide{aspect-ratio:16/10;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:8px;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:16px;position:relative;overflow:hidden;opacity:0}
+.ppt-slide .slide-num{position:absolute;top:6px;left:8px;font-size:9px;color:rgba(255,255,255,.15)}
+.ppt-slide .slide-title{font-size:11px;color:rgba(255,255,255,.35);text-align:center;margin-bottom:6px}
+.ppt-slide .slide-bar{width:60%;height:3px;border-radius:2px;background:rgba(79,142,255,.15);margin:2px 0}
+.ppt-slide.ugly{border-color:rgba(255,100,50,.15);background:rgba(255,80,40,.03)}
+.ppt-slide.ugly .slide-title{color:rgba(255,120,80,.4)}
+/* Pipeline glass cards */
+.pipe-card{display:inline-flex;align-items:center;gap:10px;padding:12px 20px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:10px;font-size:13px;color:rgba(255,255,255,.4);backdrop-filter:blur(6px);opacity:0;position:relative}
+.pipe-card .step-num{width:24px;height:24px;border-radius:50%;background:rgba(79,142,255,.1);border:1px solid rgba(79,142,255,.2);display:flex;align-items:center;justify-content:center;font-size:10px;color:rgba(79,142,255,.7)}
+.pipe-card.active{border-color:rgba(79,142,255,.3);background:rgba(79,142,255,.04)}
+.pipe-arrow{font-size:16px;color:rgba(255,255,255,.1);opacity:0}
+/* Capability badges */
+.cap-badge{display:inline-flex;align-items:center;gap:8px;padding:8px 16px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:8px;font-size:12px;color:rgba(255,255,255,.35);opacity:0}
+.cap-badge .cap-icon{width:20px;height:20px;border-radius:5px;background:rgba(79,142,255,.1);display:flex;align-items:center;justify-content:center;font-size:10px}
+/* Flow diagram */
+.flow-row{display:flex;align-items:center;gap:12px;opacity:0}
+.flow-node{padding:10px 18px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:8px;font-size:12px;color:rgba(255,255,255,.4)}
+.flow-node.highlight{border-color:rgba(79,142,255,.3);color:rgba(79,142,255,.7);background:rgba(79,142,255,.04)}
+.flow-arrow{color:rgba(255,255,255,.1);font-size:14px}
+/* Orbit ring */
+.orbit-ring{position:absolute;border-radius:50%;border:1px solid rgba(79,142,255,.06);opacity:0}
+/* Scan line */
+.scan-line{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,rgba(79,142,255,.4),transparent);opacity:0;top:0}
+/* Check marks */
+.check-item{display:flex;align-items:center;gap:10px;font-size:13px;color:rgba(255,255,255,.35);opacity:0}
+.check-item .ck{width:18px;height:18px;border-radius:50%;border:1px solid rgba(34,197,94,.3);display:flex;align-items:center;justify-content:center;font-size:10px;color:rgba(34,197,94,.7)}
+/* Convergence rays */
+.conv-ray{position:absolute;width:2px;height:120px;background:linear-gradient(to bottom,rgba(79,142,255,.2),transparent);opacity:0;transform-origin:bottom center}
+/* App icons */
+.app-icon{position:absolute;width:48px;height:48px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px;opacity:0;border:1px solid rgba(255,255,255,.08)}
+.app-icon.w{background:rgba(40,100,220,.12)}
+.app-icon.x{background:rgba(30,130,76,.12)}
+.app-icon.p{background:rgba(200,80,40,.12)}
+.app-icon.e{background:rgba(120,80,200,.12)}
+.app-icon.c{background:rgba(200,180,40,.12)}
+/* Counter */
+.counter-box{display:inline-flex;flex-direction:column;align-items:center;gap:4px;opacity:0}
+/* Shimmer */
+@keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
+.shimmer-text{background:linear-gradient(90deg,#4f8eff 0%,#a855f7 25%,#ff6b4a 50%,#a855f7 75%,#4f8eff 100%);background-size:200% 100%;-webkit-background-clip:text;-webkit-text-fill-color:transparent;animation:shimmer 3s linear infinite}
+/* Replay overlay */
+#replayOverlay{position:fixed;inset:0;z-index:100;background:rgba(5,5,8,.92);display:none;flex-direction:column;justify-content:center;align-items:center;gap:20px;backdrop-filter:blur(12px)}
+#replayOverlay button{background:rgba(79,142,255,.1);border:1px solid rgba(79,142,255,.3);color:#4f8eff;padding:10px 32px;border-radius:8px;cursor:pointer;font-size:14px;font-family:inherit;transition:all .3s}
+#replayOverlay button:hover{background:rgba(79,142,255,.2)}
+/* Glitch effect */
+.glitch{position:relative;animation:glitchShake 0.3s linear infinite}
+.glitch::before,.glitch::after{content:attr(data-text);position:absolute;left:0;top:0;width:100%;height:100%;overflow:hidden}
+.glitch::before{color:#ff3040;clip-path:inset(0 0 60% 0);animation:glitchSlice1 0.4s linear infinite alternate}
+.glitch::after{color:#4f8eff;clip-path:inset(40% 0 0 0);animation:glitchSlice2 0.4s linear infinite alternate-reverse}
+@keyframes glitchShake{0%,100%{transform:translate(0)}20%{transform:translate(-2px,1px)}40%{transform:translate(2px,-1px)}60%{transform:translate(-1px,2px)}80%{transform:translate(1px,-2px)}}
+@keyframes glitchSlice1{0%{clip-path:inset(0 0 80% 0);transform:translate(-3px)}25%{clip-path:inset(20% 0 60% 0);transform:translate(3px)}50%{clip-path:inset(40% 0 30% 0);transform:translate(-2px)}75%{clip-path:inset(60% 0 10% 0);transform:translate(2px)}100%{clip-path:inset(10% 0 70% 0);transform:translate(-1px)}}
+@keyframes glitchSlice2{0%{clip-path:inset(70% 0 0 0);transform:translate(3px)}25%{clip-path:inset(50% 0 20% 0);transform:translate(-3px)}50%{clip-path:inset(30% 0 40% 0);transform:translate(2px)}75%{clip-path:inset(10% 0 60% 0);transform:translate(-2px)}100%{clip-path:inset(60% 0 10% 0);transform:translate(1px)}}
+/* Typewriter cursor */
+.tw-cursor::after{content:'|';color:#4f8eff;animation:twBlink 0.6s step-end infinite;margin-left:2px}
+@keyframes twBlink{0%,100%{opacity:1}50%{opacity:0}}
+/* Glow sweep on pipeline */
+.glow-sweep{position:absolute;top:0;left:-100%;width:100%;height:100%;background:linear-gradient(90deg,transparent,rgba(79,142,255,.15),rgba(168,85,247,.1),transparent);pointer-events:none;border-radius:inherit}
+/* Screen shake */
+@keyframes screenShake{0%,100%{transform:translate(0)}10%{transform:translate(-4px,2px)}20%{transform:translate(4px,-2px)}30%{transform:translate(-3px,3px)}40%{transform:translate(3px,-1px)}50%{transform:translate(-2px,2px)}60%{transform:translate(2px,-3px)}70%{transform:translate(-1px,1px)}80%{transform:translate(3px,2px)}90%{transform:translate(-2px,-1px)}}
+/* Wipe reveal */
+.wipe-reveal{clip-path:inset(0 100% 0 0);transition:clip-path 0.5s ease-out}
+.wipe-reveal.revealed{clip-path:inset(0 0 0 0)}
+/* Animated gradient border */
+.glow-border{position:relative;overflow:visible}
+.glow-border::before{content:'';position:absolute;inset:-2px;border-radius:inherit;background:linear-gradient(90deg,#4f8eff,#a855f7,#ff6b4a,#4f8eff);background-size:300% 100%;animation:borderGlow 3s linear infinite;z-index:-1;opacity:0;transition:opacity 0.5s}
+.glow-border.active::before{opacity:1}
+@keyframes borderGlow{0%{background-position:0% 50%}100%{background-position:300% 50%}}
+/* Number counter highlight */
+.counter-flash{animation:counterPop 0.3s ease-out}
+@keyframes counterPop{0%{transform:scale(1.3);filter:brightness(1.5)}100%{transform:scale(1);filter:brightness(1)}}
+/* Floating particle trail */
+.trail-dot{position:absolute;width:3px;height:3px;border-radius:50%;background:#4f8eff;pointer-events:none;opacity:0}
+/* Connection line */
+.conn-line{height:2px;background:linear-gradient(90deg,rgba(79,142,255,.4),rgba(168,85,247,.4));border-radius:1px;transform-origin:left;transform:scaleX(0)}
+/* Zoom container */
+.zoom-container{transform:scale(0.3);opacity:0;filter:blur(10px)}
+/* Pulse ring */
+.pulse-ring{position:absolute;border-radius:50%;border:1px solid rgba(79,142,255,.3);opacity:0;pointer-events:none}
+/* Error flash overlay */
+.error-flash{position:absolute;inset:0;background:rgba(255,50,50,.06);opacity:0;pointer-events:none;z-index:5}
+/* Spotlight */
+.spotlight{position:absolute;width:300px;height:300px;border-radius:50%;background:radial-gradient(circle,rgba(79,142,255,.08) 0%,transparent 70%);pointer-events:none;opacity:0;filter:blur(30px)}
+/* White flash overlay for dramatic transitions */
+#whiteFlash{position:fixed;inset:0;background:rgba(255,255,255,.9);opacity:0;pointer-events:none;z-index:50}
+/* Continuous float drift for decorative elements */
+@keyframes floatDrift{0%,100%{transform:translate(0,0)}25%{transform:translate(3px,-4px)}50%{transform:translate(-2px,5px)}75%{transform:translate(4px,2px)}}
+@keyframes floatDriftSlow{0%,100%{transform:translate(0,0) rotate(0deg)}50%{transform:translate(5px,-6px) rotate(3deg)}}
+@keyframes ringPulse{0%,100%{transform:scale(1);opacity:.08}50%{transform:scale(1.08);opacity:.12}}
+/* Cinematic letterbox bars */
+.letterbox{position:fixed;left:0;right:0;height:0;background:#050508;z-index:45;pointer-events:none}
+.letterbox.top{top:0}
+.letterbox.bottom{bottom:0}
+/* Radial wipe transition */
+@keyframes radialWipe{0%{clip-path:circle(0% at 50% 50%)}100%{clip-path:circle(75% at 50% 50%)}}
+/* Text glow pulse */
+@keyframes textGlow{0%,100%{text-shadow:0 0 10px rgba(79,142,255,0)}50%{text-shadow:0 0 20px rgba(79,142,255,.3),0 0 40px rgba(168,85,247,.15)}}
+.text-glow{animation:textGlow 2s ease-in-out infinite}
+/* Stagger reveal line */
+@keyframes staggerLine{0%{width:0;opacity:0}100%{width:100%;opacity:1}}
+/* Camera drift */
+.camera-drift{animation:cameraDrift 8s ease-in-out infinite}
+@keyframes cameraDrift{0%,100%{transform:translate(0,0) rotate(0deg)}25%{transform:translate(2px,-1px) rotate(0.15deg)}50%{transform:translate(-1px,2px) rotate(-0.1deg)}75%{transform:translate(1px,-1px) rotate(0.1deg)}}
+/* Stat number breathing glow */
+@keyframes statBreathe{0%,100%{filter:brightness(1) drop-shadow(0 0 0 transparent)}50%{filter:brightness(1.15) drop-shadow(0 0 8px rgba(79,142,255,.3))}}
+.stat-breathe{animation:statBreathe 2s ease-in-out infinite}
+/* Vignette pulse for pain scenes */
+@keyframes vignettePulse{0%,100%{opacity:.7}50%{opacity:.9}}
+.vignette-intense{animation:vignettePulse 1.5s ease-in-out infinite}
+/* === STUNNING EFFECTS === */
+/* Shockwave ripple */
+.shockwave{position:fixed;border-radius:50%;border:2px solid rgba(79,142,255,.4);pointer-events:none;z-index:15}
+/* Light beam */
+.light-beam{position:fixed;width:3px;height:100vh;background:linear-gradient(to bottom,transparent,rgba(79,142,255,.15),rgba(168,85,247,.1),transparent);pointer-events:none;z-index:4;opacity:0;filter:blur(2px)}
+/* Char split container */
+.char-split{display:inline-flex;overflow:hidden}
+.char-split .char{display:inline-block;opacity:0;transform:translateY(100%) rotateX(-90deg);transform-origin:bottom center}
+/* Morphing transition overlay */
+#morphOverlay{position:fixed;inset:0;z-index:48;pointer-events:none;background:#050508;clip-path:circle(0% at 50% 50%);opacity:0}
+/* Comet trail */
+.comet{position:fixed;width:4px;height:4px;border-radius:50%;pointer-events:none;z-index:6;filter:blur(1px)}
+.comet::after{content:'';position:absolute;width:40px;height:2px;right:4px;top:1px;background:linear-gradient(to left,currentColor,transparent);border-radius:1px;filter:blur(1px)}
+/* Neon line draw */
+.neon-line{position:fixed;height:2px;background:linear-gradient(90deg,transparent,#4f8eff,#a855f7,transparent);z-index:5;pointer-events:none;transform-origin:left;transform:scaleX(0);opacity:0;filter:blur(0.5px)}
+/* Hexagon grid flash */
+.hex-flash{position:fixed;inset:0;z-index:4;pointer-events:none;opacity:0;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='60' height='52'%3E%3Cpolygon points='30,2 56,15 56,37 30,50 4,37 4,15' fill='none' stroke='rgba(79,142,255,0.08)' stroke-width='0.5'/%3E%3C/svg%3E");background-size:60px 52px}
+/* Zoom lines (speed lines) */
+#zoomLines{position:fixed;inset:0;z-index:5;pointer-events:none;opacity:0}
+/* Glow orb floating */
+.glow-orb{position:fixed;border-radius:50%;pointer-events:none;z-index:3;filter:blur(40px);opacity:0}
+
+</style>
+</head>
+<body>
+<div id="loader"><div class="ring"></div><div class="txt">LOADING</div></div>
+<canvas id="bg"></canvas>
+<div id="vignette"></div>
+<div id="scanlines"></div>
+<div id="lightStreak"></div>
+<div id="gradBg"></div>
+<div id="heroGlow"></div>
+<div id="beatPulse"></div>
+<div id="beatBar"></div>
+<div class="error-flash" id="errorFlash"></div>
+<div class="spotlight" id="spotlight"></div>
+<div id="whiteFlash"></div>
+<div class="letterbox top" id="lbTop"></div>
+<div class="letterbox bottom" id="lbBottom"></div>
+<div id="morphOverlay"></div>
+<div id="zoomLines"></div>
+<div class="hex-flash" id="hexFlash"></div>
+<div class="glow-orb" id="glowOrb1" style="width:300px;height:300px;background:rgba(79,142,255,.15);left:20%;top:30%"></div>
+<div class="glow-orb" id="glowOrb2" style="width:250px;height:250px;background:rgba(168,85,247,.12);right:15%;top:50%"></div>
+<div class="neon-line" id="neonLine1" style="top:30%;left:0;width:100%"></div>
+<div class="neon-line" id="neonLine2" style="top:70%;left:0;width:100%"></div>
+
+<!-- S0: Logo Reveal 0-5s -->
+<div class="scene" id="s0">
+<div class="grid-overlay"></div>
+<div class="float-dot" style="top:15%;left:12%"></div>
+<div class="float-dot" style="top:70%;right:15%"></div>
+<div class="float-ring" style="top:20%;right:20%"></div>
+<div class="float-ring" style="bottom:25%;left:18%"></div>
+<div class="float-cross" style="top:30%;left:25%"></div>
+<div class="float-cross" style="bottom:20%;right:22%"></div>
+<div class="float-line" style="top:40%;left:8%"></div>
+<div class="float-line" style="bottom:35%;right:10%"></div>
+<div class="tag" id="s0tag1" style="position:absolute;top:22%;left:15%;opacity:0">AI-NATIVE</div>
+<div class="tag" id="s0tag2" style="position:absolute;top:25%;right:18%;opacity:0">DOCUMENT EDITOR</div>
+<div class="tag" id="s0tag3" style="position:absolute;bottom:28%;left:20%;opacity:0">INTELLIGENT</div>
+<div class="hero-line"><span id="logo1">Word</span></div>
+<div class="hero-line"><span id="logo2" style="color:#4f8eff">Cursor</span></div>
+<div class="sub-line" style="margin-top:16px"><span id="s0sub">AI 驱动的智能文档编辑器</span></div>
+<div style="display:flex;gap:12px;margin-top:20px">
+<div class="tag" id="s0t1">WORD</div><div class="tag" id="s0t2">EXCEL</div><div class="tag" id="s0t3">PPT</div><div class="tag" id="s0t4">AI AGENT</div>
+</div>
+</div>
+<!-- S1: Opening Question 5-10s -->
+<div class="scene" id="s1">
+<div class="grid-overlay"></div>
+<div class="float-dot" style="top:10%;left:20%"></div>
+<div class="float-dot" style="top:60%;right:12%"></div>
+<div class="float-ring" style="top:15%;right:25%"></div>
+<div class="float-cross" style="bottom:30%;left:15%"></div>
+<div class="hero-line"><span id="s1h1">每天，你打开多少个窗口？</span></div>
+<div class="sub-line" style="margin-top:12px"><span id="s1sub1">Word · Excel · PowerPoint · 浏览器 · 聊天工具</span></div>
+<div class="sub-line"><span id="s1sub2">复制 → 粘贴 → 格式丢失 → 重来</span></div>
+<div style="display:flex;gap:16px;margin-top:24px">
+<div class="counter-box" id="s1c1"><div class="stat-num" id="s1n1">5+</div><div class="stat-label">应用切换</div></div>
+<div class="counter-box" id="s1c2"><div class="stat-num" id="s1n2">30%</div><div class="stat-label">时间浪费</div></div>
+<div class="counter-box" id="s1c3"><div class="stat-num" id="s1n3">∞</div><div class="stat-label">重复操作</div></div>
+</div>
+<div class="app-icon w" id="s1a1" style="top:20%;left:15%">W</div>
+<div class="app-icon x" id="s1a2" style="top:18%;right:20%">X</div>
+<div class="app-icon p" id="s1a3" style="bottom:22%;left:22%">P</div>
+<div class="app-icon e" id="s1a4" style="bottom:20%;right:18%">E</div>
+<div class="app-icon c" id="s1a5" style="top:50%;left:8%">C</div>
+</div>
+
+<!-- S2: Word Pain 10-17s -->
+<div class="scene" id="s2">
+<div class="grid-overlay"></div>
+<div class="float-dot" style="top:12%;right:18%"></div>
+<div class="float-ring" style="bottom:18%;left:12%"></div>
+<div class="float-cross" style="top:25%;left:30%"></div>
+<div class="hero-line"><span id="s2h1" style="font-size:clamp(20px,3vw,36px)">Word 的日常崩溃</span></div>
+<div class="sub-line" style="margin-top:8px"><span id="s2sub">格式错乱 · 版本混乱 · 协作地狱</span></div>
+<div class="ver-card" id="v1" style="top:20%;left:12%"><span class="dot"></span>报告_v1.docx</div>
+<div class="ver-card" id="v2" style="top:28%;left:25%"><span class="dot"></span>报告_v2_修改.docx</div>
+<div class="ver-card" id="v3" style="top:36%;right:25%"><span class="dot"></span>报告_最终版.docx</div>
+<div class="ver-card" id="v4" style="top:44%;right:12%"><span class="dot"></span>报告_最终版(2).docx</div>
+<div class="ver-card active" id="v5" style="top:52%;left:18%"><span class="dot"></span>报告_打死也不改了.docx</div>
+<div class="pain-card error" id="s2p1" style="bottom:18%;left:10%;width:200px">
+<div class="icon">⚠️</div><div class="label">格式粘贴后全部错乱<br>手动修复 2 小时</div>
+</div>
+<div class="pain-card warn" id="s2p2" style="bottom:15%;right:10%;width:200px">
+<div class="icon">🔄</div><div class="label">5 个人 5 个版本<br>谁是最新的？</div>
+</div>
+<div class="pain-card" id="s2p3" style="top:15%;right:8%;width:180px">
+<div class="icon">📋</div><div class="label">排版反复调整<br>领导说"再改改"</div>
+</div>
+</div>
+<!-- S3: Excel Pain 17-24s -->
+<div class="scene" id="s3">
+<div class="grid-overlay"></div>
+<div class="float-dot" style="top:8%;left:15%"></div>
+<div class="float-ring" style="top:12%;right:10%"></div>
+<div class="hero-line"><span id="s3h1" style="font-size:clamp(20px,3vw,36px)">Excel 的公式噩梦</span></div>
+<div class="sub-line" style="margin-top:8px"><span id="s3sub">#REF! · #VALUE! · 循环引用 · 数据丢失</span></div>
+<div class="mock-sheet" id="s3sheet">
+<div class="toolbar"><span></span><span></span><span></span><span></span></div>
+<div class="sheet-grid">
+<div class="cell header"></div><div class="cell header">A</div><div class="cell header">B</div><div class="cell header">C</div><div class="cell header">D</div><div class="cell header">E</div>
+<div class="cell header">1</div><div class="cell">产品</div><div class="cell">Q1</div><div class="cell">Q2</div><div class="cell">Q3</div><div class="cell formula">=SUM</div>
+<div class="cell header">2</div><div class="cell">A 系列</div><div class="cell">1,200</div><div class="cell">1,450</div><div class="cell error">#REF!</div><div class="cell error">#REF!</div>
+<div class="cell header">3</div><div class="cell">B 系列</div><div class="cell">890</div><div class="cell error">#VALUE!</div><div class="cell">1,100</div><div class="cell error">#REF!</div>
+<div class="cell header">4</div><div class="cell">合计</div><div class="cell error">#REF!</div><div class="cell error">#REF!</div><div class="cell error">#REF!</div><div class="cell error" style="color:rgba(255,50,50,.8);font-weight:600">#REF!</div>
+</div>
+</div>
+<div class="pain-card error" id="s3p1" style="bottom:12%;left:8%;width:210px">
+<div class="icon">💥</div><div class="label">公式引用断裂<br>一删行全表崩盘</div>
+</div>
+<div class="pain-card warn" id="s3p2" style="bottom:10%;right:8%;width:210px">
+<div class="icon">📊</div><div class="label">数据量一大就卡死<br>10 万行 = 风扇起飞</div>
+</div>
+<div style="display:flex;gap:16px;margin-top:20px">
+<div class="counter-box" id="s3c1"><div class="stat-num" style="color:#ef4444" id="s3n1">47%</div><div class="stat-label">报表含公式错误</div></div>
+<div class="counter-box" id="s3c2"><div class="stat-num" style="color:#f59e0b" id="s3n2">3.2h</div><div class="stat-label">平均排错时间</div></div>
+</div>
+</div>
+
+<!-- S4: PPT Pain 24-31s -->
+<div class="scene" id="s4">
+<div class="grid-overlay"></div>
+<div class="float-dot" style="bottom:15%;left:20%"></div>
+<div class="float-ring" style="top:18%;left:10%"></div>
+<div class="float-cross" style="top:12%;right:15%"></div>
+<div class="hero-line"><span id="s4h1" style="font-size:clamp(20px,3vw,36px)">PPT 的审美灾难</span></div>
+<div class="sub-line" style="margin-top:8px"><span id="s4sub">模板老旧 · 排版灾难 · 配色辣眼 · 耗时巨大</span></div>
+<div class="ppt-grid" id="s4grid">
+<div class="ppt-slide ugly" id="s4s1"><div class="slide-num">01</div><div class="slide-title">年度总结</div><div class="slide-bar" style="background:rgba(255,80,40,.3)"></div><div class="slide-bar" style="width:40%;background:rgba(255,80,40,.2)"></div></div>
+<div class="ppt-slide ugly" id="s4s2"><div class="slide-num">02</div><div class="slide-title">数据概览</div><div class="slide-bar" style="background:rgba(255,180,0,.3)"></div><div class="slide-bar" style="width:45%;background:rgba(255,180,0,.2)"></div></div>
+<div class="ppt-slide ugly" id="s4s3"><div class="slide-num">03</div><div class="slide-title">市场分析</div><div class="slide-bar" style="background:rgba(0,200,100,.3)"></div><div class="slide-bar" style="width:50%;background:rgba(0,200,100,.2)"></div></div>
+<div class="ppt-slide ugly" id="s4s4"><div class="slide-num">04</div><div class="slide-title">竞品对比</div><div class="slide-bar" style="background:rgba(200,50,200,.3)"></div></div>
+<div class="ppt-slide ugly" id="s4s5"><div class="slide-num">05</div><div class="slide-title">团队介绍</div><div class="slide-bar" style="background:rgba(50,200,200,.3)"></div></div>
+<div class="ppt-slide ugly" id="s4s6"><div class="slide-num">06</div><div class="slide-title">Q&A</div><div class="slide-bar" style="background:rgba(255,100,100,.3)"></div></div>
+</div>
+<div class="pain-card" id="s4p1" style="bottom:8%;left:50%;transform:translateX(-50%);width:280px">
+<div class="icon">🎨</div><div class="label">找模板 2 小时 · 改排版 3 小时 · 老板说"太丑了重做"</div>
+</div>
+</div>
+<!-- S5: Workflow Chaos 31-36s -->
+<div class="scene" id="s5">
+<div class="grid-overlay"></div>
+<div class="hero-line"><span id="s5h1" style="font-size:clamp(18px,2.5vw,30px)">传统工作流</span></div>
+<div class="sub-line" style="margin-top:8px"><span id="s5sub">碎片化 · 低效率 · 无尽的窗口切换</span></div>
+<div class="app-icon w" id="s5a1" style="top:30%;left:20%">W</div>
+<div class="app-icon x" id="s5a2" style="top:25%;left:40%">X</div>
+<div class="app-icon p" id="s5a3" style="top:30%;right:30%">P</div>
+<div class="app-icon e" id="s5a4" style="top:55%;left:30%">E</div>
+<div class="app-icon c" id="s5a5" style="top:55%;right:25%">C</div>
+<div style="position:absolute;bottom:25%;display:flex;gap:12px;flex-wrap:wrap;justify-content:center;max-width:600px">
+<div class="tag" id="s5t1" style="opacity:0;border-color:rgba(255,80,80,.2);color:rgba(255,80,80,.5)">复制粘贴</div>
+<div class="tag" id="s5t2" style="opacity:0;border-color:rgba(255,80,80,.2);color:rgba(255,80,80,.5)">格式丢失</div>
+<div class="tag" id="s5t3" style="opacity:0;border-color:rgba(255,80,80,.2);color:rgba(255,80,80,.5)">版本混乱</div>
+<div class="tag" id="s5t4" style="opacity:0;border-color:rgba(255,80,80,.2);color:rgba(255,80,80,.5)">重复劳动</div>
+<div class="tag" id="s5t5" style="opacity:0;border-color:rgba(255,80,80,.2);color:rgba(255,80,80,.5)">效率低下</div>
+</div>
+</div>
+
+<!-- S6: Transition 36-41s -->
+<div class="scene" id="s6">
+<div class="conv-ray" id="r1" style="left:20%;top:0;transform:rotate(15deg)"></div>
+<div class="conv-ray" id="r2" style="left:35%;top:0;transform:rotate(5deg)"></div>
+<div class="conv-ray" id="r3" style="left:50%;top:0;transform:rotate(0deg)"></div>
+<div class="conv-ray" id="r4" style="left:65%;top:0;transform:rotate(-5deg)"></div>
+<div class="conv-ray" id="r5" style="left:80%;top:0;transform:rotate(-15deg)"></div>
+<div class="conv-ray" id="r6" style="left:10%;top:0;transform:rotate(25deg)"></div>
+<div class="conv-ray" id="r7" style="left:90%;top:0;transform:rotate(-25deg)"></div>
+<div class="hero-line"><span id="s6h1" style="font-size:clamp(24px,3.5vw,44px)">如果</span></div>
+<div class="hero-line"><span id="s6h2" style="font-size:clamp(24px,3.5vw,44px);color:#4f8eff">一个窗口就够了呢？</span></div>
+<div class="sub-line" style="margin-top:14px"><span id="s6sub">一个编辑器 · 一个 AI · 无限可能</span></div>
+<div style="display:flex;gap:10px;margin-top:20px">
+<div class="tag" id="s6t1" style="opacity:0;border-color:rgba(79,142,255,.3);color:rgba(79,142,255,.7)">ALL-IN-ONE</div>
+<div class="tag" id="s6t2" style="opacity:0;border-color:rgba(168,85,247,.3);color:rgba(168,85,247,.7)">AI-POWERED</div>
+<div class="tag" id="s6t3" style="opacity:0;border-color:rgba(255,107,74,.3);color:rgba(255,107,74,.7)">ZERO FRICTION</div>
+</div>
+</div>
+<!-- S7: Editor Assembly 41-52s -->
+<div class="scene" id="s7">
+<div class="grid-overlay"></div>
+<div class="hero-line"><span id="s7h1" style="font-size:clamp(18px,2.5vw,28px)">三栏合一 · 所见即所得</span></div>
+<div class="sub-line" style="margin-top:6px"><span id="s7sub">文件树 + 编辑器 + AI 对话 — 一个界面搞定一切</span></div>
+<div class="mock-editor" id="s7editor" style="margin-top:16px">
+<div class="mock-sidebar">
+<div class="file" style="padding:10px 14px;font-size:12px;color:rgba(255,255,255,.15);border-bottom:1px solid rgba(255,255,255,.04)">📁 工作区</div>
+<div class="file active">📄 年度报告.docx</div>
+<div class="file">📄 Q4数据.xlsx</div>
+<div class="file">📄 产品介绍.pptx</div>
+<div class="file">📄 会议纪要.docx</div>
+<div class="file">📁 素材文件夹</div>
+</div>
+<div class="mock-main">
+<div class="line heading" id="s7l1"></div>
+<div class="line text" id="s7l2"></div>
+<div class="line text short" id="s7l3"></div>
+<div class="line text" id="s7l4"></div>
+<div class="diff-del" id="s7dd1">- 本季度销售额较上季度有所增长</div>
+<div class="diff-add" id="s7da1">+ 本季度销售额同比增长 23.5%，环比增长 8.2%，创历史新高</div>
+<div class="line text" id="s7l5" style="margin-top:8px"></div>
+<div class="diff-del" id="s7dd2">- 客户满意度保持稳定</div>
+<div class="diff-add" id="s7da2">+ 客户满意度达 96.3%（NPS +12），较去年提升 4.1 个百分点</div>
+<div class="line text short" id="s7l6" style="margin-top:8px"></div>
+</div>
+<div class="mock-chat">
+<div class="msg user" id="s7m1">帮我润色这段报告，加入具体数据</div>
+<div class="msg ai" id="s7m2">好的，我来为您优化这段内容，补充精确数据...</div>
+<div class="typing" id="s7tp">AI 正在编辑</div>
+<div class="msg ai" id="s7m3" style="margin-top:auto;font-size:10px;color:rgba(34,197,94,.5)">✓ 已完成 2 处修改，新增数据引用 4 处</div>
+</div>
+</div>
+<div style="display:flex;gap:10px;margin-top:14px">
+<div class="tag" id="s7t1" style="opacity:0">实时 DIFF</div>
+<div class="tag" id="s7t2" style="opacity:0">AI 润色</div>
+<div class="tag" id="s7t3" style="opacity:0">一键接受</div>
+</div>
+</div>
+
+<!-- S8: Diff Philosophy 52-59s -->
+<div class="scene" id="s8">
+<div class="grid-overlay"></div>
+<div class="float-dot" style="top:15%;left:10%"></div>
+<div class="float-dot" style="bottom:20%;right:12%"></div>
+<div class="float-ring" style="top:10%;right:18%"></div>
+<div class="float-cross" style="bottom:15%;left:20%"></div>
+<div class="hero-line"><span id="s8h1" style="font-size:clamp(20px,3vw,36px)">每一次修改</span></div>
+<div class="hero-line"><span id="s8h2" style="font-size:clamp(20px,3vw,36px);color:#4f8eff">都清晰可见</span></div>
+<div class="sub-line" style="margin-top:10px"><span id="s8sub">不是黑箱替换，而是透明的 Diff 审阅</span></div>
+<div style="display:flex;flex-direction:column;gap:10px;margin-top:24px;width:min(500px,80vw)">
+<div class="diff-del" id="s8d1" style="opacity:0;font-size:13px;padding:8px 14px">- 我们的产品具有很多优势和特点</div>
+<div class="diff-add" id="s8a1" style="opacity:0;font-size:13px;padding:8px 14px">+ 三大核心优势：AI 原生架构、实时协作、全格式支持</div>
+<div class="diff-del" id="s8d2" style="opacity:0;font-size:13px;padding:8px 14px">- 用户反馈比较好</div>
+<div class="diff-add" id="s8a2" style="opacity:0;font-size:13px;padding:8px 14px">+ 用户满意度 97.2%，日活跃用户环比增长 340%</div>
+<div class="diff-del" id="s8d3" style="opacity:0;font-size:13px;padding:8px 14px">- 未来会继续努力</div>
+<div class="diff-add" id="s8a3" style="opacity:0;font-size:13px;padding:8px 14px">+ 2025 路线图：多模态理解、团队协作空间、插件生态</div>
+</div>
+<div style="display:flex;gap:16px;margin-top:20px">
+<div class="counter-box" id="s8c1"><div class="stat-num" id="s8n1">100%</div><div class="stat-label">修改可追溯</div></div>
+<div class="counter-box" id="s8c2"><div class="stat-num" id="s8n2">0</div><div class="stat-label">黑箱操作</div></div>
+</div>
+</div>
+<!-- S9: /审查 One More Thing 59-67s -->
+<div class="scene" id="s9">
+<div class="grid-overlay"></div>
+<div class="scan-line" id="s9scan"></div>
+<div class="float-ring" style="top:12%;left:15%"></div>
+<div class="float-dot" style="bottom:18%;right:20%"></div>
+<div class="hero-line"><span id="s9h1" style="font-size:clamp(22px,3vw,38px)">One More Thing</span></div>
+<div class="hero-line"><span id="s9h2" style="font-size:clamp(28px,4vw,48px);color:#4f8eff">/审查</span></div>
+<div class="sub-line" style="margin-top:10px"><span id="s9sub">AI 全文审阅 · 逻辑校验 · 风格统一 · 数据核查</span></div>
+<div style="display:flex;flex-direction:column;gap:10px;margin-top:24px;width:min(420px,80vw)">
+<div class="check-item" id="s9ck1"><div class="ck">✓</div>语法与拼写检查 — 0 错误</div>
+<div class="check-item" id="s9ck2"><div class="ck">✓</div>数据一致性校验 — 全部通过</div>
+<div class="check-item" id="s9ck3"><div class="ck">✓</div>论证逻辑审查 — 结构完整</div>
+<div class="check-item" id="s9ck4"><div class="ck">✓</div>格式规范检查 — 符合标准</div>
+<div class="check-item" id="s9ck5"><div class="ck">✓</div>敏感信息扫描 — 安全</div>
+</div>
+<div style="display:flex;gap:10px;margin-top:16px">
+<div class="cap-badge" id="s9b1"><div class="cap-icon">🔍</div>深度审阅</div>
+<div class="cap-badge" id="s9b2"><div class="cap-icon">⚡</div>秒级完成</div>
+<div class="cap-badge" id="s9b3"><div class="cap-icon">🎯</div>精准定位</div>
+</div>
+</div>
+
+<!-- S10: PPT Generation 67-76s -->
+<div class="scene" id="s10">
+<div class="grid-overlay"></div>
+<div class="float-dot" style="top:10%;left:18%"></div>
+<div class="float-ring" style="bottom:15%;right:12%"></div>
+<div class="hero-line"><span id="s10h1" style="font-size:clamp(20px,3vw,36px)">AI 生成 PPT</span></div>
+<div class="hero-line"><span id="s10h2" style="font-size:clamp(16px,2vw,24px);color:rgba(255,255,255,.4)">从大纲到成品，一句话搞定</span></div>
+<div style="display:flex;align-items:center;gap:8px;margin-top:24px;flex-wrap:wrap;justify-content:center">
+<div class="pipe-card" id="s10p1"><div class="step-num">1</div>自然语言描述</div>
+<div class="pipe-arrow" id="s10a1">→</div>
+<div class="pipe-card" id="s10p2"><div class="step-num">2</div>AI 生成大纲</div>
+<div class="pipe-arrow" id="s10a2">→</div>
+<div class="pipe-card" id="s10p3"><div class="step-num">3</div>视觉提示词</div>
+<div class="pipe-arrow" id="s10a3">→</div>
+<div class="pipe-card" id="s10p4"><div class="step-num">4</div>AI 生图</div>
+<div class="pipe-arrow" id="s10a4">→</div>
+<div class="pipe-card" id="s10p5"><div class="step-num">5</div>打包 PPTX</div>
+</div>
+<div class="sub-line" style="margin-top:16px"><span id="s10sub">杂志级审美 · 电影级光影 · 零模板依赖</span></div>
+<div style="display:flex;gap:16px;margin-top:16px">
+<div class="counter-box" id="s10c1"><div class="stat-num" id="s10n1">15</div><div class="stat-label">页 PPT</div></div>
+<div class="counter-box" id="s10c2"><div class="stat-num" id="s10n2">&lt;2</div><div class="stat-label">分钟生成</div></div>
+<div class="counter-box" id="s10c3"><div class="stat-num" id="s10n3">∞</div><div class="stat-label">风格可选</div></div>
+</div>
+<div style="display:flex;gap:10px;margin-top:14px">
+<div class="tag" id="s10t1" style="opacity:0">拖拽编辑</div>
+<div class="tag" id="s10t2" style="opacity:0">局部重绘</div>
+<div class="tag" id="s10t3" style="opacity:0">整页重做</div>
+<div class="tag" id="s10t4" style="opacity:0">风格一致</div>
+</div>
+</div>
+<!-- S11: Paradigm Shift 76-84s -->
+<div class="scene" id="s11">
+<div class="grid-overlay"></div>
+<div class="float-dot" style="top:12%;right:15%"></div>
+<div class="float-ring" style="bottom:20%;left:10%"></div>
+<div class="float-cross" style="top:18%;left:22%"></div>
+<div class="hero-line"><span id="s11h1" style="font-size:clamp(20px,3vw,36px)">不只是工具升级</span></div>
+<div class="hero-line"><span id="s11h2" style="font-size:clamp(20px,3vw,36px);color:#a855f7">是工作方式的革命</span></div>
+<div style="display:flex;flex-direction:column;gap:12px;margin-top:24px">
+<div class="flow-row" id="s11f1">
+<div class="flow-node">自然语言</div><div class="flow-arrow">→</div>
+<div class="flow-node highlight">AI 理解意图</div><div class="flow-arrow">→</div>
+<div class="flow-node">精准执行</div>
+</div>
+<div class="flow-row" id="s11f2">
+<div class="flow-node">一句话</div><div class="flow-arrow">→</div>
+<div class="flow-node highlight">全文档操作</div><div class="flow-arrow">→</div>
+<div class="flow-node">Diff 审阅</div>
+</div>
+<div class="flow-row" id="s11f3">
+<div class="flow-node">描述需求</div><div class="flow-arrow">→</div>
+<div class="flow-node highlight">AI 生成 PPT</div><div class="flow-arrow">→</div>
+<div class="flow-node">拖拽微调</div>
+</div>
+</div>
+<div style="display:flex;gap:10px;margin-top:20px;flex-wrap:wrap;justify-content:center">
+<div class="cap-badge" id="s11b1"><div class="cap-icon">📝</div>Word 编辑</div>
+<div class="cap-badge" id="s11b2"><div class="cap-icon">📊</div>Excel 分析</div>
+<div class="cap-badge" id="s11b3"><div class="cap-icon">🎨</div>PPT 生成</div>
+<div class="cap-badge" id="s11b4"><div class="cap-icon">🔍</div>全文审查</div>
+<div class="cap-badge" id="s11b5"><div class="cap-icon">🤖</div>AI Agent</div>
+<div class="cap-badge" id="s11b6"><div class="cap-icon">⚡</div>Tab 补全</div>
+</div>
+</div>
+
+<!-- S12: Finale 84-100s -->
+<div class="scene" id="s12">
+<div class="orbit-ring" id="orb1" style="width:200px;height:200px;left:50%;top:50%;transform:translate(-50%,-50%)"></div>
+<div class="orbit-ring" id="orb2" style="width:350px;height:350px;left:50%;top:50%;transform:translate(-50%,-50%)"></div>
+<div class="orbit-ring" id="orb3" style="width:500px;height:500px;left:50%;top:50%;transform:translate(-50%,-50%)"></div>
+<div class="orbit-ring" id="orb4" style="width:650px;height:650px;left:50%;top:50%;transform:translate(-50%,-50%)"></div>
+<div class="float-dot" style="top:20%;left:15%"></div>
+<div class="float-dot" style="top:30%;right:20%"></div>
+<div class="float-dot" style="bottom:25%;left:25%"></div>
+<div class="float-dot" style="bottom:20%;right:15%"></div>
+<div class="float-cross" style="top:15%;right:30%"></div>
+<div class="float-cross" style="bottom:30%;left:18%"></div>
+<div class="hero-line"><span id="s12h1" class="shimmer-text" style="font-size:clamp(36px,5vw,64px)">Word-Cursor</span></div>
+<div class="sub-line" style="margin-top:12px"><span id="s12sub1">AI 驱动 · 重新定义文档编辑</span></div>
+<div class="sub-line"><span id="s12sub2" style="color:rgba(79,142,255,.5)">Your Documents, Supercharged.</span></div>
+<div style="display:flex;gap:12px;margin-top:24px">
+<div class="tag" id="s12t1" style="opacity:0;border-color:rgba(79,142,255,.3);color:rgba(79,142,255,.7)">立即体验</div>
+<div class="tag" id="s12t2" style="opacity:0;border-color:rgba(168,85,247,.3);color:rgba(168,85,247,.7)">开源免费</div>
+<div class="tag" id="s12t3" style="opacity:0;border-color:rgba(255,107,74,.3);color:rgba(255,107,74,.7)">桌面端优先</div>
+</div>
+<div style="display:flex;gap:16px;margin-top:20px">
+<div class="counter-box" id="s12c1"><div class="stat-num" id="s12n1">3</div><div class="stat-label">格式支持</div></div>
+<div class="counter-box" id="s12c2"><div class="stat-num" id="s12n2">1</div><div class="stat-label">个窗口</div></div>
+<div class="counter-box" id="s12c3"><div class="stat-num" id="s12n3">∞</div><div class="stat-label">可能性</div></div>
+</div>
+</div>
+
+<!-- Progress & Controls -->
+<div id="progressWrap"><div id="progressBar"></div></div>
+<div id="timeCode">00:00 / 01:40</div>
+<div id="controls">
+<button id="playPauseBtn">⏸</button>
+<button id="restartBtn">↺</button>
+</div>
+<button id="soundToggle">🔊 音效</button>
+<div id="replayOverlay">
+<div class="hero-line"><span class="shimmer-text" style="font-size:clamp(28px,4vw,48px)">Word-Cursor</span></div>
+<div style="color:rgba(255,255,255,.3);font-size:14px;margin-top:8px">感谢观看</div>
+<button id="replayBtn">重新播放</button>
+</div>
+
+<script>
+// ===== BGM: Epic Cinematic Track =====
+const bgm=new Audio();
+bgm.crossOrigin='anonymous';
+bgm.loop=true;
+bgm.volume=0.5;
+bgm.preload='auto';
+// Build-up tracks: atmospheric cinematic → epic climax (film score style)
+const bgmSources=['https://assets.mixkit.co/music/184/184.mp3','https://assets.mixkit.co/music/322/322.mp3','https://assets.mixkit.co/music/680/680.mp3','https://assets.mixkit.co/music/188/188.mp3'];
+let bgmSrcIdx=0;
+function loadBGM(){bgm.src=bgmSources[bgmSrcIdx];bgm.load();}
+bgm.addEventListener('error',()=>{bgmSrcIdx++;if(bgmSrcIdx<bgmSources.length){loadBGM();}});
+loadBGM();
+
+let bgmPlaying=false;
+function startBGM(){
+  if(bgmPlaying) return;
+  bgmPlaying=true;
+  bgm.play().catch(()=>{
+    // Autoplay blocked — retry on next click
+    bgmPlaying=false;
+    document.addEventListener('click',()=>{if(!bgmPlaying&&soundOn){bgmPlaying=true;bgm.play().catch(()=>{});}},{once:true});
+  });
+}
+function stopBGM(){bgmPlaying=false;bgm.pause();}
+
+// ===== Beat Visualization (analyser is OPTIONAL, lazy-init on click) =====
+let analyser=null, analyserData=null, audioSrcConnected=false;
+function initAnalyser(){
+  if(audioSrcConnected) return;
+  try{
+    const actx=new(window.AudioContext||window.webkitAudioContext)();
+    if(actx.state==='suspended') actx.resume();
+    analyser=actx.createAnalyser();
+    analyser.fftSize=256;
+    analyser.smoothingTimeConstant=0.7;
+    analyserData=new Uint8Array(analyser.frequencyBinCount);
+    const src=actx.createMediaElementSource(bgm);
+    src.connect(analyser);
+    analyser.connect(actx.destination);
+    audioSrcConnected=true;
+  }catch(e){/* analyser is optional — BGM still plays via HTML Audio */}
+}
+// Only init analyser on user gesture (click) so BGM plays fine without it
+document.addEventListener('click',()=>{if(!audioSrcConnected) initAnalyser();},{once:true});
+
+const beatBarEl=document.getElementById('beatBar');
+for(let i=0;i<16;i++){const d=document.createElement('div');d.className='beat-dot';beatBarEl.appendChild(d);}
+const beatDots=beatBarEl.querySelectorAll('.beat-dot');
+const beatPulseEl=document.getElementById('beatPulse');
+
+let lastBeatTime=0;
+function updateBeatVis(){
+  if(!analyser||!bgmPlaying){requestAnimationFrame(updateBeatVis);return;}
+  analyser.getByteFrequencyData(analyserData);
+  let bass=0;for(let i=0;i<6;i++) bass+=analyserData[i];bass/=6;
+  for(let i=0;i<16;i++){
+    const idx=Math.floor(i*analyser.frequencyBinCount/16);
+    if((analyserData[idx]||0)>120) beatDots[i].classList.add('on');
+    else beatDots[i].classList.remove('on');
+  }
+  const now=performance.now();
+  if(bass>150&&now-lastBeatTime>200){
+    lastBeatTime=now;
+    gsap.fromTo(beatPulseEl,{opacity:.2,scale:1},{opacity:0,scale:2.5,duration:0.5,ease:'expo.out'});
+    // Beat-reactive: subtle heroGlow pulse
+    gsap.to('#heroGlow',{scale:'+=0.05',duration:0.1,yoyo:true,repeat:1,ease:'power1.out',overwrite:'auto'});
+  }
+  // Mid-range reactive: subtle vignette pulse
+  let mid=0;for(let i=6;i<20;i++) mid+=analyserData[i];mid/=14;
+  if(mid>130){
+    gsap.to('#vignette',{opacity:0.85+mid/1500,duration:0.1,overwrite:'auto'});
+  }
+  requestAnimationFrame(updateBeatVis);
+}
+requestAnimationFrame(updateBeatVis);
+
+// ===== SFX Engine (Web Audio synthesis — clean, no external files) =====
+let sfxCtx=null;
+let soundOn=true;
+
+function ensureSfxCtx(){
+  if(!sfxCtx) sfxCtx=new(window.AudioContext||window.webkitAudioContext)();
+  if(sfxCtx.state==='suspended') sfxCtx.resume();
+  return sfxCtx;
+}
+
+function sfx(name,vol=0.2){
+  if(!soundOn) return;
+  try{
+    const c=ensureSfxCtx();
+    const g=c.createGain();
+    g.connect(c.destination);
+    const t=c.currentTime;
+    if(name==='hit'||name==='bass'){
+      // Deep impact
+      const o=c.createOscillator();o.type='sine';
+      o.frequency.setValueAtTime(80,t);o.frequency.exponentialRampToValueAtTime(20,t+0.2);
+      g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.25);
+      o.connect(g);o.start(t);o.stop(t+0.25);
+    }else if(name==='whoosh'||name==='sweep'){
+      // Filtered sweep
+      const o=c.createOscillator();o.type='sine';
+      const lp=c.createBiquadFilter();lp.type='bandpass';lp.frequency.setValueAtTime(200,t);
+      lp.frequency.exponentialRampToValueAtTime(2000,t+0.3);lp.Q.value=2;
+      o.frequency.setValueAtTime(300,t);o.frequency.exponentialRampToValueAtTime(1200,t+0.3);
+      g.gain.setValueAtTime(vol*0.5,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.35);
+      o.connect(lp);lp.connect(g);o.start(t);o.stop(t+0.35);
+    }else if(name==='ding'||name==='chime'){
+      // Bell tone
+      const o=c.createOscillator();o.type='sine';
+      o.frequency.setValueAtTime(880,t);
+      g.gain.setValueAtTime(vol*0.4,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.4);
+      o.connect(g);o.start(t);o.stop(t+0.4);
+    }else if(name==='pop'||name==='click'||name==='snap'){
+      // Short click
+      const o=c.createOscillator();o.type='sine';
+      o.frequency.setValueAtTime(600,t);o.frequency.exponentialRampToValueAtTime(200,t+0.05);
+      g.gain.setValueAtTime(vol*0.6,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.06);
+      o.connect(g);o.start(t);o.stop(t+0.06);
+    }else if(name==='rise'){
+      // Rising tone
+      const o=c.createOscillator();o.type='sine';
+      o.frequency.setValueAtTime(200,t);o.frequency.exponentialRampToValueAtTime(800,t+0.5);
+      g.gain.setValueAtTime(vol*0.3,t);g.gain.linearRampToValueAtTime(vol*0.5,t+0.3);
+      g.gain.exponentialRampToValueAtTime(0.001,t+0.55);
+      o.connect(g);o.start(t);o.stop(t+0.55);
+    }else if(name==='shimmer'||name==='reveal'||name==='glow'){
+      // Shimmer — two detuned tones
+      const o1=c.createOscillator();o1.type='sine';o1.frequency.value=523;
+      const o2=c.createOscillator();o2.type='sine';o2.frequency.value=526;
+      g.gain.setValueAtTime(vol*0.3,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.8);
+      o1.connect(g);o2.connect(g);o1.start(t);o2.start(t);o1.stop(t+0.8);o2.stop(t+0.8);
+    }
+  }catch(e){}
+}
+
+// ===== Animation Utilities =====
+// Counter count-up animation
+function countUp(el,from,to,duration,suffix='',prefix=''){
+  const obj={val:from};
+  gsap.to(obj,{val:to,duration,ease:'power2.out',onUpdate:()=>{
+    const v=obj.val;
+    el.textContent=prefix+(Number.isInteger(to)?Math.round(v):v.toFixed(1))+suffix;
+  },onComplete:()=>{el.classList.add('counter-flash');}});
+}
+// Typewriter effect
+function typewrite(el,text,speed=0.04,delay=0){
+  el.textContent='';el.classList.add('tw-cursor');
+  return gsap.to({i:0},{i:text.length,duration:text.length*speed,delay,ease:'none',
+    onUpdate:function(){el.textContent=text.slice(0,Math.round(this.targets()[0].i));},
+    onComplete:()=>{setTimeout(()=>el.classList.remove('tw-cursor'),800);}
+  });
+}
+// Glitch toggle
+function glitchOn(el){const e=typeof el==='string'?document.querySelector(el):el;if(e){e.setAttribute('data-text',e.textContent);e.classList.add('glitch');}}
+function glitchOff(el){const e=typeof el==='string'?document.querySelector(el):el;if(e) e.classList.remove('glitch');}
+// Screen shake
+function screenShake(dur=0.4){
+  document.body.style.animation=`screenShake ${dur}s linear`;
+  setTimeout(()=>{document.body.style.animation='';},dur*1000);
+}
+// Wipe reveal helper
+function wipeReveal(el,delay=0){
+  const e=typeof el==='string'?document.querySelector(el):el;
+  if(!e) return;
+  e.style.opacity='1';
+  e.classList.add('wipe-reveal');
+  e.classList.remove('revealed');
+  void e.offsetWidth; // force reflow
+  setTimeout(()=>e.classList.add('revealed'),delay*1000);
+}
+// Spotlight follow
+const spotlightEl=document.getElementById('spotlight');
+function moveSpotlight(x,y,opacity=0.6){
+  gsap.to(spotlightEl,{left:x-150,top:y-150,opacity,duration:0.8,ease:'power2.out'});
+}
+function hideSpotlight(){gsap.to(spotlightEl,{opacity:0,duration:0.5});}
+// Pulse ring burst
+function pulseRing(x,y,size=200,color='79,142,255'){
+  const ring=document.createElement('div');
+  ring.className='pulse-ring';
+  ring.style.cssText=`left:${x-size/2}px;top:${y-size/2}px;width:${size}px;height:${size}px;border-color:rgba(${color},.3);`;
+  document.body.appendChild(ring);
+  gsap.fromTo(ring,{scale:0.3,opacity:0.6},{scale:2,opacity:0,duration:1,ease:'expo.out',onComplete:()=>ring.remove()});
+}
+
+// White flash transition
+function whiteFlash(dur=0.3){
+  gsap.fromTo('#whiteFlash',{opacity:0},{opacity:1,duration:dur*0.3,ease:'power2.in',
+    onComplete:()=>gsap.to('#whiteFlash',{opacity:0,duration:dur*0.7,ease:'power2.out'})
+  });
+}
+// Cinematic letterbox (bars in/out)
+function letterboxIn(dur=0.5){
+  gsap.to('#lbTop',{height:'5vh',duration:dur,ease:'power2.out'});
+  gsap.to('#lbBottom',{height:'5vh',duration:dur,ease:'power2.out'});
+}
+function letterboxOut(dur=0.4){
+  gsap.to('#lbTop',{height:0,duration:dur,ease:'power2.in'});
+  gsap.to('#lbBottom',{height:0,duration:dur,ease:'power2.in'});
+}
+// Start continuous ambient float on visible decorations
+let ambientTweens=[];
+function startAmbientFloat(){
+  killAmbientFloat();
+  document.querySelectorAll('.float-dot').forEach((el,i)=>{
+    ambientTweens.push(gsap.to(el,{x:'random(-6,6)',y:'random(-8,8)',duration:gsap.utils.random(3,5),repeat:-1,yoyo:true,ease:'sine.inOut',delay:i*0.2}));
+  });
+  document.querySelectorAll('.float-ring').forEach((el,i)=>{
+    ambientTweens.push(gsap.to(el,{scale:'random(0.9,1.1)',opacity:'random(0.05,0.12)',duration:gsap.utils.random(2,4),repeat:-1,yoyo:true,ease:'sine.inOut',delay:i*0.3}));
+  });
+  document.querySelectorAll('.float-cross').forEach((el,i)=>{
+    ambientTweens.push(gsap.to(el,{rotation:'+=360',duration:gsap.utils.random(15,25),repeat:-1,ease:'none'}));
+  });
+}
+function killAmbientFloat(){ambientTweens.forEach(t=>t.kill());ambientTweens=[];}
+// Scene entrance variants
+function slideInScene(id,dir='left',dur=0.5){
+  const x=dir==='left'?-60:dir==='right'?60:0;
+  const y=dir==='up'?-40:dir==='down'?40:0;
+  return gsap.fromTo(id,{x,y,opacity:0},{x:0,y:0,opacity:1,duration:dur,ease:'expo.out'});
+}
+function tiltInScene(id,dur=0.6){
+  return gsap.fromTo(id,{rotationY:8,scale:0.92,opacity:0,transformPerspective:800},{rotationY:0,scale:1,opacity:1,duration:dur,ease:'expo.out'});
+}
+// Camera drift toggle
+const vignetteEl=document.getElementById('vignette');
+function cameraDriftOn(){document.querySelector('.scene[style*="opacity: 1"],.scene')?.classList.add('camera-drift');}
+function cameraDriftOff(){document.querySelectorAll('.camera-drift').forEach(el=>el.classList.remove('camera-drift'));}
+function vignetteIntense(on){if(on)vignetteEl.classList.add('vignette-intense');else vignetteEl.classList.remove('vignette-intense');}
+// Stat breathe glow
+function statBreathe(el){const e=typeof el==='string'?document.querySelector(el):el;if(e)e.classList.add('stat-breathe');}
+function statBreatheOff(el){const e=typeof el==='string'?document.querySelector(el):el;if(e)e.classList.remove('stat-breathe');}
+
+// === STUNNING EFFECTS ===
+
+// Shockwave ripple — expanding ring with fade
+function shockwave(x,y,maxSize=400,color='79,142,255',dur=0.8){
+  const el=document.createElement('div');
+  el.className='shockwave';
+  el.style.cssText=`left:${x}px;top:${y}px;width:0;height:0;border-color:rgba(${color},.5);`;
+  document.body.appendChild(el);
+  gsap.to(el,{width:maxSize,height:maxSize,left:x-maxSize/2,top:y-maxSize/2,opacity:0,borderWidth:0.5,duration:dur,ease:'expo.out',onComplete:()=>el.remove()});
+}
+
+// Multi-ring shockwave (staggered)
+function multiShockwave(x,y,count=3,maxSize=500,color='79,142,255'){
+  for(let i=0;i<count;i++){
+    setTimeout(()=>shockwave(x,y,maxSize-i*80,color,0.8+i*0.15),i*100);
+  }
+}
+
+// Comet trail — a glowing particle that flies across screen
+function shootComet(fromX,fromY,toX,toY,color='#4f8eff',dur=0.6){
+  const el=document.createElement('div');
+  el.className='comet';
+  el.style.cssText=`left:${fromX}px;top:${fromY}px;background:${color};color:${color};`;
+  document.body.appendChild(el);
+  const angle=Math.atan2(toY-fromY,toX-fromX)*180/Math.PI;
+  el.style.transform=`rotate(${angle}deg)`;
+  gsap.to(el,{left:toX,top:toY,duration:dur,ease:'power2.in',onComplete:()=>{
+    particleBurst(toX,toY,12,color.includes('255')?'79,142,255':'168,85,247');
+    el.remove();
+  }});
+}
+
+// Comet shower — multiple comets from edges
+function cometShower(count=6){
+  for(let i=0;i<count;i++){
+    setTimeout(()=>{
+      const side=Math.floor(Math.random()*4);
+      let fx,fy;
+      if(side===0){fx=Math.random()*W;fy=-20;}
+      else if(side===1){fx=W+20;fy=Math.random()*H;}
+      else if(side===2){fx=Math.random()*W;fy=H+20;}
+      else{fx=-20;fy=Math.random()*H;}
+      const tx=W*0.3+Math.random()*W*0.4;
+      const ty=H*0.3+Math.random()*H*0.4;
+      shootComet(fx,fy,tx,ty,Math.random()>0.5?'#4f8eff':'#a855f7',0.4+Math.random()*0.3);
+    },i*120);
+  }
+}
+
+// Character split animation — split text into chars and animate each
+function charSplitReveal(el,dur=0.8,stagger=0.03){
+  const e=typeof el==='string'?document.querySelector(el):el;
+  if(!e) return;
+  const text=e.textContent;
+  e.textContent='';
+  e.style.opacity='1';
+  const chars=[];
+  for(const ch of text){
+    const span=document.createElement('span');
+    span.className='char';
+    span.textContent=ch===''?' ':ch;
+    if(ch===' ') span.style.width='0.3em';
+    e.appendChild(span);
+    chars.push(span);
+  }
+  gsap.to(chars,{opacity:1,y:0,rotateX:0,duration:dur/chars.length*3,stagger,ease:'back.out(1.5)',
+    onStart:function(){this.targets()[0]?.parentElement?.classList.add('char-split');}
+  });
+}
+
+// Neon line draw
+function neonLineDraw(id,dur=0.4){
+  gsap.to(id,{opacity:0.8,scaleX:1,duration:dur,ease:'expo.out',
+    onComplete:()=>gsap.to(id,{opacity:0,duration:dur*0.6,ease:'power2.in'})
+  });
+}
+
+// Hex grid flash
+function hexFlash(dur=0.3){
+  gsap.fromTo('#hexFlash',{opacity:0},{opacity:0.6,duration:dur*0.3,ease:'power2.in',
+    onComplete:()=>gsap.to('#hexFlash',{opacity:0,duration:dur*0.7,ease:'power2.out'})
+  });
+}
+
+// Zoom/speed lines (canvas-drawn)
+function drawZoomLines(dur=0.4){
+  const zl=document.getElementById('zoomLines');
+  const zc=document.createElement('canvas');
+  zc.width=W;zc.height=H;zc.style.cssText='width:100%;height:100%';
+  zl.innerHTML='';zl.appendChild(zc);
+  const zctx=zc.getContext('2d');
+  const cx=W/2,cy=H/2;
+  for(let i=0;i<40;i++){
+    const angle=Math.random()*Math.PI*2;
+    const r1=Math.random()*100+80;
+    const r2=Math.random()*400+300;
+    zctx.beginPath();
+    zctx.moveTo(cx+Math.cos(angle)*r1,cy+Math.sin(angle)*r1);
+    zctx.lineTo(cx+Math.cos(angle)*r2,cy+Math.sin(angle)*r2);
+    zctx.strokeStyle=`rgba(79,142,255,${Math.random()*0.15+0.05})`;
+    zctx.lineWidth=Math.random()*2+0.5;
+    zctx.stroke();
+  }
+  gsap.fromTo(zl,{opacity:0},{opacity:1,duration:dur*0.3,ease:'power2.in',
+    onComplete:()=>gsap.to(zl,{opacity:0,duration:dur*0.7,ease:'power2.out',onComplete:()=>{zl.innerHTML='';}})
+  });
+}
+
+// Glow orbs drift
+function glowOrbsOn(){
+  gsap.to('#glowOrb1',{opacity:0.6,duration:2,ease:'power2.out'});
+  gsap.to('#glowOrb2',{opacity:0.5,duration:2,ease:'power2.out',delay:0.3});
+  gsap.to('#glowOrb1',{x:'random(-50,50)',y:'random(-40,40)',duration:6,repeat:-1,yoyo:true,ease:'sine.inOut'});
+  gsap.to('#glowOrb2',{x:'random(-40,60)',y:'random(-50,30)',duration:7,repeat:-1,yoyo:true,ease:'sine.inOut'});
+}
+function glowOrbsOff(){
+  gsap.to('#glowOrb1',{opacity:0,duration:0.5});
+  gsap.to('#glowOrb2',{opacity:0,duration:0.5});
+}
+
+// Light beams — vertical light pillars
+function lightBeams(count=3,dur=1.5,color='79,142,255'){
+  for(let i=0;i<count;i++){
+    const beam=document.createElement('div');
+    beam.className='light-beam';
+    beam.style.left=(15+Math.random()*70)+'%';
+    beam.style.background=`linear-gradient(to bottom,transparent,rgba(${color},.12),rgba(${color},.06),transparent)`;
+    beam.style.width=(2+Math.random()*2)+'px';
+    document.body.appendChild(beam);
+    gsap.fromTo(beam,{opacity:0,scaleY:0},{opacity:0.8,scaleY:1,duration:dur*0.4,delay:i*0.15,ease:'expo.out',
+      onComplete:()=>gsap.to(beam,{opacity:0,duration:dur*0.6,ease:'power2.in',onComplete:()=>beam.remove()})
+    });
+  }
+}
+
+// Camera drift — subtle scene movement for cinematic feel
+function cameraDriftOn(id){
+  const el=document.querySelector(id);
+  if(el) el.classList.add('camera-drift');
+}
+function cameraDriftOff(id){
+  const el=document.querySelector(id);
+  if(el) el.classList.remove('camera-drift');
+}
+
+// Energy ring — expanding ring that leaves a glow trail
+function energyRing(x,y,maxR=300,color='79,142,255',dur=1){
+  const ring=document.createElement('div');
+  ring.style.cssText=`position:fixed;left:${x}px;top:${y}px;width:0;height:0;border-radius:50%;border:2px solid rgba(${color},.5);box-shadow:0 0 20px rgba(${color},.3),inset 0 0 20px rgba(${color},.1);pointer-events:none;z-index:15;transform:translate(-50%,-50%)`;
+  document.body.appendChild(ring);
+  gsap.to(ring,{width:maxR*2,height:maxR*2,opacity:0,borderWidth:0.5,duration:dur,ease:'expo.out',onComplete:()=>ring.remove()});
+}
+
+// Morph transition (circle wipe with custom center)
+function morphTransition(dur=0.6,cx='50%',cy='50%'){
+  const mo=document.getElementById('morphOverlay');
+  mo.style.clipPath=`circle(0% at ${cx} ${cy})`;
+  mo.style.opacity='1';
+  gsap.to(mo,{clipPath:`circle(100% at ${cx} ${cy})`,duration:dur*0.5,ease:'expo.in',
+    onComplete:()=>{
+      gsap.to(mo,{clipPath:`circle(0% at ${cx} ${cy})`,duration:dur*0.5,ease:'expo.out',
+        onComplete:()=>{mo.style.opacity='0';}
+      });
+    }
+  });
+}
+// Radial wipe scene entrance
+function radialWipeIn(id,dur=0.6){
+  const el=document.querySelector(id);
+  if(!el) return;
+  el.style.clipPath='circle(0% at 50% 50%)';
+  el.style.opacity='1';
+  gsap.to(el,{clipPath:'circle(75% at 50% 50%)',duration:dur,ease:'expo.out'});
+}
+
+// ===== Canvas Particle System =====
+const canvas=document.getElementById('bg');
+const ctx=canvas.getContext('2d');
+let W,H;
+function resize(){W=canvas.width=innerWidth;H=canvas.height=innerHeight;}
+resize();window.addEventListener('resize',resize);
+
+class Particle{
+  constructor(layer){
+    this.layer=layer;
+    this.reset();
+  }
+  reset(){
+    this.x=Math.random()*W;
+    this.y=Math.random()*H;
+    this.r=this.layer===0?Math.random()*1.5+0.3:this.layer===1?Math.random()*1+0.2:Math.random()*0.8+0.1;
+    this.vx=(Math.random()-0.5)*(this.layer===0?0.3:0.15);
+    this.vy=(Math.random()-0.5)*(this.layer===0?0.3:0.15);
+    this.alpha=Math.random()*0.3+0.05;
+    this.pulse=Math.random()*Math.PI*2;
+    this.pulseSpeed=Math.random()*0.02+0.005;
+  }
+  update(){
+    this.x+=this.vx;this.y+=this.vy;
+    this.pulse+=this.pulseSpeed;
+    if(this.x<-10||this.x>W+10||this.y<-10||this.y>H+10) this.reset();
+  }
+  draw(){
+    const a=this.alpha*(0.7+0.3*Math.sin(this.pulse));
+    ctx.beginPath();ctx.arc(this.x,this.y,this.r,0,Math.PI*2);
+    ctx.fillStyle=this.layer===0?`rgba(79,142,255,${a})`:this.layer===1?`rgba(168,85,247,${a})`:`rgba(255,107,74,${a})`;
+    ctx.fill();
+  }
+}
+
+const particles=[];
+for(let i=0;i<40;i++) particles.push(new Particle(0));
+for(let i=0;i<30;i++) particles.push(new Particle(1));
+for(let i=0;i<25;i++) particles.push(new Particle(2));
+
+// Burst particles
+let bursts=[];
+function particleBurst(x,y,count=20,color='79,142,255'){
+  for(let i=0;i<count;i++){
+    const angle=Math.random()*Math.PI*2;
+    const speed=Math.random()*3+1;
+    bursts.push({x,y,vx:Math.cos(angle)*speed,vy:Math.sin(angle)*speed,r:Math.random()*2+0.5,life:1,decay:Math.random()*0.02+0.01,color});
+  }
+}
+// Epic burst — larger, with gravity and trails
+function epicBurst(x,y,count=50,color='79,142,255'){
+  for(let i=0;i<count;i++){
+    const angle=Math.random()*Math.PI*2;
+    const speed=Math.random()*6+2;
+    bursts.push({x,y,vx:Math.cos(angle)*speed,vy:Math.sin(angle)*speed-1,r:Math.random()*3+1,life:1.5,decay:Math.random()*0.012+0.005,color,gravity:0.03,trail:true});
+  }
+}
+
+function animateParticles(){
+  ctx.clearRect(0,0,W,H);
+  particles.forEach(p=>{p.update();p.draw();});
+  // Connection lines between nearby particles (network effect)
+  for(let i=0;i<particles.length;i++){
+    for(let j=i+1;j<particles.length;j++){
+      if(particles[i].layer!==particles[j].layer) continue;
+      const dx=particles[i].x-particles[j].x;
+      const dy=particles[i].y-particles[j].y;
+      const dist=dx*dx+dy*dy;
+      if(dist<12000){
+        const a=Math.max(0,(1-dist/12000)*0.06);
+        ctx.beginPath();
+        ctx.moveTo(particles[i].x,particles[i].y);
+        ctx.lineTo(particles[j].x,particles[j].y);
+        ctx.strokeStyle=particles[i].layer===0?`rgba(79,142,255,${a})`:particles[i].layer===1?`rgba(168,85,247,${a})`:`rgba(255,107,74,${a})`;
+        ctx.lineWidth=0.5;
+        ctx.stroke();
+      }
+    }
+  }
+  // Draw bursts
+  for(let i=bursts.length-1;i>=0;i--){
+    const b=bursts[i];
+    b.x+=b.vx;b.y+=b.vy;b.vx*=0.97;b.vy*=0.97;
+    if(b.gravity) b.vy+=b.gravity;
+    b.life-=b.decay;
+    if(b.life<=0){bursts.splice(i,1);continue;}
+    // Trail effect
+    if(b.trail){
+      ctx.beginPath();
+      ctx.moveTo(b.x,b.y);
+      ctx.lineTo(b.x-b.vx*3,b.y-b.vy*3);
+      ctx.strokeStyle=`rgba(${b.color},${b.life*0.3})`;
+      ctx.lineWidth=b.r*b.life*0.5;
+      ctx.stroke();
+    }
+    ctx.beginPath();ctx.arc(b.x,b.y,b.r*b.life,0,Math.PI*2);
+    ctx.fillStyle=`rgba(${b.color},${b.life*0.6})`;ctx.fill();
+  }
+  requestAnimationFrame(animateParticles);
+}
+animateParticles();
+// ===== Light Streak =====
+const lightStreak=document.getElementById('lightStreak');
+function flashStreak(){
+  gsap.fromTo(lightStreak,
+    {opacity:0,background:'linear-gradient(90deg,transparent 0%,rgba(79,142,255,.08) 40%,rgba(168,85,247,.06) 60%,transparent 100%)'},
+    {opacity:1,duration:0.15,yoyo:true,repeat:1,ease:'power2.inOut'}
+  );
+}
+
+// ===== Scene Helpers =====
+function showScene(id,dur=0.5){
+  return gsap.to(id,{opacity:1,duration:dur,ease:'power2.out'});
+}
+function hideScene(id,dur=0.4){
+  return gsap.to(id,{opacity:0,duration:dur,ease:'power2.in'});
+}
+function lineReveal(el,dur=0.6,delay=0){
+  return gsap.fromTo(el,{yPercent:110,opacity:0},{yPercent:0,opacity:1,duration:dur,delay,ease:'expo.out'});
+}
+function fadeUp(el,dur=0.5,delay=0,y=20){
+  return gsap.fromTo(el,{y,opacity:0},{y:0,opacity:1,duration:dur,delay,ease:'expo.out'});
+}
+function scaleIn(el,dur=0.5,delay=0){
+  return gsap.fromTo(el,{scale:0.6,opacity:0},{scale:1,opacity:1,duration:dur,delay,ease:'back.out(1.4)'});
+}
+
+// ===== Gradient Background Color Shifts =====
+const gradBg=document.getElementById('gradBg');
+function setGrad(color1,pos='30% 50%'){
+  gradBg.style.background=`radial-gradient(ellipse at ${pos},${color1},transparent 60%)`;
+}
+
+// ===== Master Timeline =====
+const tl=gsap.timeline({paused:true});
+const DURATION=100;
+
+// Progress bar
+tl.to('#progressBar',{width:'100%',duration:DURATION,ease:'none'},0);
+
+// Time code update
+const timeCodeEl=document.getElementById('timeCode');
+function updateTimeCode(){
+  const t=tl.time();
+  const m=Math.floor(t/60);const s=Math.floor(t%60);
+  const tm=Math.floor(DURATION/60);const ts=Math.floor(DURATION%60);
+  timeCodeEl.textContent=`${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')} / ${String(tm).padStart(2,'0')}:${String(ts).padStart(2,'0')}`;
+}
+gsap.ticker.add(updateTimeCode);
+
+// ========== S0: Logo Reveal (0-5s) — SPECTACULAR Zoom + Shockwave + Comets ==========
+tl.call(()=>{setGrad('rgba(79,142,255,.15)');sfx('rise',0.2);startAmbientFloat();glowOrbsOn();lightBeams(4,1.2);},null,0);
+tl.add(showScene('#s0',0.01),0);
+// Zoom-out reveal: start zoomed in & blurred, expand to normal
+tl.fromTo('#s0',{scale:2.2,filter:'blur(18px)'},{scale:1,filter:'blur(0px)',duration:1.2,ease:'expo.out'},0);
+// Hex grid flash on entry
+tl.call(()=>hexFlash(0.4),null,0.1);
+// Neon lines sweep across
+tl.call(()=>neonLineDraw('#neonLine1',0.5),null,0.3);
+tl.call(()=>neonLineDraw('#neonLine2',0.5),null,0.5);
+tl.fromTo('#s0 .float-dot',{scale:0,opacity:0},{scale:1,opacity:0.3,duration:0.5,stagger:0.08,ease:'back.out(2)'},0.3);
+tl.fromTo('#s0 .float-ring',{scale:0,opacity:0},{scale:1,opacity:0.08,duration:0.6,stagger:0.1,ease:'expo.out'},0.35);
+tl.fromTo('#s0 .float-cross',{rotation:0,opacity:0},{rotation:90,opacity:0.15,duration:0.6,stagger:0.1,ease:'expo.out'},0.4);
+tl.fromTo('#s0 .float-line',{scaleX:0,opacity:0},{scaleX:1,opacity:0.15,duration:0.5,stagger:0.08,ease:'expo.out'},0.45);
+// Logo: character-by-character reveal
+tl.call(()=>charSplitReveal('#logo1',0.6,0.04),null,0.5);
+tl.call(()=>charSplitReveal('#logo2',0.6,0.04),null,0.7);
+// IMPACT: multi-shockwave + epic burst + zoom lines + energy ring
+tl.call(()=>{sfx('hit',0.4);multiShockwave(W/2,H/2,4,600);epicBurst(W/2,H/2,60);drawZoomLines(0.5);energyRing(W/2,H/2,400,'79,142,255',1);},null,1.0);
+tl.to('#heroGlow',{opacity:0.7,scale:1.2,duration:0.8,ease:'expo.out'},0.8);
+tl.add(lineReveal('#s0sub',0.4,0.8),0);
+// Tags wipe in from sides
+tl.call(()=>wipeReveal(document.getElementById('s0t1'),0),null,1.2);
+tl.call(()=>wipeReveal(document.getElementById('s0t2'),0.1),null,1.2);
+tl.call(()=>wipeReveal(document.getElementById('s0t3'),0.2),null,1.2);
+tl.call(()=>wipeReveal(document.getElementById('s0t4'),0.3),null,1.2);
+tl.fromTo('#s0tag1',{x:-30,opacity:0},{x:0,opacity:0.5,duration:0.35},1.8);
+tl.fromTo('#s0tag2',{x:30,opacity:0},{x:0,opacity:0.5,duration:0.35},2.0);
+tl.fromTo('#s0tag3',{x:-30,opacity:0},{x:0,opacity:0.5,duration:0.35},2.2);
+tl.call(()=>particleBurst(W/2,H/2,35),null,0.8);
+tl.to('#beatPulse',{opacity:0.1,duration:0.3},0.5);
+// Spotlight follows logo
+tl.call(()=>moveSpotlight(W/2,H*0.42),null,0.6);
+tl.call(()=>hideSpotlight(),null,4.2);
+tl.call(()=>flashStreak(),null,4.6);
+tl.add(hideScene('#s0',0.3),4.6);
+tl.to('#heroGlow',{opacity:0,scale:0.4,duration:0.4},4.6);
+tl.call(()=>particleBurst(W/2,H/2,20),null,4.8);
+// ========== S1: Opening Question (5-10s) — CountUp + Typewriter ==========
+tl.call(()=>{setGrad('rgba(255,107,74,.1)','50% 40%');sfx('sweep',0.2);glowOrbsOff();},null,5);
+tl.add(showScene('#s1',0.4),5);
+tl.fromTo('#s1 .float-dot',{scale:0},{scale:1,opacity:0.3,duration:0.4,stagger:0.06,ease:'back.out(2)'},5.1);
+tl.fromTo('#s1 .float-ring',{scale:0},{scale:1,opacity:0.08,duration:0.5},5.15);
+tl.fromTo('#s1 .float-cross',{rotation:0,opacity:0},{rotation:90,opacity:0.15,duration:0.5},5.2);
+// Typewriter for the question
+tl.call(()=>typewrite(document.getElementById('s1h1'),'每天，你打开多少个窗口？',0.05,0),null,5.1);
+tl.add(lineReveal('#s1sub1',0.4,0.8),5.1);
+tl.add(lineReveal('#s1sub2',0.4,1.0),5.1);
+// App icons fly in from edges with rotation
+tl.fromTo('#s1a1',{scale:0,rotation:-15,opacity:0},{scale:1,rotation:0,opacity:0.7,duration:0.35,ease:'back.out(1.7)'},5.8);
+tl.fromTo('#s1a2',{scale:0,rotation:10,opacity:0},{scale:1,rotation:0,opacity:0.7,duration:0.35,ease:'back.out(1.7)'},5.95);
+tl.fromTo('#s1a3',{scale:0,rotation:-10,opacity:0},{scale:1,rotation:0,opacity:0.7,duration:0.35,ease:'back.out(1.7)'},6.1);
+tl.fromTo('#s1a4',{scale:0,rotation:15,opacity:0},{scale:1,rotation:0,opacity:0.7,duration:0.35,ease:'back.out(1.7)'},6.25);
+tl.fromTo('#s1a5',{scale:0,rotation:-20,opacity:0},{scale:1,rotation:0,opacity:0.7,duration:0.35,ease:'back.out(1.7)'},6.4);
+// CountUp on stat numbers
+tl.add(scaleIn('#s1c1',0.35,0),6.8);
+tl.add(scaleIn('#s1c2',0.35,0.12),6.8);
+tl.add(scaleIn('#s1c3',0.35,0.24),6.8);
+tl.call(()=>{sfx('pop',0.2);countUp(document.getElementById('s1n1'),0,5,0.8,'+'  );},null,6.8);
+tl.call(()=>countUp(document.getElementById('s1n2'),0,30,0.8,'%'),null,6.95);
+// Stat numbers breathe after counting
+tl.call(()=>{statBreathe('#s1n1');statBreathe('#s1n2');},null,7.8);
+// Infinity symbol scales in with emphasis
+tl.to('#s1n3',{scale:1.2,duration:0.3,ease:'back.out(2)',yoyo:true,repeat:1},7.5);
+tl.call(()=>energyRing(W/2,H/2,250,'255,107,74',0.8),null,7.5);
+// Shake icons to show chaos
+tl.to('#s1a1',{x:-8,y:5,rotation:-5,duration:0.2,yoyo:true,repeat:3,ease:'power1.inOut'},7.5);
+tl.to('#s1a2',{x:6,y:-4,rotation:4,duration:0.2,yoyo:true,repeat:3,ease:'power1.inOut'},7.55);
+tl.to('#s1a3',{x:-5,y:6,rotation:-3,duration:0.2,yoyo:true,repeat:3,ease:'power1.inOut'},7.6);
+tl.to('#s1a4',{x:7,y:-5,rotation:5,duration:0.2,yoyo:true,repeat:3,ease:'power1.inOut'},7.65);
+tl.to('#s1a5',{x:-6,y:4,rotation:-4,duration:0.2,yoyo:true,repeat:3,ease:'power1.inOut'},7.7);
+tl.call(()=>flashStreak(),null,9.6);
+tl.add(hideScene('#s1',0.3),9.6);
+tl.call(()=>{particleBurst(W/2,H/2,15,'255,107,74');shockwave(W/2,H/2,300,'255,107,74',0.6);},null,9.8);
+
+// ========== S2: Word Pain (10-17s) — Glitch + ScreenShake + ErrorFlash ==========
+tl.call(()=>{setGrad('rgba(239,68,68,.1)','40% 50%');sfx('whoosh',0.2);vignetteIntense(true);},null,10);
+tl.add(slideInScene('#s2','left',0.5),10);
+tl.fromTo('#s2 .float-dot',{scale:0},{scale:1,opacity:0.3,duration:0.4},10.1);
+tl.fromTo('#s2 .float-ring',{scale:0},{scale:1,opacity:0.08,duration:0.5},10.15);
+tl.fromTo('#s2 .float-cross',{rotation:0,opacity:0},{rotation:90,opacity:0.15,duration:0.5},10.2);
+// Glitch title entrance
+tl.add(lineReveal('#s2h1',0.4,0),10.1);
+tl.call(()=>glitchOn('#s2h1 span'),null,10.5);
+tl.call(()=>glitchOff('#s2h1 span'),null,11.5);
+tl.add(lineReveal('#s2sub',0.35,0.2),10.1);
+// Version cards slide in with stagger
+tl.fromTo('#v1',{x:-40,opacity:0},{x:0,opacity:0.7,duration:0.25,ease:'expo.out'},10.7);
+tl.fromTo('#v2',{x:-40,opacity:0},{x:0,opacity:0.7,duration:0.25,ease:'expo.out'},10.85);
+tl.fromTo('#v3',{x:40,opacity:0},{x:0,opacity:0.7,duration:0.25,ease:'expo.out'},11.0);
+tl.fromTo('#v4',{x:40,opacity:0},{x:0,opacity:0.7,duration:0.25,ease:'expo.out'},11.15);
+tl.fromTo('#v5',{x:-40,opacity:0},{x:0,opacity:0.8,duration:0.25,ease:'expo.out'},11.3);
+tl.call(()=>sfx('click',0.15),null,10.7);
+tl.call(()=>sfx('click',0.15),null,10.85);
+tl.call(()=>sfx('click',0.15),null,11.0);
+// Screen shake + error flash on the "final" version
+tl.call(()=>{sfx('hit',0.25);screenShake(0.4);},null,11.3);
+tl.to('#errorFlash',{opacity:1,duration:0.08,yoyo:true,repeat:3},11.3);
+tl.call(()=>particleBurst(W*0.18,H*0.52,15,'239,68,68'),null,11.5);
+// Pain cards fade up
+tl.add(fadeUp('#s2p1',0.35,0),12);
+tl.add(fadeUp('#s2p2',0.35,0.2),12);
+tl.add(fadeUp('#s2p3',0.35,0.4),12);
+// Cards shake in frustration + red pulse
+tl.to('.ver-card',{x:'+=4',yoyo:true,repeat:5,duration:0.07,ease:'power1.inOut'},13);
+tl.to('.ver-card.active',{boxShadow:'0 0 20px rgba(239,68,68,.15)',duration:0.3,yoyo:true,repeat:4},13.5);
+tl.call(()=>energyRing(W/2,H/2,200,'239,68,68',0.6),null,13.5);
+tl.call(()=>flashStreak(),null,16.6);
+tl.add(hideScene('#s2',0.3),16.6);
+tl.call(()=>screenShake(0.15),null,16.8); // micro-shake between pain scenes
+
+// ========== S3: Excel Pain (17-24s) — Glitch Errors + CountUp ==========
+tl.call(()=>{setGrad('rgba(245,158,11,.1)','60% 50%');sfx('sweep',0.2);},null,17);
+tl.add(slideInScene('#s3','right',0.5),17);
+tl.fromTo('#s3 .float-dot',{scale:0},{scale:1,opacity:0.3,duration:0.4},17.1);
+tl.fromTo('#s3 .float-ring',{scale:0},{scale:1,opacity:0.08,duration:0.5},17.15);
+tl.add(lineReveal('#s3h1',0.4,0),17.1);
+tl.call(()=>glitchOn('#s3h1 span'),null,17.5);
+tl.call(()=>glitchOff('#s3h1 span'),null,18.5);
+tl.add(lineReveal('#s3sub',0.35,0.2),17.1);
+// Sheet slides up
+tl.fromTo('#s3sheet',{y:30,opacity:0},{y:0,opacity:1,duration:0.5,ease:'expo.out'},17.7);
+tl.call(()=>sfx('pop',0.2),null,17.7);
+// Error cells flash red with screen shake
+tl.fromTo('.sheet-grid .cell.error',{backgroundColor:'rgba(255,50,50,.04)'},{backgroundColor:'rgba(255,50,50,.15)',duration:0.15,stagger:0.04,yoyo:true,repeat:4,ease:'power1.inOut'},18.3);
+tl.call(()=>{sfx('bass',0.2);screenShake(0.3);shockwave(W*0.6,H*0.45,250,'245,158,11',0.5);},null,18.3);
+tl.to('#errorFlash',{opacity:1,duration:0.06,yoyo:true,repeat:2},18.3);
+tl.call(()=>particleBurst(W*0.6,H*0.45,20,'245,158,11'),null,18.8);
+// Pain cards
+tl.add(fadeUp('#s3p1',0.35,0),19);
+tl.add(fadeUp('#s3p2',0.35,0.2),19);
+// CountUp on stats
+tl.add(scaleIn('#s3c1',0.35,0),19.8);
+tl.add(scaleIn('#s3c2',0.35,0.15),19.8);
+tl.call(()=>{sfx('ding',0.15);countUp(document.getElementById('s3n1'),0,47,0.8,'%');},null,19.8);
+tl.call(()=>countUp(document.getElementById('s3n2'),0,3.2,0.8,'h'),null,19.95);
+tl.call(()=>{statBreathe('#s3n1');statBreathe('#s3n2');},null,20.8);
+tl.call(()=>flashStreak(),null,23.6);
+tl.add(hideScene('#s3',0.3),23.6);
+tl.call(()=>screenShake(0.15),null,23.8); // micro-shake between pain scenes
+// ========== S4: PPT Pain (24-31s) — Shake + Glitch ==========
+tl.call(()=>{setGrad('rgba(200,80,40,.1)','50% 50%');sfx('whoosh',0.2);},null,24);
+tl.add(slideInScene('#s4','left',0.5),24);
+tl.fromTo('#s4 .float-dot',{scale:0},{scale:1,opacity:0.3,duration:0.4},24.1);
+tl.fromTo('#s4 .float-ring',{scale:0},{scale:1,opacity:0.08,duration:0.5},24.15);
+tl.fromTo('#s4 .float-cross',{rotation:0,opacity:0},{rotation:90,opacity:0.15,duration:0.5},24.2);
+tl.add(lineReveal('#s4h1',0.4,0),24.1);
+tl.call(()=>glitchOn('#s4h1 span'),null,24.5);
+tl.call(()=>glitchOff('#s4h1 span'),null,25.5);
+tl.add(lineReveal('#s4sub',0.35,0.2),24.1);
+tl.to('#s4grid',{opacity:1,duration:0.2},24.7);
+// Slides pop in with stagger
+tl.fromTo('#s4s1',{y:25,opacity:0},{y:0,opacity:1,duration:0.25,ease:'back.out(1.4)'},24.8);
+tl.fromTo('#s4s2',{y:25,opacity:0},{y:0,opacity:1,duration:0.25,ease:'back.out(1.4)'},24.92);
+tl.fromTo('#s4s3',{y:25,opacity:0},{y:0,opacity:1,duration:0.25,ease:'back.out(1.4)'},25.04);
+tl.fromTo('#s4s4',{y:25,opacity:0},{y:0,opacity:1,duration:0.25,ease:'back.out(1.4)'},25.16);
+tl.fromTo('#s4s5',{y:25,opacity:0},{y:0,opacity:1,duration:0.25,ease:'back.out(1.4)'},25.28);
+tl.fromTo('#s4s6',{y:25,opacity:0},{y:0,opacity:1,duration:0.25,ease:'back.out(1.4)'},25.4);
+tl.call(()=>sfx('pop',0.15),null,24.8);
+// Ugly slides shake violently + screen shake + red border flash
+tl.to('.ppt-slide.ugly',{rotation:()=>gsap.utils.random(-4,4),duration:0.1,stagger:0.03,yoyo:true,repeat:6,ease:'power1.inOut'},26.2);
+tl.to('.ppt-slide.ugly',{borderColor:'rgba(255,50,50,.3)',duration:0.1,yoyo:true,repeat:4},26.2);
+tl.call(()=>{sfx('snap',0.25);screenShake(0.5);multiShockwave(W/2,H*0.4,2,350,'200,80,40');},null,26.2);
+tl.to('#errorFlash',{opacity:1,duration:0.06,yoyo:true,repeat:2},26.2);
+tl.call(()=>particleBurst(W/2,H*0.4,25,'200,80,40'),null,26.5);
+tl.add(fadeUp('#s4p1',0.4,0),27);
+tl.call(()=>flashStreak(),null,30.6);
+tl.add(hideScene('#s4',0.3),30.6);
+
+// ========== S5: Workflow Chaos (31-36s) — ScreenShake + Scatter ==========
+tl.call(()=>{setGrad('rgba(255,80,80,.08)','50% 50%');sfx('bass',0.2);},null,31);
+tl.add(slideInScene('#s5','down',0.4),31);
+tl.add(lineReveal('#s5h1',0.4,0),31.1);
+tl.add(lineReveal('#s5sub',0.3,0.2),31.1);
+// App icons pop in
+tl.fromTo('#s5a1',{scale:0,opacity:0},{scale:1,opacity:0.8,duration:0.3,ease:'back.out(1.7)'},31.5);
+tl.fromTo('#s5a2',{scale:0,opacity:0},{scale:1,opacity:0.8,duration:0.3,ease:'back.out(1.7)'},31.65);
+tl.fromTo('#s5a3',{scale:0,opacity:0},{scale:1,opacity:0.8,duration:0.3,ease:'back.out(1.7)'},31.8);
+tl.fromTo('#s5a4',{scale:0,opacity:0},{scale:1,opacity:0.8,duration:0.3,ease:'back.out(1.7)'},31.95);
+tl.fromTo('#s5a5',{scale:0,opacity:0},{scale:1,opacity:0.8,duration:0.3,ease:'back.out(1.7)'},32.1);
+// Tags appear
+tl.to('#s5t1',{opacity:1,duration:0.15},32.4);
+tl.to('#s5t2',{opacity:1,duration:0.15},32.5);
+tl.to('#s5t3',{opacity:1,duration:0.15},32.6);
+tl.to('#s5t4',{opacity:1,duration:0.15},32.7);
+tl.to('#s5t5',{opacity:1,duration:0.15},32.8);
+// Chaos: icons shake wildly + screen shake + error flash
+tl.to('.app-icon',{x:'random(-18,18)',y:'random(-18,18)',rotation:'random(-25,25)',duration:0.12,stagger:0.03,yoyo:true,repeat:8,ease:'power1.inOut'},33.2);
+tl.call(()=>{sfx('hit',0.3);screenShake(0.6);},null,33.2);
+tl.to('#errorFlash',{opacity:1,duration:0.05,yoyo:true,repeat:4},33.2);
+// Tags shake too
+tl.to('#s5t1,#s5t2,#s5t3,#s5t4,#s5t5',{x:'random(-6,6)',y:'random(-4,4)',duration:0.08,stagger:0.02,yoyo:true,repeat:6,ease:'power1.inOut'},33.5);
+// Scatter explosion: icons fly away
+tl.to('#s5a1',{x:-220,y:-120,opacity:0,rotation:-35,duration:0.35,ease:'power2.in'},34.8);
+tl.to('#s5a2',{x:170,y:-140,opacity:0,rotation:30,duration:0.35,ease:'power2.in'},34.85);
+tl.to('#s5a3',{x:-200,y:110,opacity:0,rotation:-25,duration:0.35,ease:'power2.in'},34.9);
+tl.to('#s5a4',{x:220,y:90,opacity:0,rotation:35,duration:0.35,ease:'power2.in'},34.95);
+tl.to('#s5a5',{x:-180,y:70,opacity:0,rotation:-30,duration:0.35,ease:'power2.in'},35.0);
+tl.call(()=>{sfx('whoosh',0.25);epicBurst(W/2,H/2,35,'255,80,80');cometShower(4);},null,34.8);
+tl.add(hideScene('#s5',0.3),35.6);
+// *** DRAMATIC TURNING POINT: White flash + screen shake + shockwave ***
+tl.call(()=>{whiteFlash(0.5);screenShake(0.3);vignetteIntense(false);multiShockwave(W/2,H/2,3,500,'255,80,80');},null,35.8);
+
+// ========== S6: Transition (36-41s) — SPECTACULAR Turning Point ==========
+tl.call(()=>{sfx('rise',0.3);morphTransition(0.7);},null,35.9);
+// Smooth gradient transition from red to blue (turning point)
+tl.to('#gradBg',{background:'radial-gradient(ellipse at 50% 50%,rgba(79,142,255,.2),transparent 60%)',duration:1.5,ease:'power2.inOut'},36);
+tl.add(showScene('#s6',0.01),36);
+// Dramatic zoom from deep + hex flash
+tl.fromTo('#s6',{scale:2.5,filter:'blur(20px)',opacity:0},{scale:1,filter:'blur(0px)',opacity:1,duration:1,ease:'expo.out'},36);
+tl.call(()=>{hexFlash(0.5);neonLineDraw('#neonLine1',0.6);},null,36.1);
+// Convergence rays with more drama
+tl.fromTo('.conv-ray',{height:0,opacity:0},{height:120,opacity:0.4,duration:0.4,stagger:0.04,ease:'expo.out'},36.3);
+tl.to('.conv-ray',{height:400,opacity:0.08,duration:2,ease:'power1.out'},37);
+// charSplitReveal for "如果"
+tl.call(()=>charSplitReveal('#s6h1',0.5,0.05),null,36.4);
+// Typewriter for the key question with shockwave on finish
+tl.call(()=>typewrite(document.getElementById('s6h2'),'一个窗口就够了呢？',0.06,0),null,36.8);
+tl.call(()=>{sfx('hit',0.45);multiShockwave(W/2,H/2,3,500);epicBurst(W/2,H/2,45);drawZoomLines(0.4);lightBeams(3,1);},null,37.7);
+tl.call(()=>neonLineDraw('#neonLine2',0.5),null,37.9);
+tl.add(lineReveal('#s6sub',0.4,0.8),36.5);
+// Comet shower converging to center
+tl.call(()=>cometShower(5),null,38);
+// Tags wipe in
+tl.call(()=>wipeReveal(document.getElementById('s6t1'),0),null,38.3);
+tl.call(()=>wipeReveal(document.getElementById('s6t2'),0.15),null,38.3);
+tl.call(()=>wipeReveal(document.getElementById('s6t3'),0.3),null,38.3);
+tl.to('#heroGlow',{opacity:0.6,scale:1.1,duration:1,ease:'expo.out'},36.8);
+tl.call(()=>moveSpotlight(W/2,H*0.45),null,37);
+// Second wave of particles
+tl.call(()=>{particleBurst(W*0.3,H*0.5,20,'168,85,247');particleBurst(W*0.7,H*0.5,20,'255,107,74');},null,39);
+tl.call(()=>hideSpotlight(),null,40);
+tl.to('#heroGlow',{opacity:0,scale:0.4,duration:0.5},40.3);
+tl.call(()=>flashStreak(),null,40.6);
+tl.add(hideScene('#s6',0.3),40.6);
+// ========== S7: Editor Assembly (41-52s) — GlowBorder + Typing ==========
+tl.call(()=>{setGrad('rgba(79,142,255,.12)','50% 50%');sfx('chime',0.2);hexFlash(0.3);},null,41);
+tl.add(tiltInScene('#s7',0.5),41);
+tl.add(lineReveal('#s7h1',0.4,0),41.1);
+tl.add(lineReveal('#s7sub',0.3,0.2),41.1);
+// Cinematic letterbox for editor demo
+tl.call(()=>letterboxIn(0.4),null,41.3);
+// Editor zooms in from small
+tl.fromTo('#s7editor',{y:40,scale:0.85,opacity:0,filter:'blur(4px)'},{y:0,scale:1,opacity:1,filter:'blur(0px)',duration:0.7,ease:'expo.out'},41.6);
+tl.call(()=>{sfx('pop',0.2);cameraDriftOn('#s7');},null,41.6);
+// Sidebar files slide in
+tl.fromTo('#s7editor .mock-sidebar .file',{x:-15,opacity:0},{x:0,opacity:1,duration:0.2,stagger:0.06,ease:'expo.out'},42);
+// Content lines wipe in
+tl.fromTo('#s7l1',{scaleX:0},{scaleX:1,duration:0.25,ease:'expo.out'},42.8);
+tl.fromTo('#s7l2',{scaleX:0},{scaleX:1,duration:0.2,ease:'expo.out'},43);
+tl.fromTo('#s7l3',{scaleX:0},{scaleX:1,duration:0.2,ease:'expo.out'},43.12);
+tl.fromTo('#s7l4',{scaleX:0},{scaleX:1,duration:0.2,ease:'expo.out'},43.24);
+tl.fromTo('#s7l5',{scaleX:0},{scaleX:1,duration:0.2,ease:'expo.out'},43.36);
+tl.fromTo('#s7l6',{scaleX:0},{scaleX:1,duration:0.2,ease:'expo.out'},43.48);
+// Chat: user message types in
+tl.fromTo('#s7m1',{x:10,opacity:0},{x:0,opacity:1,duration:0.3,ease:'expo.out'},44);
+tl.call(()=>sfx('click',0.1),null,44);
+// AI response with typing indicator
+tl.fromTo('#s7m2',{x:-10,opacity:0},{x:0,opacity:1,duration:0.3,ease:'expo.out'},44.5);
+tl.to('#s7tp',{opacity:1,duration:0.15},44.9);
+// Cursor blink in editor area while AI edits
+tl.call(()=>{
+  const cursor=document.createElement('div');
+  cursor.id='s7cursor';
+  cursor.style.cssText='position:absolute;left:188px;top:140px;width:2px;height:14px;background:#4f8eff;animation:twBlink 0.6s step-end infinite;z-index:5';
+  document.getElementById('s7editor').appendChild(cursor);
+},null,45);
+tl.to('#s7cursor',{top:170,duration:1.5,ease:'steps(3)'},45.2);
+// Diff reveals with wipe effect
+tl.to('#s7dd1',{opacity:1,duration:0.2},45.3);
+tl.call(()=>wipeReveal(document.getElementById('s7da1'),0),null,45.5);
+tl.call(()=>{sfx('ding',0.15);particleBurst(W*0.5,H*0.5,15,'34,197,94');},null,45.6);
+tl.to('#s7dd2',{opacity:1,duration:0.2},46.2);
+tl.call(()=>wipeReveal(document.getElementById('s7da2'),0),null,46.4);
+tl.call(()=>sfx('ding',0.12),null,46.5);
+tl.to('#s7tp',{opacity:0,duration:0.15},47);
+tl.call(()=>{const c=document.getElementById('s7cursor');if(c)c.remove();},null,47);
+tl.fromTo('#s7m3',{y:5,opacity:0},{y:0,opacity:1,duration:0.3,ease:'expo.out'},47.2);
+tl.call(()=>sfx('chime',0.15),null,47.2);
+// Glow border on editor
+tl.call(()=>{document.getElementById('s7editor').classList.add('glow-border','active');shockwave(W/2,H/2,350,'79,142,255',0.7);},null,48);
+tl.call(()=>wipeReveal(document.getElementById('s7t1'),0),null,48);
+tl.call(()=>wipeReveal(document.getElementById('s7t2'),0.15),null,48);
+tl.call(()=>wipeReveal(document.getElementById('s7t3'),0.3),null,48);
+tl.to('#s7editor',{boxShadow:'0 0 50px rgba(79,142,255,.1)',duration:0.8,yoyo:true,repeat:2},48.5);
+tl.call(()=>document.getElementById('s7editor').classList.remove('active'),null,51);
+tl.call(()=>{letterboxOut(0.3);cameraDriftOff('#s7');},null,51.2);
+tl.call(()=>flashStreak(),null,51.6);
+tl.add(hideScene('#s7',0.3),51.6);
+
+// ========== S8: Diff Philosophy (52-59s) — WipeReveal + CountUp ==========
+tl.call(()=>{setGrad('rgba(34,197,94,.08)','50% 50%');sfx('sweep',0.2);},null,52);
+tl.add(slideInScene('#s8','up',0.5),52);
+tl.fromTo('#s8 .float-dot',{scale:0},{scale:1,opacity:0.3,duration:0.4,stagger:0.06},52.1);
+tl.fromTo('#s8 .float-ring',{scale:0},{scale:1,opacity:0.08,duration:0.5},52.15);
+tl.fromTo('#s8 .float-cross',{rotation:0,opacity:0},{rotation:90,opacity:0.15,duration:0.5},52.2);
+tl.add(lineReveal('#s8h1',0.4,0),52.1);
+tl.add(lineReveal('#s8h2',0.4,0.2),52.1);
+tl.add(lineReveal('#s8sub',0.35,0.4),52.1);
+// Diff pairs: delete fades, add wipes in
+tl.to('#s8d1',{opacity:1,duration:0.2},53);
+tl.call(()=>{sfx('click',0.1);wipeReveal(document.getElementById('s8a1'),0.1);},null,53.2);
+tl.call(()=>{sfx('ding',0.12);particleBurst(W*0.5,H*0.46,12,'34,197,94');},null,53.4);
+tl.to('#s8d2',{opacity:1,duration:0.2},53.8);
+tl.call(()=>{sfx('click',0.1);wipeReveal(document.getElementById('s8a2'),0.1);},null,54);
+tl.call(()=>sfx('ding',0.12),null,54.2);
+tl.to('#s8d3',{opacity:1,duration:0.2},54.6);
+tl.call(()=>{sfx('click',0.1);wipeReveal(document.getElementById('s8a3'),0.1);},null,54.8);
+tl.call(()=>{sfx('ding',0.12);particleBurst(W*0.5,H*0.56,12,'34,197,94');lightBeams(2,1,'34,197,94');},null,55);
+// CountUp on stats
+tl.add(scaleIn('#s8c1',0.35,0),55.8);
+tl.add(scaleIn('#s8c2',0.35,0.15),55.8);
+tl.call(()=>{sfx('pop',0.15);countUp(document.getElementById('s8n1'),0,100,0.8,'%');},null,55.8);
+tl.call(()=>countUp(document.getElementById('s8n2'),10,0,0.6),null,55.95);
+tl.call(()=>{statBreathe('#s8n1');statBreathe('#s8n2');},null,56.8);
+tl.call(()=>pulseRing(W/2,H*0.7,200,'34,197,94'),null,56.5);
+tl.call(()=>flashStreak(),null,58.6);
+tl.add(hideScene('#s8',0.3),58.6);
+// ========== S9: /审查 One More Thing (59-67s) — Typewriter + Spotlight ==========
+tl.call(()=>{setGrad('rgba(79,142,255,.12)','50% 50%');sfx('rise',0.3);morphTransition(0.6);},null,59);
+// Radial wipe entrance for dramatic "One More Thing"
+tl.call(()=>radialWipeIn('#s9',0.7),null,59);
+tl.fromTo('#s9 .float-ring',{scale:0},{scale:1,opacity:0.08,duration:0.5},59.1);
+tl.fromTo('#s9 .float-dot',{scale:0},{scale:1,opacity:0.3,duration:0.4},59.15);
+tl.add(lineReveal('#s9h1',0.4,0),59.15);
+// Typewriter for "/审查" — dramatic reveal
+tl.call(()=>typewrite(document.getElementById('s9h2'),'/审查',0.12,0),null,59.6);
+tl.call(()=>{sfx('hit',0.35);pulseRing(W/2,H*0.4,350);epicBurst(W/2,H*0.4,35);lightBeams(2,1);},null,60.2);
+tl.add(lineReveal('#s9sub',0.4,0.8),59.15);
+// Spotlight follows scan line
+tl.call(()=>moveSpotlight(W/2,H*0.15,0.5),null,60.5);
+tl.to('#s9scan',{opacity:0.7,duration:0.1},60.5);
+tl.to('#s9scan',{top:'100%',duration:1.5,ease:'power1.inOut'},60.5);
+tl.call(()=>moveSpotlight(W/2,H*0.5,0.5),null,61);
+tl.call(()=>moveSpotlight(W/2,H*0.85,0.5),null,61.5);
+tl.to('#s9scan',{opacity:0,duration:0.2},62);
+tl.call(()=>{sfx('sweep',0.2);hideSpotlight();},null,62);
+// Check items appear with ding cascade + green flash
+tl.add(fadeUp('#s9ck1',0.25,0),61.2);
+tl.call(()=>sfx('ding',0.1),null,61.2);
+tl.to('#s9ck1 .ck',{boxShadow:'0 0 12px rgba(34,197,94,.4)',duration:0.2,yoyo:true,repeat:1},61.2);
+tl.add(fadeUp('#s9ck2',0.25,0),61.45);
+tl.call(()=>sfx('ding',0.1),null,61.45);
+tl.to('#s9ck2 .ck',{boxShadow:'0 0 12px rgba(34,197,94,.4)',duration:0.2,yoyo:true,repeat:1},61.45);
+tl.add(fadeUp('#s9ck3',0.25,0),61.7);
+tl.call(()=>sfx('ding',0.1),null,61.7);
+tl.to('#s9ck3 .ck',{boxShadow:'0 0 12px rgba(34,197,94,.4)',duration:0.2,yoyo:true,repeat:1},61.7);
+tl.add(fadeUp('#s9ck4',0.25,0),61.95);
+tl.call(()=>sfx('ding',0.1),null,61.95);
+tl.to('#s9ck4 .ck',{boxShadow:'0 0 12px rgba(34,197,94,.4)',duration:0.2,yoyo:true,repeat:1},61.95);
+tl.add(fadeUp('#s9ck5',0.25,0),62.2);
+tl.call(()=>{sfx('chime',0.2);particleBurst(W/2,H*0.6,20,'34,197,94');},null,62.2);
+tl.to('#s9ck5 .ck',{boxShadow:'0 0 12px rgba(34,197,94,.4)',duration:0.2,yoyo:true,repeat:1},62.2);
+// Badges wipe in
+tl.call(()=>wipeReveal(document.getElementById('s9b1'),0),null,63.2);
+tl.call(()=>wipeReveal(document.getElementById('s9b2'),0.12),null,63.2);
+tl.call(()=>wipeReveal(document.getElementById('s9b3'),0.24),null,63.2);
+tl.call(()=>flashStreak(),null,66.6);
+tl.add(hideScene('#s9',0.3),66.6);
+
+// ========== S10: PPT Generation (67-76s) — GlowSweep + CountUp ==========
+tl.call(()=>{setGrad('rgba(168,85,247,.1)','50% 50%');sfx('whoosh',0.2);},null,67);
+tl.add(tiltInScene('#s10',0.5),67);
+tl.fromTo('#s10 .float-dot',{scale:0},{scale:1,opacity:0.3,duration:0.4},67.1);
+tl.fromTo('#s10 .float-ring',{scale:0},{scale:1,opacity:0.08,duration:0.5},67.15);
+tl.add(lineReveal('#s10h1',0.4,0),67.1);
+tl.add(lineReveal('#s10h2',0.35,0.2),67.1);
+// Pipeline cards appear with glow sweep
+tl.add(fadeUp('#s10p1',0.3,0),68);
+tl.to('#s10a1',{opacity:1,duration:0.12},68.3);
+tl.add(fadeUp('#s10p2',0.3,0),68.5);
+tl.to('#s10a2',{opacity:1,duration:0.12},68.8);
+tl.add(fadeUp('#s10p3',0.3,0),69);
+tl.to('#s10a3',{opacity:1,duration:0.12},69.3);
+tl.add(fadeUp('#s10p4',0.3,0),69.5);
+tl.to('#s10a4',{opacity:1,duration:0.12},69.8);
+tl.add(fadeUp('#s10p5',0.3,0),70);
+tl.call(()=>sfx('pop',0.12),null,68);
+tl.call(()=>sfx('pop',0.12),null,68.5);
+tl.call(()=>sfx('pop',0.12),null,69);
+tl.call(()=>sfx('pop',0.12),null,69.5);
+tl.call(()=>{sfx('chime',0.2);epicBurst(W*0.7,H*0.45,25,'168,85,247');},null,70);
+// Glow sweep across pipeline — sequential activation with glow trail
+tl.to('#s10p1',{borderColor:'rgba(79,142,255,.4)',background:'rgba(79,142,255,.06)',boxShadow:'0 0 15px rgba(79,142,255,.1)',duration:0.15},70.5);
+tl.to('#s10p2',{borderColor:'rgba(79,142,255,.4)',background:'rgba(79,142,255,.06)',boxShadow:'0 0 15px rgba(79,142,255,.1)',duration:0.15},70.65);
+tl.to('#s10p3',{borderColor:'rgba(79,142,255,.4)',background:'rgba(79,142,255,.06)',boxShadow:'0 0 15px rgba(79,142,255,.1)',duration:0.15},70.8);
+tl.to('#s10p4',{borderColor:'rgba(79,142,255,.4)',background:'rgba(79,142,255,.06)',boxShadow:'0 0 15px rgba(79,142,255,.1)',duration:0.15},70.95);
+tl.to('#s10p5',{borderColor:'rgba(79,142,255,.4)',background:'rgba(79,142,255,.06)',boxShadow:'0 0 15px rgba(79,142,255,.1)',duration:0.15},71.1);
+// Arrows glow as pipeline activates
+tl.to('#s10a1',{color:'rgba(79,142,255,.6)',duration:0.1},70.6);
+tl.to('#s10a2',{color:'rgba(79,142,255,.6)',duration:0.1},70.75);
+tl.to('#s10a3',{color:'rgba(79,142,255,.6)',duration:0.1},70.9);
+tl.to('#s10a4',{color:'rgba(79,142,255,.6)',duration:0.1},71.05);
+tl.call(()=>{pulseRing(W*0.7,H*0.45,250,'168,85,247');neonLineDraw('#neonLine1',0.4);energyRing(W/2,H*0.45,300,'168,85,247',0.8);},null,71.2);
+tl.add(lineReveal('#s10sub',0.4,0),71.8);
+// CountUp on stats
+tl.add(scaleIn('#s10c1',0.35,0),72.5);
+tl.add(scaleIn('#s10c2',0.35,0.12),72.5);
+tl.add(scaleIn('#s10c3',0.35,0.24),72.5);
+tl.call(()=>{sfx('ding',0.15);countUp(document.getElementById('s10n1'),0,15,0.8);},null,72.5);
+tl.call(()=>countUp(document.getElementById('s10n2'),10,2,0.8,'','<'),null,72.65);
+tl.call(()=>{statBreathe('#s10n1');statBreathe('#s10n2');},null,73.3);
+// Tags wipe in
+tl.call(()=>wipeReveal(document.getElementById('s10t1'),0),null,73.5);
+tl.call(()=>wipeReveal(document.getElementById('s10t2'),0.12),null,73.5);
+tl.call(()=>wipeReveal(document.getElementById('s10t3'),0.24),null,73.5);
+tl.call(()=>wipeReveal(document.getElementById('s10t4'),0.36),null,73.5);
+tl.call(()=>flashStreak(),null,75.6);
+tl.add(hideScene('#s10',0.3),75.6);
+// ========== S11: Paradigm Shift (76-84s) — ConnLines + Dynamic Badges ==========
+tl.call(()=>{setGrad('rgba(168,85,247,.1)','40% 50%');sfx('rise',0.2);},null,76);
+tl.add(slideInScene('#s11','right',0.5),76);
+tl.fromTo('#s11 .float-dot',{scale:0},{scale:1,opacity:0.3,duration:0.4},76.1);
+tl.fromTo('#s11 .float-ring',{scale:0},{scale:1,opacity:0.08,duration:0.5},76.15);
+tl.fromTo('#s11 .float-cross',{rotation:0,opacity:0},{rotation:90,opacity:0.15,duration:0.5},76.2);
+tl.add(lineReveal('#s11h1',0.4,0),76.1);
+tl.add(lineReveal('#s11h2',0.5,0.2),76.1);
+// Flow rows slide in from left with stagger
+tl.fromTo('#s11f1',{x:-40,opacity:0},{x:0,opacity:1,duration:0.4,ease:'expo.out'},77);
+tl.call(()=>sfx('click',0.1),null,77);
+tl.fromTo('#s11f2',{x:-40,opacity:0},{x:0,opacity:1,duration:0.4,ease:'expo.out'},77.5);
+tl.call(()=>sfx('click',0.1),null,77.5);
+tl.fromTo('#s11f3',{x:-40,opacity:0},{x:0,opacity:1,duration:0.4,ease:'expo.out'},78);
+tl.call(()=>{sfx('click',0.1);particleBurst(W/2,H*0.55,15,'168,85,247');},null,78);
+// Highlight nodes glow
+tl.to('.flow-node.highlight',{boxShadow:'0 0 25px rgba(79,142,255,.2)',duration:0.3,yoyo:true,repeat:4},78.6);
+// Flow arrows pulse
+tl.to('.flow-arrow',{color:'rgba(79,142,255,.5)',scale:1.3,duration:0.2,stagger:0.05,yoyo:true,repeat:3,ease:'power1.inOut'},78.8);
+tl.call(()=>moveSpotlight(W/2,H*0.5),null,78.5);
+// Badges fly in from different directions
+tl.fromTo('#s11b1',{x:-30,scale:0.5,opacity:0},{x:0,scale:1,opacity:1,duration:0.3,ease:'back.out(1.5)'},79.8);
+tl.fromTo('#s11b2',{y:20,scale:0.5,opacity:0},{y:0,scale:1,opacity:1,duration:0.3,ease:'back.out(1.5)'},79.95);
+tl.fromTo('#s11b3',{x:30,scale:0.5,opacity:0},{x:0,scale:1,opacity:1,duration:0.3,ease:'back.out(1.5)'},80.1);
+tl.fromTo('#s11b4',{y:-20,scale:0.5,opacity:0},{y:0,scale:1,opacity:1,duration:0.3,ease:'back.out(1.5)'},80.25);
+tl.fromTo('#s11b5',{x:-30,scale:0.5,opacity:0},{x:0,scale:1,opacity:1,duration:0.3,ease:'back.out(1.5)'},80.4);
+tl.fromTo('#s11b6',{x:30,scale:0.5,opacity:0},{x:0,scale:1,opacity:1,duration:0.3,ease:'back.out(1.5)'},80.55);
+tl.call(()=>sfx('pop',0.12),null,79.8);
+tl.call(()=>sfx('pop',0.12),null,80.1);
+tl.call(()=>{sfx('chime',0.15);pulseRing(W/2,H*0.7,250,'168,85,247');},null,80.55);
+tl.call(()=>hideSpotlight(),null,83);
+tl.call(()=>flashStreak(),null,83.6);
+tl.add(hideScene('#s11',0.3),83.6);
+// *** Brief dramatic pause before finale ***
+tl.call(()=>{whiteFlash(0.4);epicBurst(W/2,H/2,30);},null,83.8);
+
+// ========== S12: Finale (84-100s) — SPECTACULAR Grand Finale ==========
+tl.call(()=>{setGrad('rgba(79,142,255,.15)','50% 50%');sfx('rise',0.3);morphTransition(0.8);},null,83.9);
+tl.add(showScene('#s12',0.01),84);
+// Epic zoom-in from far away with hex flash
+tl.fromTo('#s12',{scale:0.2,filter:'blur(20px)',opacity:0},{scale:1,filter:'blur(0px)',opacity:1,duration:1.4,ease:'expo.out'},84);
+tl.call(()=>{hexFlash(0.5);neonLineDraw('#neonLine1',0.6);neonLineDraw('#neonLine2',0.6);cameraDriftOn('#s12');},null,84.1);
+// Orbit rings expand with stagger
+tl.fromTo('#orb1',{scale:0.2,opacity:0},{scale:1,opacity:0.1,duration:0.8,ease:'expo.out'},84.3);
+tl.fromTo('#orb2',{scale:0.2,opacity:0},{scale:1,opacity:0.08,duration:1,ease:'expo.out'},84.4);
+tl.fromTo('#orb3',{scale:0.2,opacity:0},{scale:1,opacity:0.06,duration:1.2,ease:'expo.out'},84.5);
+tl.fromTo('#orb4',{scale:0.2,opacity:0},{scale:1,opacity:0.04,duration:1.4,ease:'expo.out'},84.6);
+tl.fromTo('#s12 .float-dot',{scale:0},{scale:1,opacity:0.3,duration:0.5,stagger:0.1,ease:'back.out(2)'},84.7);
+tl.fromTo('#s12 .float-cross',{rotation:0,opacity:0},{rotation:90,opacity:0.15,duration:0.6,stagger:0.12},84.9);
+// Logo reveal with charSplitReveal instead of lineReveal
+tl.call(()=>charSplitReveal('#s12h1',0.8,0.04),null,84.8);
+// Impact moment: shockwave + epicBurst + zoom lines + light beams
+tl.call(()=>{sfx('hit',0.5);multiShockwave(W/2,H/2,4,600);epicBurst(W/2,H/2,70);drawZoomLines(0.5);lightBeams(5,1.5);},null,85.4);
+// Comet shower for spectacle
+tl.call(()=>cometShower(8),null,85.8);
+// Add text glow to logo
+tl.call(()=>document.getElementById('s12h1').classList.add('text-glow'),null,86);
+// Slow cinematic drift zoom on logo
+tl.to('#s12h1',{scale:1.05,duration:8,ease:'sine.inOut',yoyo:true,repeat:-1},86.5);
+tl.to('#heroGlow',{opacity:0.8,scale:1.3,duration:1.5,ease:'expo.out'},85);
+// Glow orbs intensify
+tl.call(()=>glowOrbsOn(),null,85);
+// Subtitles
+tl.add(lineReveal('#s12sub1',0.5,0.9),84.8);
+tl.add(lineReveal('#s12sub2',0.5,1.2),84.8);
+// Tags wipe in
+tl.call(()=>wipeReveal(document.getElementById('s12t1'),0),null,86.5);
+tl.call(()=>wipeReveal(document.getElementById('s12t2'),0.15),null,86.5);
+tl.call(()=>wipeReveal(document.getElementById('s12t3'),0.3),null,86.5);
+tl.call(()=>sfx('chime',0.15),null,86.5);
+// CTA tag pulse
+tl.to('#s12t1',{boxShadow:'0 0 15px rgba(79,142,255,.3)',duration:0.5,yoyo:true,repeat:-1,ease:'sine.inOut'},87);
+// CountUp on final stats
+tl.add(scaleIn('#s12c1',0.4,0),87.5);
+tl.add(scaleIn('#s12c2',0.4,0.15),87.5);
+tl.add(scaleIn('#s12c3',0.4,0.3),87.5);
+tl.call(()=>{sfx('shimmer',0.2);countUp(document.getElementById('s12n1'),0,3,0.6);},null,87.5);
+tl.call(()=>countUp(document.getElementById('s12n2'),0,1,0.4),null,87.65);
+tl.call(()=>{statBreathe('#s12n1');statBreathe('#s12n2');statBreathe('#s12n3');},null,88.2);
+// Orbit rotations with parallax depth
+tl.to('#orb1',{rotation:360,duration:16,ease:'none',repeat:-1},84.8);
+tl.to('#orb2',{rotation:-360,duration:22,ease:'none',repeat:-1},84.8);
+tl.to('#orb3',{rotation:360,duration:30,ease:'none',repeat:-1},84.8);
+tl.to('#orb4',{rotation:-360,duration:40,ease:'none',repeat:-1},84.8);
+// Subtle orbit breathing
+tl.to('#orb1',{scale:1.05,opacity:0.12,duration:2,yoyo:true,repeat:-1,ease:'sine.inOut'},85);
+tl.to('#orb2',{scale:1.03,opacity:0.08,duration:2.5,yoyo:true,repeat:-1,ease:'sine.inOut'},85.2);
+tl.to('#orb3',{scale:1.02,opacity:0.06,duration:3,yoyo:true,repeat:-1,ease:'sine.inOut'},85.4);
+// Particle burst cascade with epicBurst
+tl.call(()=>{epicBurst(W*0.3,H*0.4,25,'168,85,247');multiShockwave(W*0.3,H*0.4,2,300,'168,85,247');energyRing(W*0.3,H*0.4,250,'168,85,247',0.8);},null,88.5);
+tl.call(()=>{epicBurst(W*0.7,H*0.6,25,'255,107,74');multiShockwave(W*0.7,H*0.6,2,300,'255,107,74');energyRing(W*0.7,H*0.6,250,'255,107,74',0.8);},null,89.5);
+tl.call(()=>{hexFlash(0.3);epicBurst(W/2,H/2,40);multiShockwave(W/2,H/2,3,400);lightBeams(4,1.2);},null,91);
+// Neon lines sweep again
+tl.call(()=>{neonLineDraw('#neonLine1',0.5);neonLineDraw('#neonLine2',0.5);},null,91.5);
+// Spotlight on logo
+tl.call(()=>moveSpotlight(W/2,H*0.4,0.7),null,92);
+tl.to('#heroGlow',{opacity:0.9,scale:1.5,duration:2,ease:'power1.inOut',yoyo:true,repeat:2},92);
+// More comet showers
+tl.call(()=>cometShower(6),null,93);
+tl.call(()=>{epicBurst(W*0.4,H*0.3,20);shootComet(0,H*0.3,W,H*0.5,'#a855f7',0.8);},null,94);
+tl.call(()=>{epicBurst(W*0.6,H*0.7,20,'168,85,247');shootComet(W,H*0.6,0,H*0.4,'#ff6b4a',0.8);},null,95.5);
+// Grand finale burst
+tl.call(()=>{drawZoomLines(0.5);epicBurst(W/2,H/2,80);multiShockwave(W/2,H/2,5,700);hexFlash(0.4);lightBeams(6,2);energyRing(W/2,H/2,500,'79,142,255',1.2);energyRing(W/2,H/2,400,'168,85,247',1);},null,97);
+tl.call(()=>cometShower(10),null,97.5);
+tl.call(()=>hideSpotlight(),null,99);
+// End
+tl.call(()=>{
+  stopBGM();
+  glowOrbsOff();
+  document.getElementById('replayOverlay').style.display='flex';
+  gsap.fromTo('#replayOverlay',{opacity:0},{opacity:1,duration:0.8});
+},null,99.5);
+// ===== Controls =====
+const playPauseBtn=document.getElementById('playPauseBtn');
+const restartBtn=document.getElementById('restartBtn');
+const soundToggleBtn=document.getElementById('soundToggle');
+const replayBtn=document.getElementById('replayBtn');
+let isPlaying=false;
+
+playPauseBtn.addEventListener('click',()=>{
+  if(isPlaying){tl.pause();stopBGM();playPauseBtn.textContent='▶';isPlaying=false;}
+  else{tl.play();if(soundOn)startBGM();playPauseBtn.textContent='⏸';isPlaying=true;}
+});
+
+soundToggleBtn.addEventListener('click',()=>{
+  soundOn=!soundOn;
+  soundToggleBtn.textContent=soundOn?'🔊 音效':'🔇 静音';
+  bgm.volume=soundOn?0.5:0;
+  if(soundOn&&isPlaying&&!bgmPlaying){startBGM();}
+});
+
+function restart(){
+  // Kill all tweens and reset
+  tl.pause().time(0);
+  stopBGM();
+  bursts=[];
+  killAmbientFloat();
+  glowOrbsOff();
+  // Reset all scenes
+  gsap.set('.scene',{opacity:0,scale:1,filter:'blur(0px)',x:0,y:0,rotationY:0});
+  gsap.set('#heroGlow',{opacity:0,scale:0.4});
+  gsap.set('#beatPulse',{opacity:0});
+  // Reset all animated elements
+  gsap.set(['.float-dot','.float-ring','.float-cross','.float-line'],{opacity:0,scale:0});
+  gsap.set(['.ver-card','.pain-card','.counter-box','.cap-badge','.check-item','.pipe-card','.pipe-arrow','.flow-row','.orbit-ring'],{opacity:0});
+  gsap.set(['.app-icon'],{opacity:0,x:0,y:0,rotation:0,scale:0});
+  gsap.set(['.diff-add','.diff-del','.mock-chat .msg','.mock-chat .typing'],{opacity:0});
+  gsap.set('#s3sheet',{opacity:0});
+  gsap.set('#s4grid',{opacity:0});
+  gsap.set('.ppt-slide',{opacity:0,rotation:0});
+  gsap.set('.ver-card',{boxShadow:'none'});
+  gsap.set('.conv-ray',{opacity:0,height:0});
+  gsap.set('#s9scan',{opacity:0,top:0});
+  gsap.set('.mock-editor',{opacity:0,filter:'blur(0px)',boxShadow:'none'});
+  gsap.set(['.mock-main .line'],{scaleX:0});
+  gsap.set('#progressBar',{width:0});
+  gsap.set(['#s0tag1','#s0tag2','#s0tag3'],{opacity:0});
+  gsap.set(['#s0t1','#s0t2','#s0t3','#s0t4','#s5t1','#s5t2','#s5t3','#s5t4','#s5t5','#s6t1','#s6t2','#s6t3','#s7t1','#s7t2','#s7t3','#s10t1','#s10t2','#s10t3','#s10t4','#s12t1','#s12t2','#s12t3'],{opacity:0,x:0,y:0});
+  gsap.set('#errorFlash',{opacity:0});
+  gsap.set('#spotlight',{opacity:0});
+  gsap.set('#whiteFlash',{opacity:0});
+  gsap.set('#lbTop',{height:0});
+  gsap.set('#lbBottom',{height:0});
+  // Remove wipe-reveal classes
+  document.querySelectorAll('.wipe-reveal').forEach(el=>{el.classList.remove('wipe-reveal','revealed');});
+  // Remove glitch classes
+  document.querySelectorAll('.glitch').forEach(el=>el.classList.remove('glitch'));
+  // Remove glow-border active
+  document.querySelectorAll('.glow-border.active').forEach(el=>el.classList.remove('active'));
+  // Remove tw-cursor
+  document.querySelectorAll('.tw-cursor').forEach(el=>el.classList.remove('tw-cursor'));
+  // Remove text-glow
+  document.querySelectorAll('.text-glow').forEach(el=>el.classList.remove('text-glow'));
+  // Reset clip-path on scenes (radial wipe)
+  document.querySelectorAll('.scene').forEach(el=>{el.style.clipPath='';});
+  // Remove pulse rings
+  document.querySelectorAll('.pulse-ring').forEach(el=>el.remove());
+  // Remove stat breathe
+  document.querySelectorAll('.stat-breathe').forEach(el=>el.classList.remove('stat-breathe'));
+  // Remove camera drift & vignette intense
+  document.querySelectorAll('.camera-drift').forEach(el=>el.classList.remove('camera-drift'));
+  vignetteEl.classList.remove('vignette-intense');
+  // Remove dynamic energy rings
+  document.querySelectorAll('[style*="box-shadow"][style*="border-radius: 50%"]').forEach(el=>{if(el.style.zIndex==='15')el.remove();});
+  // Remove dynamic cursor
+  const s7c=document.getElementById('s7cursor');if(s7c)s7c.remove();
+  // Reset flow arrows & check marks
+  gsap.set('.flow-arrow',{color:'rgba(255,255,255,.1)',scale:1});
+  gsap.set('.check-item .ck',{boxShadow:'none'});
+  gsap.set('.ppt-slide.ugly',{borderColor:'rgba(255,100,50,.15)'});
+  gsap.set('.pipe-card',{borderColor:'rgba(255,255,255,.06)',background:'rgba(255,255,255,.03)',boxShadow:'none'});
+  gsap.set('.pipe-arrow',{color:'rgba(255,255,255,.1)'});
+  gsap.set('#s12t1',{boxShadow:'none'});
+  gsap.set('#s12h1',{scale:1});
+  gsap.set('#s1n3',{scale:1});
+  gsap.set(['#orb1','#orb2','#orb3','#orb4'],{scale:1,rotation:0});
+  // Clean up stunning effects
+  document.querySelectorAll('.shockwave,.comet,.light-beam').forEach(el=>el.remove());
+  gsap.set('#morphOverlay',{opacity:0,clipPath:'circle(0% at 50% 50%)'});
+  gsap.set('#zoomLines',{opacity:0});
+  document.getElementById('zoomLines').innerHTML='';
+  gsap.set('#hexFlash',{opacity:0});
+  gsap.set('#glowOrb1',{opacity:0,x:0,y:0});
+  gsap.set('#glowOrb2',{opacity:0,x:0,y:0});
+  gsap.set('#neonLine1',{scaleX:0,opacity:0});
+  gsap.set('#neonLine2',{scaleX:0,opacity:0});
+  // Restore char-split elements to original text
+  document.querySelectorAll('.char-split').forEach(el=>{
+    el.classList.remove('char-split');
+    const txt=Array.from(el.querySelectorAll('.char')).map(c=>c.textContent).join('');
+    el.innerHTML='';el.textContent=txt;
+  });
+  // Reset counter text
+  const resets={'s1n1':'5+','s1n2':'30%','s1n3':'∞','s3n1':'47%','s3n2':'3.2h','s8n1':'100%','s8n2':'0','s10n1':'15','s10n2':'<2','s10n3':'∞','s12n1':'3','s12n2':'1','s12n3':'∞'};
+  Object.entries(resets).forEach(([id,txt])=>{const el=document.getElementById(id);if(el)el.textContent=txt;});
+  // Reset typewriter text
+  const twResets={'s1h1':'每天，你打开多少个窗口？','s6h1':'如果','s6h2':'一个窗口就够了呢？','s9h2':'/审查','s12h1':'Word-Cursor','logo1':'Word','logo2':'Cursor'};
+  Object.entries(twResets).forEach(([id,txt])=>{const el=document.getElementById(id);if(el)el.textContent=txt;});
+  // Hide replay overlay
+  document.getElementById('replayOverlay').style.display='none';
+  // Play
+  setTimeout(()=>{
+    tl.play();
+    if(soundOn) startBGM();
+    isPlaying=true;
+    playPauseBtn.textContent='⏸';
+  },100);
+}
+
+restartBtn.addEventListener('click',restart);
+replayBtn.addEventListener('click',restart);
+
+// ===== Boot Sequence =====
+window.addEventListener('load',()=>{
+  setTimeout(()=>{
+    const loader=document.getElementById('loader');
+    loader.style.opacity='0';
+    setTimeout(()=>{
+      loader.style.display='none';
+      tl.play();
+      if(soundOn) startBGM();
+      isPlaying=true;
+    },600);
+  },800);
+});
+</script>
+</body>
+</html>

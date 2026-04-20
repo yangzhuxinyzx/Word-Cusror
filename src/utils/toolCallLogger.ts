@@ -108,6 +108,8 @@ class ToolCallLogger {
     systemPromptLength: number
     temperature?: number
     maxTokens?: number
+    nativeToolsCount?: number
+    nativeToolProvider?: string
   }) {
     this.log({ type: 'api_request', data: info })
   }

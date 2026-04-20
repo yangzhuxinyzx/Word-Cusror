@@ -81,16 +81,16 @@
 
   /* Border light（用于细分隔线） */
   --border-light: rgba(255, 255, 255, 0.08);
-  --word-canvas-bg: #1e1e1e;
-  --word-page-bg: #2b2b2b;
-  --word-page-border: rgba(255, 255, 255, 0.08);
-  --word-page-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
-  --word-rule: rgba(255, 255, 255, 0.16);
-  --word-ink: rgba(255, 255, 255, 0.9);
-  --word-ink-muted: rgba(255, 255, 255, 0.55);
-  --word-font-family-cn: "DengXian", "SimSun", "Songti SC", "Microsoft YaHei", serif;
-  --word-font-size: 14px; /* 10.5pt @ 96 DPI */
-  --word-line-height: 1.15;
+  --word-canvas-bg: #e7e7e7;
+  --word-page-bg: #ffffff;
+  --word-page-border: rgba(0, 0, 0, 0.12);
+  --word-page-shadow: 0 10px 28px rgba(0, 0, 0, 0.12);
+  --word-rule: rgba(0, 0, 0, 0.22);
+  --word-ink: rgba(0, 0, 0, 0.9);
+  --word-ink-muted: rgba(0, 0, 0, 0.55);
+  --word-font-family-cn: "STSong", "Songti SC", "SimSun", serif;
+  --word-font-size: 13.33px; /* 10pt @ 96 DPI，默认更接近 WPS 中文正文观感 */
+  --word-line-height: 1.08;
   --a4-width: 793.7px;  /* 210mm @ 96 DPI */
   --a4-height: 1122.5px; /* 297mm @ 96 DPI */
 
@@ -118,13 +118,13 @@
   --surface-hover: rgba(255, 255, 255, 0.06);
   --surface-active: rgba(255, 255, 255, 0.10);
   --border-light: rgba(255, 255, 255, 0.08);
-  --word-canvas-bg: #1c1c1c;
-  --word-page-bg: #2a2a2a;
-  --word-page-border: rgba(255, 255, 255, 0.08);
-  --word-page-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
-  --word-rule: rgba(255, 255, 255, 0.16);
-  --word-ink: rgba(255, 255, 255, 0.9);
-  --word-ink-muted: rgba(255, 255, 255, 0.55);
+  --word-canvas-bg: #e2e2e2;
+  --word-page-bg: #ffffff;
+  --word-page-border: rgba(0, 0, 0, 0.14);
+  --word-page-shadow: 0 12px 30px rgba(0, 0, 0, 0.16);
+  --word-rule: rgba(0, 0, 0, 0.22);
+  --word-ink: rgba(0, 0, 0, 0.9);
+  --word-ink-muted: rgba(0, 0, 0, 0.55);
 
 
   --wallpaper-vignette-top: rgb(0 0 0 / 0.32);
@@ -220,8 +220,8 @@ input, textarea, select, button {
 
 .glass {
   background: var(--glass-bg);
-  backdrop-filter: blur(var(--glass-blur)) saturate(180%);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(180%);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   border: 1px solid var(--glass-border);
   box-shadow: 
     0 14px 40px rgba(0, 0, 0, 0.24),
@@ -231,8 +231,8 @@ input, textarea, select, button {
 
 .glass-card {
   background: linear-gradient(145deg, rgb(255 255 255 / 0.075) 0%, rgb(255 255 255 / 0.03) 100%);
-  backdrop-filter: blur(36px) saturate(180%);
-  -webkit-backdrop-filter: blur(36px) saturate(180%);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   border: 1px solid var(--glass-border);
   border-radius: 24px;
   box-shadow: 
@@ -244,8 +244,8 @@ input, textarea, select, button {
 
 .glass-card-soft {
   background: rgb(255 255 255 / 0.035);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   border: 1px solid var(--glass-border);
   border-radius: 20px;
   box-shadow: 
@@ -256,15 +256,15 @@ input, textarea, select, button {
 
 .glass-panel {
   background: var(--glass-bg);
-  backdrop-filter: blur(48px) saturate(190%);
-  -webkit-backdrop-filter: blur(48px) saturate(190%);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   border-right: 1px solid var(--glass-border);
 }
 
 .glass-button {
   background: rgba(255, 255, 255, 0.06);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   border: 1px solid var(--glass-border);
   transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -278,8 +278,8 @@ input, textarea, select, button {
 
 .glass-input {
   background: rgba(0, 0, 0, 0.25);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   border: 1px solid rgba(255, 255, 255, 0.08);
   transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -533,6 +533,18 @@ input, textarea, select, button {
   display: inline !important;
 }
 
+.diff-change-pair {
+  display: inline-flex !important;
+  align-items: baseline;
+  gap: 4px;
+  vertical-align: baseline;
+  flex-wrap: wrap;
+}
+
+.diff-old + .diff-new {
+  margin-left: 4px !important;
+}
+
 /* ========================================
    Word 编辑器样式
    ======================================== */
@@ -559,34 +571,34 @@ input, textarea, select, button {
 }
 
 .word-editor-content p {
-  text-indent: 2em;
-  line-height: 1.8;
-  margin-bottom: 0.5em;
+  text-indent: 0;
+  line-height: inherit;
+  margin-bottom: 0;
 }
 
 .word-editor-content h1,
 .word-editor-content h2,
 .word-editor-content h3 {
   text-indent: 0 !important;
-  font-weight: bold;
+  font-weight: inherit;
 }
 
 .word-editor-content h1 {
-  font-size: 22pt;
-  line-height: 1.5;
-  margin: 24pt 0 12pt 0;
+  font-size: inherit;
+  line-height: inherit;
+  margin: 0;
 }
 
 .word-editor-content h2 {
-  font-size: 16pt;
-  line-height: 1.5;
-  margin: 18pt 0 9pt 0;
+  font-size: inherit;
+  line-height: inherit;
+  margin: 0;
 }
 
 .word-editor-content h3 {
-  font-size: 14pt;
-  line-height: 1.5;
-  margin: 12pt 0 6pt 0;
+  font-size: inherit;
+  line-height: inherit;
+  margin: 0;
 }
 
 /* ========================================

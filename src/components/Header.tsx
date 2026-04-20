@@ -10,7 +10,7 @@ import {
   Share2,
   Sparkles
 } from 'lucide-react'
-import { useDocument } from '../context/DocumentContext'
+import { useDocument } from '../context/useDocument'
 import { useCallback, useState } from 'react'
 
 interface HeaderProps {
@@ -28,7 +28,16 @@ export default function Header({
   onToggleChat,
   onOpenSettings,
 }: HeaderProps) {
-  const { document, saveDocument, hasUnsavedChanges, isElectron, openFolder } = useDocument()
+  const {
+    document,
+    saveDocument,
+    hasUnsavedChanges,
+    isElectron,
+    openFolder,
+    currentFile,
+    effectiveWorkspacePath,
+    sessionMode,
+  } = useDocument()
   const [isSaving, setIsSaving] = useState(false)
 
   const handleSave = useCallback(async () => {
@@ -73,6 +82,14 @@ export default function Header({
           ) : (
             <span className="flex items-center gap-1.5 text-[10px] px-2.5 py-1 rounded-full bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 text-text-dim font-medium">
               已保存
+            </span>
+          )}
+          {currentFile && effectiveWorkspacePath && (
+            <span
+              className="flex items-center gap-1.5 text-[10px] px-2.5 py-1 rounded-full bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 text-text-dim font-medium"
+              title={effectiveWorkspacePath}
+            >
+              {sessionMode === 'single-file' ? '轻工作区' : '工作区'}
             </span>
           )}
         </div>

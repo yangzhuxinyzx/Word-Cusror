@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, type ReactNode } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo, type ReactNode } from 'react'
 import { 
   Send,
   FileText,
@@ -22,7 +22,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useAI, ToolResult, type AgentDebugEvent } from '../context/AIContext'
-import { useDocument } from '../context/DocumentContext'
+import { useDocument } from '../context/useDocument'
 import { FileItem, AgentStep, AgentFileChange, ChatMessage } from '../types'
 import { runWebSearch, WebSearchResponse } from '../utils/webSearch'
 import { parseDocxToHtmlForAgent } from '../utils/docxParser'
@@ -36,8 +36,23 @@ import type { ChartConfig, ChartSeries } from '../utils/chartParser'
 import { toolCallLogger } from '../utils/toolCallLogger'
 import { htmlToDsl } from '../utils/htmlToDsl'
 import { serializeDslForAI } from '../utils/dslSerializer'
-import JSZip from 'jszip'
+import { createLegacyXmlToolBlockRegex } from '../agent/compat/legacyTools'
 import CinematicTyper from './CinematicTyper'
+import { createPhaseOneToolExecutor } from '../agent/adapters/chatPanel/createPhaseOneToolExecutor'
+import { createDocumentAgentAdapter } from '../agent/adapters/document/DocumentAgentAdapter'
+import { ExcelDomainAdapter } from '../agent/adapters/excel/ExcelDomainAdapter'
+import { PptDomainAdapter } from '../agent/adapters/ppt/PptDomainAdapter'
+import { WorkspaceDomainAdapter } from '../agent/adapters/workspace/WorkspaceDomainAdapter'
+import { WorkspaceSummaryAdapter } from '../agent/adapters/workspace/WorkspaceSummaryAdapter'
+import { BUILTIN_SKILLS } from '../agent/skills/builtinSkills'
+import { SkillExecutor } from '../agent/skills/SkillExecutor'
+import type { AgentSkillDefinition } from '../agent/skills/SkillRegistry'
+import { SkillRegistry } from '../agent/skills/SkillRegistry'
+import { WorkspaceSkillLoader } from '../agent/skills/WorkspaceSkillLoader'
+import {
+  parseSubagentCommand,
+  SubagentWorkflowRunner,
+} from '../agent/subagents/SubagentWorkflowRunner'
 
 type PptOutlineSlideDraft = {
   pageNumber: number
@@ -51,7 +66,7 @@ type PptOutlineSlideDraft = {
 
 const TOOL_CALL_BLOCK_REGEX = /\[TOOL_CALL\][\s\S]*?\[\/TOOL_CALL\]/g
 const TOOL_RESULT_BLOCK_REGEX = /\[TOOL_RESULT\][\s\S]*?\[\/TOOL_RESULT\]/g
-const LEGACY_XML_TOOL_BLOCK_REGEX = /<((?:replace|review|insert|delete|word_edit_ops|create|copy_template|create_from_template|ppt_create|ppt_edit|workspace_list|workspace_open|workspace_summarize|workspace_read|web_search|excel_read|excel_search|excel_write|excel_insert_rows|excel_insert_columns|excel_delete_rows|excel_delete_columns|excel_add_sheet|excel_delete_sheet|excel_merge|excel_unmerge|excel_create|excel_formula|excel_sort|excel_autofill|excel_dimensions|excel_conditional_format|excel_calculate|excel_filter|excel_validation|excel_hyperlink|excel_find_replace|excel_chart))>[\s\S]*?<\/\1>/gi
+const LEGACY_XML_TOOL_BLOCK_REGEX = createLegacyXmlToolBlockRegex()
 const TOOL_USE_BLOCK_REGEX = /<tool_use>[\s\S]*?<\/tool_use>/gi
 
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -246,7 +261,11 @@ const formatAgentDebugEventMarkdown = (event: AgentDebugEvent): string => {
       ].join('\n')
 
     case 'api_response_raw': {
-      const rawResponse = event.rawResponse ?? event.response ?? ''
+      const rawResponseValue = event.rawResponse ?? event.response ?? ''
+      const rawResponse =
+        typeof rawResponseValue === 'string'
+          ? rawResponseValue
+          : stringifyDebugData(rawResponseValue)
       const cleanedResponse = event.response || ''
       const isIdentical = rawResponse === cleanedResponse
 
@@ -658,7 +677,31 @@ const formatSearchResults = (response: WebSearchResponse, query: string) => {
 }
 
 export default function ChatPanel() {
-  const { messages, isLoading, streamingContent, streamingReasoning, editPhase, streamingSummary, settings, addMessage, sendAgentMessage, clearMessages, stopGeneration } = useAI()
+  const {
+    messages,
+    isLoading,
+    streamingContent,
+    streamingReasoning,
+    editPhase,
+    streamingSummary,
+    settings,
+    addMessage,
+    sendAgentMessage,
+    clearMessages,
+    stopGeneration,
+    recordRuntimeToolExecution,
+    syncRuntimeTools,
+    syncRuntimeSkills,
+    getAgentRuntimeSnapshot,
+    spawnRuntimeSubagent,
+    startRuntimeSubagent,
+    completeRuntimeSubagent,
+    failRuntimeSubagent,
+    cancelRuntimeSubagent,
+    appendRuntimeSubagentTranscript,
+    loadRuntimeSubagentTranscript,
+    runRuntimeSubagentSession,
+  } = useAI()
 
   const { 
     document, 
@@ -681,11 +724,13 @@ export default function ChatPanel() {
     silentSaveToFile,
     getTiptapDocumentStructure,
     replaceWithFormat,
+    documentAgentApi,
     excelData,
     refreshExcelData,
     previewWordOps,
     applyWordOps,
-    getLatestContent
+    getLatestContent,
+    scrollToDiffId,
   } = useDocument()
   const [input, setInput] = useState('')
   const [pendingImages, setPendingImages] = useState<string[]>([]) // 待发送的图片 base64 URL
@@ -737,6 +782,17 @@ export default function ChatPanel() {
     console.log('Dispatching event:', event)
     window.dispatchEvent(event)
   }, [])
+
+  const jumpToDiffChange = useCallback((diff: { diffId?: string; replaceText: string; searchText: string }) => {
+    if (diff.diffId) {
+      scrollToDiffId(diff.diffId)
+      return
+    }
+    const fallbackText = diff.replaceText || diff.searchText
+    if (fallbackText) {
+      scrollToChange(fallbackText)
+    }
+  }, [scrollToChange, scrollToDiffId])
   
   // 打开创建的文档
   const openCreatedFile = useCallback(async (fileName: string) => {
@@ -862,11 +918,23 @@ export default function ChatPanel() {
 
   const flushUiFrame = useCallback(async () => {
     await new Promise<void>((resolve) => {
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        resolve()
+      }
+
+      const timeoutId = window.setTimeout(finish, 80)
+
       if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
-        window.requestAnimationFrame(() => resolve())
+        window.requestAnimationFrame(() => {
+          window.clearTimeout(timeoutId)
+          finish()
+        })
         return
       }
-      setTimeout(() => resolve(), 0)
+      finish()
     })
   }, [])
 
@@ -969,6 +1037,80 @@ export default function ChatPanel() {
   }, [])
 
   const resolvePreviewToolMeta = useCallback((tool: string, args: Record<string, string>) => {
+    if (tool === 'word.edit') {
+      const operation = args.operation || args.mode || args.action || (
+        args.reason || args.type
+          ? 'review'
+          : args.position || args.content || args.dsl
+            ? 'insert'
+            : args.target && !args.search
+              ? 'delete'
+              : 'replace'
+      )
+      if (operation === 'review') {
+        const searchText = args.search || ''
+        const reason = args.reason || searchText
+        const type = args.type || 'review'
+        return {
+          label: `[${type}] ${truncateLabel(reason, 30)}`,
+          searchText,
+          replaceText: args.replace || '',
+        }
+      }
+
+      if (operation === 'insert') {
+        return {
+          label: `Insert: ${args.position || 'after'}`,
+          searchText: args.target || '',
+          replaceText: args.content || '',
+        }
+      }
+
+      if (operation === 'delete') {
+        const target = args.target || ''
+        return {
+          label: `Delete: ${truncateLabel(target, 24)}`,
+          searchText: target,
+          replaceText: '',
+        }
+      }
+
+      const searchText = args.search || ''
+      return {
+        label: `Replace: ${truncateLabel(searchText, 24)}`,
+        searchText,
+        replaceText: args.replace || '',
+      }
+    }
+
+    if (tool === 'word.format') {
+      let opsCount = 0
+      if (args.ops) {
+        try {
+          const parsed = JSON.parse(args.ops)
+          if (Array.isArray(parsed)) {
+            opsCount = parsed.length
+          }
+        } catch {
+          // ignore parse error for preview label
+        }
+      }
+      const mode = (args.mode || args.action || '').toLowerCase()
+      return {
+        label: `WordFormat: ${mode === 'preview' ? 'preview' : mode === 'apply' ? 'apply' : opsCount > 0 ? `${opsCount} ops` : 'running'}`,
+      }
+    }
+
+    if (tool === 'word.resolve_change') {
+      const action = args.action || 'resolve'
+      const target = args.changeId || args.id || (args.all === 'true' ? 'all' : '')
+      return {
+        label: `${action}: ${truncateLabel(target || 'pending changes', 24)}`,
+        searchText: target,
+        replaceText: '',
+      }
+    }
+
     if (tool === 'replace') {
       const searchText = args.search || ''
       return {
@@ -997,7 +1139,7 @@ export default function ChatPanel() {
       }
     }
 
-    if (tool === 'word_chart') {
+    if (tool === 'word_chart' || tool === 'word.chart') {
       return {
         label: `Chart: ${args.type || 'bar'}`,
         searchText: '',
@@ -1040,10 +1182,26 @@ export default function ChatPanel() {
   }, [])
 
   const registerToolStart = useCallback((tool: string) => {
-    const trackedTools = new Set(['replace', 'review', 'insert', 'delete', 'word_edit_ops', 'word_chart'])
+    const trackedTools = new Set([
+      'replace',
+      'review',
+      'insert',
+      'delete',
+      'word_edit_ops',
+      'word_chart',
+      'word.edit',
+      'word.format',
+      'word.resolve_change',
+      'word.chart',
+    ])
     if (!trackedTools.has(tool)) return
 
-    const startLabel = tool === 'word_edit_ops' ? 'WordOps: running' : `${tool}: running`
+    const startLabel =
+      tool === 'word_edit_ops'
+        ? 'WordOps: running'
+        : tool === 'word.format'
+          ? 'WordFormat: running'
+          : `${tool}: running`
     const activityId = registerToolActivity(tool, startLabel)
     enqueueStartedToolPreview(tool, activityId)
 
@@ -1053,7 +1211,18 @@ export default function ChatPanel() {
   }, [enqueueStartedToolPreview, registerToolActivity])
 
   const registerToolPreview = useCallback((tool: string, args: Record<string, string>) => {
-    const trackedTools = new Set(['replace', 'review', 'insert', 'delete', 'word_edit_ops', 'word_chart'])
+    const trackedTools = new Set([
+      'replace',
+      'review',
+      'insert',
+      'delete',
+      'word_edit_ops',
+      'word_chart',
+      'word.edit',
+      'word.format',
+      'word.resolve_change',
+      'word.chart',
+    ])
     if (!trackedTools.has(tool)) return
 
     const signature = buildToolCallSignature(tool, args)
@@ -1209,6 +1378,24 @@ export default function ChatPanel() {
   }, [])
 
   // ========== 直接执行 PPT 生成（确认按钮用） ==========
+  const pptDomainAdapter = useMemo(() => {
+    return new PptDomainAdapter({
+      isElectron,
+      currentFilePath: currentFile?.path || null,
+      currentFileName: currentFile?.name || null,
+      workspacePath,
+      refreshFiles,
+      openFile,
+    })
+  }, [
+    isElectron,
+    currentFile?.path,
+    currentFile?.name,
+    workspacePath,
+    refreshFiles,
+    openFile,
+  ])
+
   const executePptCreate = useCallback(async (draft: PptOutlineDraft, rawJson: string) => {
     if (pptGenerating) return
     setPptGenerating(true)
@@ -1241,22 +1428,19 @@ export default function ChatPanel() {
       console.log('[PPT] executePptCreate start:', { title, slideCount: draft.slides?.length || 0 })
       activityId = registerToolActivity('ppt_create', `PPT：${title.slice(0, 24)}`)
 
-      if (!isElectron || !window.electronAPI?.pptGenerateDeck) {
+      if (!pptDomainAdapter.canUsePptTools()) {
         throw new Error('PPT 生成仅支持桌面版（Electron）')
       }
 
       // 输出路径
-      const dir = currentFile?.path
-        ? currentFile.path.substring(0, currentFile.path.lastIndexOf('\\'))
-        : (workspacePath || null)
+      const output = pptDomainAdapter.buildOutputPath(title)
 
-      if (!dir) {
+      if (!output) {
         throw new Error('缺少工作区路径，请先打开一个文件夹')
       }
 
       const safeTitle = String(title).replace(/[<>:"/\\|?*]/g, '_').slice(0, 60) || '新建演示文稿'
-      const pptxName = safeTitle.toLowerCase().endsWith('.pptx') ? safeTitle : `${safeTitle}.pptx`
-      const outputPath = `${dir}\\${pptxName}`
+      const { fileName: pptxName, outputPath } = output
 
       // 获取 API Keys
       const openRouterApiKey = settings?.openRouterApiKey || ''
@@ -1274,12 +1458,15 @@ export default function ChatPanel() {
       updateAgentAction(`正在让 Gemini 设计视觉风格...`)
       addAgentFileOperation(`PPT: 正在设计 ${estimatedSlideCount} 页视觉`)
 
-      const geminiResult = await window.electronAPI.openrouterGeminiPptPrompts({
-        apiKey: openRouterApiKey,
+      const geminiResult = await pptDomainAdapter.generatePromptSlides({
+        title,
         outline,
+        outputPath,
         slideCount: estimatedSlideCount,
         theme,
         style: draft.styleHint || '',
+        pendingImages,
+        settings,
         // 主模型回退参数（当没有 OpenRouter API Key 时使用）
         mainApiKey: settings?.apiKey || '',
         mainBaseUrl: settings?.baseUrl || '',
@@ -1327,9 +1514,12 @@ export default function ChatPanel() {
       const imageSize = pptImageModel === 'z-image-turbo' ? '2048*1152' : '1664*928'
       console.log(`[PPT] 使用生图模型: ${pptImageModel}`)
 
-      const result = await window.electronAPI.pptGenerateDeck({
+      const result = await pptDomainAdapter.generateDeck({
         outputPath,
         slides: slidesWithContent,
+        settings,
+        designConcept: geminiResult?.designConcept || '',
+        colorPalette: geminiResult?.colorPalette || '',
         // 主模型 API Key（用于 Gemini 生图）
         mainApiKey: settings?.apiKey || '',
         dashscope: {
@@ -1359,10 +1549,10 @@ export default function ChatPanel() {
         throw new Error(`PPT 生成失败: ${result.error || '未知错误'}`)
       }
 
-      await refreshFiles()
+      await pptDomainAdapter.refreshFiles()
 
       // 打开新生成的 PPT
-      await openFile({ name: pptxName, path: result.path, type: 'file' as const })
+      await pptDomainAdapter.openGeneratedDeck(pptxName, result.path)
 
       // 完成进度
       completeAgentStep()
@@ -1388,7 +1578,7 @@ export default function ChatPanel() {
       console.log('[PPT] executePptCreate end')
       setPptGenerating(false)
     }
-  }, [pptGenerating, isElectron, currentFile, workspacePath, settings, addMessage, registerToolActivity, completeToolActivity, updateAgentAction, completeAgentStep, updateAgentFile, addAgentFileOperation, finishAgentProgress, refreshFiles, openFile])
+  }, [pptGenerating, isElectron, currentFile, workspacePath, settings, addMessage, registerToolActivity, completeToolActivity, updateAgentAction, completeAgentStep, updateAgentFile, addAgentFileOperation, finishAgentProgress, refreshFiles, openFile, pendingImages, pptDomainAdapter])
 
   // ========== PPT 编辑：整页重做 / 局部编辑 ==========
   const [pptEditPending, setPptEditPending] = useState<{
@@ -1404,7 +1594,7 @@ export default function ChatPanel() {
     mode: 'regenerate' | 'partial_edit',
     feedback: string
   ) => {
-    if (pptGenerating || !isElectron) return
+    if (pptGenerating || !pptDomainAdapter.canUsePptTools()) return
     setPptGenerating(true)
 
     const modeLabel = mode === 'regenerate' ? '整页重做' : '局部编辑'
@@ -1438,11 +1628,12 @@ export default function ChatPanel() {
       updateAgentAction(`正在${modeLabel}：${pagesLabel}...`)
       addAgentFileOperation(`PPT: ${modeLabel} ${pagesLabel}`)
 
-      const result = await window.electronAPI!.pptEditSlides({
+      const result = await pptDomainAdapter.editSlides({
         pptxPath,
         pageNumbers,
         feedback,
         mode,
+        settings,
         openRouterApiKey,
         dashscopeApiKey,
         mainApiKey: settings.apiKey || '',
@@ -1453,7 +1644,7 @@ export default function ChatPanel() {
         throw new Error(result.error || '编辑失败')
       }
 
-      await refreshFiles()
+      await pptDomainAdapter.refreshFiles()
 
       // 重新打开 PPT 以刷新预览，并跳转到被编辑的页面
       const pptxName = pptxPath.split(/[\\/]/).pop() || 'output.pptx'
@@ -1464,7 +1655,7 @@ export default function ChatPanel() {
         detail: { pageNumber: firstEditedPage }
       }))
       
-      await openFile({ name: pptxName, path: result.path || pptxPath, type: 'file' as const })
+      await pptDomainAdapter.openGeneratedDeck(pptxName, result.path || pptxPath)
 
       completeToolActivity(activityId, 'success', `${result.editedPages?.length || pageNumbers.length} 页`)
       finishAgentProgress()
@@ -1484,7 +1675,7 @@ export default function ChatPanel() {
     } finally {
       setPptGenerating(false)
     }
-  }, [pptGenerating, isElectron, settings, addMessage, registerToolActivity, completeToolActivity, updateAgentAction, addAgentFileOperation, finishAgentProgress, refreshFiles, openFile])
+  }, [pptGenerating, isElectron, settings, addMessage, registerToolActivity, completeToolActivity, updateAgentAction, addAgentFileOperation, finishAgentProgress, refreshFiles, openFile, pptDomainAdapter])
 
   // 监听 PPT 编辑请求事件
   useEffect(() => {
@@ -1579,19 +1770,12 @@ export default function ChatPanel() {
   const DOCX_AGENT_MAX_CHARS = 80_000
   const FILES_CONTEXT_MAX_CHARS = 160_000
   const WORKSPACE_CONTEXT_MAX_CHARS = 60_000
-  const WORKSPACE_INDEX_MAX_ITEMS = 200
   const WORKSPACE_AUTO_SUMMARY_MAX_FILES = 3
   const WORKSPACE_SUMMARY_MAX_CHARS = 1600
   const WORKSPACE_READ_MAX_CHARS = 8000
   const WORKSPACE_PPTX_MAX_SLIDES = 6
 
   const docxAttachmentCacheRef = useRef<Map<string, { key: string; content: string }>>(new Map())
-  const workspaceIndexCacheRef = useRef<{
-    folderPath: string
-    flatFiles: FileItem[]
-    updatedAt: number
-  } | null>(null)
-  const workspaceSummaryCacheRef = useRef<Map<string, { key: string; summary: string }>>(new Map())
 
   const truncateWithNote = useCallback((text: string, maxLen: number, note: string) => {
     if (!text) return ''
@@ -1819,321 +2003,108 @@ export default function ChatPanel() {
     await debugLogQueueRef.current
   }, [isElectron, resolveAgentDebugLogPath])
 
-  const flattenFileTree = (items: FileItem[]) => {
-    const out: FileItem[] = []
-    const walk = (nodes: FileItem[]) => {
-      for (const node of nodes) {
-        if (node.type === 'file') {
-          out.push(node)
-        } else if (node.children?.length) {
-          walk(node.children)
-        }
-      }
-    }
-    walk(items)
-    return out
-  }
-
-  const formatWorkspaceIndex = (flatFiles: FileItem[], folderPath: string) => {
-    const counts = new Map<string, number>()
-    for (const file of flatFiles) {
-      const ext = (file.extension || file.name.split('.').pop() || '').toLowerCase()
-      const key = ext || 'unknown'
-      counts.set(key, (counts.get(key) || 0) + 1)
-    }
-
-    const countLines = Array.from(counts.entries())
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([ext, count]) => `${ext}: ${count}`)
-
-    const displayFiles = flatFiles.slice(0, WORKSPACE_INDEX_MAX_ITEMS)
-    const fileLines = displayFiles.map((file) => {
-      const rel = file.relativePath
-        ? file.relativePath
-        : file.path && normalizePath(file.path).startsWith(normalizePath(folderPath))
-          ? file.path.slice(folderPath.length).replace(/^[/\\]/, '')
-          : file.name
-      const ext = (file.extension || file.name.split('.').pop() || '').toLowerCase() || 'file'
-      return `- [${ext}] ${rel}`
+  const workspaceSummaryAdapter = useMemo(() => {
+    return new WorkspaceSummaryAdapter({
+      isElectron,
+      workspaceSummaryMaxChars: WORKSPACE_SUMMARY_MAX_CHARS,
+      workspacePptxMaxSlides: WORKSPACE_PPTX_MAX_SLIDES,
+      truncateWithNote,
+      readFile: window.electronAPI?.readFile,
+      getFileInfo: window.electronAPI?.getFileInfo,
+      excelListSheets: window.electronAPI?.excelListSheets,
+      excelReadCells: window.electronAPI?.excelReadCells,
     })
-
-    if (flatFiles.length > displayFiles.length) {
-      fileLines.push(`... (${flatFiles.length - displayFiles.length} 个文件未显示，使用 workspace_list 查看更多)`)
-    }
-
-    const sections: string[] = []
-    sections.push(`【文件统计】${flatFiles.length} 个文件`)
-    if (countLines.length) {
-      sections.push(countLines.join(', '))
-    }
-    sections.push('')
-    sections.push('【文件清单】')
-    sections.push(fileLines.join('\n'))
-    return sections.join('\n')
-  }
-
-  const getWorkspaceFolderPath = useCallback(() => {
-    if (currentFile?.path) {
-      return getParentDir(currentFile.path)
-    }
-    return workspacePath || null
-  }, [currentFile, workspacePath])
-
-  const buildWorkspaceIndex = useCallback(async (folderPath: string, refresh = false) => {
-    if (!isElectron || !window.electronAPI?.readFolder) return null
-    const cached = workspaceIndexCacheRef.current
-    if (!refresh && cached && normalizePath(cached.folderPath) === normalizePath(folderPath)) {
-      return cached
-    }
-    const result = await window.electronAPI.readFolder(folderPath)
-    if (!result?.success || !result.data) return null
-    const flatFiles = flattenFileTree(result.data)
-    const next = { folderPath, flatFiles, updatedAt: Date.now() }
-    workspaceIndexCacheRef.current = next
-    return next
-  }, [isElectron])
-
-  const resolveWorkspaceFile = useCallback(async (args: { path?: string; name?: string; relativePath?: string }) => {
-    const folderPath = getWorkspaceFolderPath()
-    if (!folderPath) return null
-    const index = await buildWorkspaceIndex(folderPath)
-    if (!index) return null
-
-    const targetPath = (args.path || args.relativePath || '').trim()
-    const targetName = (args.name || '').trim()
-
-    if (targetPath) {
-      const normalizedTarget = normalizePath(targetPath)
-      const matched = index.flatFiles.find((file) => {
-        const filePath = file.path ? normalizePath(file.path) : ''
-        const rel = file.relativePath ? normalizePath(file.relativePath) : ''
-        return filePath === normalizedTarget || rel === normalizedTarget
-      })
-      if (matched) return matched
-
-      // 兼容相对路径拼接
-      if (!normalizedTarget.includes('/') && !normalizedTarget.includes('\\')) {
-        const byName = index.flatFiles.find((file) => file.name === targetPath)
-        if (byName) return byName
-      }
-    }
-
-    if (targetName) {
-      const byName = index.flatFiles.find((file) => file.name === targetName)
-      if (byName) return byName
-    }
-
-    return null
-  }, [buildWorkspaceIndex, getWorkspaceFolderPath])
-
-  const htmlToPlainText = (html: string) => {
-    if (!html) return ''
-    let text = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-    text = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-    text = text.replace(/&nbsp;/g, ' ')
-    text = text.replace(/&amp;/g, '&')
-    text = text.replace(/&lt;/g, '<')
-    text = text.replace(/&gt;/g, '>')
-    text = text.replace(/&quot;/g, '"')
-    text = text.replace(/&#39;/g, "'")
-    text = text.replace(/<[^>]+>/g, ' ')
-    text = text.replace(/\s+/g, ' ').trim()
-    return text
-  }
-
-  const extractPptxTextSummary = async (base64: string, maxSlides: number, maxChars: number) => {
-    const zip = await JSZip.loadAsync(base64, { base64: true })
-    const slidePaths = Object.keys(zip.files)
-      .filter((name) => name.startsWith('ppt/slides/slide') && name.endsWith('.xml'))
-      .sort((a, b) => {
-        const getNum = (s: string) => parseInt(s.match(/slide(\d+)\.xml/)?.[1] || '0', 10)
-        return getNum(a) - getNum(b)
-      })
-
-    const lines: string[] = []
-    lines.push(`页数: ${slidePaths.length}`)
-
-    const decodeXml = (input: string) =>
-      input
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-
-    for (let i = 0; i < Math.min(maxSlides, slidePaths.length); i++) {
-      const slideXml = await zip.file(slidePaths[i])!.async('string')
-      const texts = Array.from(slideXml.matchAll(/<a:t>([\s\S]*?)<\/a:t>/g)).map((m) => decodeXml(m[1]))
-      const combined = texts.join(' ').replace(/\s+/g, ' ').trim()
-      if (combined) {
-        lines.push(`- 第 ${i + 1} 页：${combined.slice(0, 200)}`)
-      }
-    }
-
-    const result = lines.join('\n')
-    return truncateWithNote(result, maxChars, 'PPT 摘要')
-  }
-
-  const summarizeExcelFile = async (filePath: string, maxChars: number) => {
-    if (!window.electronAPI?.excelListSheets || !window.electronAPI?.excelReadCells) {
-      return '⚠️ Excel 工具不可用'
-    }
-    const list = await window.electronAPI.excelListSheets(filePath)
-    if (!list.success || !list.sheets?.length) {
-      return `⚠️ 无法读取工作表：${list.error || '未知错误'}`
-    }
-    const sheetNames = list.sheets.map((s) => `${s.name}(${s.rowCount}x${s.columnCount})`).join(', ')
-    const firstSheet = list.sheets[0]?.name
-    const lines: string[] = []
-    lines.push(`【工作表】${sheetNames}`)
-    if (firstSheet) {
-      const preview = await window.electronAPI.excelReadCells(filePath, firstSheet, 'A1:E8')
-      if (preview.success && preview.cells?.length) {
-        const maxRows = 6
-        const maxCols = 5
-        const cellMap = new Map<string, string>()
-        for (const cell of preview.cells) {
-          if (cell.r < maxRows && cell.c < maxCols) {
-            cellMap.set(`${cell.r}-${cell.c}`, String(cell.text || cell.value || ''))
-          }
-        }
-        const rows: string[] = []
-        for (let r = 0; r < maxRows; r++) {
-          const cols: string[] = []
-          for (let c = 0; c < maxCols; c++) {
-            cols.push(cellMap.get(`${r}-${c}`) || '')
-          }
-          if (cols.some((val) => val)) {
-            rows.push(cols.join('\t'))
-          }
-        }
-        if (rows.length) {
-          lines.push(`【${firstSheet} 预览】`)
-          lines.push(rows.join('\n'))
-        }
-      }
-    }
-    return truncateWithNote(lines.join('\n'), maxChars, 'Excel 摘要')
-  }
-
-  const summarizeWorkspaceFile = useCallback(async (file: FileItem, options?: { maxChars?: number; maxSlides?: number; format?: string }) => {
-    if (!isElectron || !window.electronAPI) {
-      return '⚠️ 当前环境不支持读取工作夹文件'
-    }
-    const maxChars = options?.maxChars || WORKSPACE_SUMMARY_MAX_CHARS
-    const maxSlides = options?.maxSlides || WORKSPACE_PPTX_MAX_SLIDES
-    const format = options?.format || 'summary'
-
-    let cacheKey = `${file.path}:${maxChars}:${maxSlides}:${format}`
-    if (window.electronAPI.getFileInfo) {
-      try {
-        const infoResult = await window.electronAPI.getFileInfo(file.path)
-        const info = infoResult?.data
-        if (infoResult?.success && info) {
-          cacheKey = `${file.path}:${String(info.modified || '')}:${info.size || ''}:${maxChars}:${maxSlides}:${format}`
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    const cached = workspaceSummaryCacheRef.current.get(file.path)
-    if (cached?.key === cacheKey) {
-      return cached.summary
-    }
-
-    const ext = (file.extension || file.name.split('.').pop() || '').toLowerCase()
-    let summary = ''
-
-    if (ext === 'docx' && format === 'dsl') {
-      // DSL 格式：解析 docx → HTML → DSL → 序列化，保留完整格式信息
-      try {
-        const result = await window.electronAPI.readFile(file.path)
-        if (result.success && result.data) {
-          const parsed = await parseDocxToHtmlForAgent(result.data)
-          const dsl = htmlToDsl(parsed.html, { stripDiffMarkers: true })
-          summary = `【Word 文档 DSL】${file.name}\n` + serializeDslForAI(dsl, { maxLength: maxChars - 100 })
-        } else {
-          summary = `⚠️ 无法读取 .docx：${result.error || '未知错误'}`
-        }
-      } catch (e) {
-        summary = `⚠️ DSL 解析失败：${(e as Error).message}`
-      }
-    } else if (ext === 'docx') {
-      summary = await generateDocxAgentContextFromFilePath(file.name, file.path, {
-        maxLength: maxChars,
-        maxParagraphs: 30,
-        maxParagraphLength: 120,
-      })
-    } else if (ext === 'doc') {
-      const result = await window.electronAPI.readFile(file.path)
-      if (result.success && result.data) {
-        summary = truncateWithNote(htmlToPlainText(result.data), maxChars, `${file.name} 摘要`)
-      } else {
-        summary = `⚠️ 无法读取 .doc：${result.error || '未知错误'}`
-      }
-    } else if (ext === 'xlsx' || ext === 'xls') {
-      summary = await summarizeExcelFile(file.path, maxChars)
-    } else if (ext === 'pptx' || ext === 'ppt') {
-      const result = await window.electronAPI.readFile(file.path)
-      if (result.success && result.data && result.type === 'pptx') {
-        summary = await extractPptxTextSummary(result.data, maxSlides, maxChars)
-      } else {
-        summary = `⚠️ 无法读取 PPT：${result.error || '未知错误'}`
-      }
-    } else {
-      const result = await window.electronAPI.readFile(file.path)
-      if (result.success && result.data) {
-        summary = truncateWithNote(result.data, maxChars, `${file.name} 摘要`)
-      } else {
-        summary = `⚠️ 无法读取文件：${result.error || '未知错误'}`
-      }
-    }
-
-    workspaceSummaryCacheRef.current.set(file.path, { key: cacheKey, summary })
-    return summary
   }, [isElectron, truncateWithNote])
 
+  const summarizeWorkspaceFile = useCallback(async (file: FileItem, options?: { maxChars?: number; maxSlides?: number; format?: string }) => {
+    return workspaceSummaryAdapter.summarizeWorkspaceFile(file, options)
+  }, [workspaceSummaryAdapter])
+
   const buildWorkspaceAutoSummaries = useCallback(async (flatFiles: FileItem[]) => {
-    if (!flatFiles.length) return ''
-    const currentPath = currentFile?.path
-    const candidates = flatFiles.filter((file) => file.type === 'file' && file.path !== currentPath)
-    if (!candidates.length) return ''
-
-    const priority = (file: FileItem) => {
-      const ext = (file.extension || file.name.split('.').pop() || '').toLowerCase()
-      if (ext === 'docx') return 1
-      if (ext === 'xlsx' || ext === 'xls') return 2
-      if (ext === 'pptx' || ext === 'ppt') return 3
-      if (ext === 'md' || ext === 'txt') return 4
-      return 9
-    }
-    const selected = candidates.sort((a, b) => priority(a) - priority(b)).slice(0, WORKSPACE_AUTO_SUMMARY_MAX_FILES)
-    if (!selected.length) return ''
-
-    const summaries = await Promise.all(
-      selected.map(async (file) => {
-        const summary = await summarizeWorkspaceFile(file, { maxChars: WORKSPACE_SUMMARY_MAX_CHARS })
-        return `【${file.name}】\n${summary}`
-      })
+    return workspaceSummaryAdapter.buildWorkspaceAutoSummaries(
+      flatFiles,
+      currentFile?.path,
+      WORKSPACE_AUTO_SUMMARY_MAX_FILES,
     )
-    return `【自动摘要】\n${summaries.join('\n\n')}`
-  }, [currentFile, summarizeWorkspaceFile])
+  }, [currentFile?.path, workspaceSummaryAdapter])
+
+  const workspaceDomainAdapter = useMemo(() => {
+    return new WorkspaceDomainAdapter({
+      isElectron,
+      workspacePath,
+      currentFilePath: currentFile?.path || null,
+      workspaceContextMaxChars: WORKSPACE_CONTEXT_MAX_CHARS,
+      truncateWithNote,
+      readFolder: window.electronAPI?.readFolder,
+      buildWorkspaceAutoSummaries,
+    })
+  }, [buildWorkspaceAutoSummaries, currentFile?.path, isElectron, truncateWithNote, workspacePath])
 
   const buildWorkspaceContext = useCallback(async () => {
-    const folderPath = getWorkspaceFolderPath()
-    if (!folderPath) return ''
-    const index = await buildWorkspaceIndex(folderPath)
-    if (!index) return ''
-    const indexText = formatWorkspaceIndex(index.flatFiles, folderPath)
-    const summaryText = await buildWorkspaceAutoSummaries(index.flatFiles)
-    const blocks = [`=== 工作夹目录（${folderPath}）===`, indexText]
-    if (summaryText) {
-      blocks.push('')
-      blocks.push(summaryText)
-    }
-    return truncateWithNote(blocks.join('\n'), WORKSPACE_CONTEXT_MAX_CHARS, '工作夹上下文')
-  }, [buildWorkspaceAutoSummaries, buildWorkspaceIndex, getWorkspaceFolderPath, truncateWithNote])
+    return workspaceDomainAdapter.buildWorkspaceContext()
+  }, [workspaceDomainAdapter])
+
+  const buildWorkspaceProfile = useCallback(async () => {
+    return workspaceDomainAdapter.buildWorkspaceProfile()
+  }, [workspaceDomainAdapter])
+
+  const excelDomainAdapter = useMemo(() => {
+    return new ExcelDomainAdapter({
+      currentFileName: currentFile?.name || null,
+      currentFilePath: currentFile?.path || null,
+      workspacePath,
+      refreshExcelData,
+      refreshFiles,
+      openFile,
+    })
+  }, [
+    currentFile?.name,
+    currentFile?.path,
+    workspacePath,
+    refreshExcelData,
+    refreshFiles,
+    openFile,
+  ])
+
+  const documentAgentAdapter = useMemo(() => {
+    return createDocumentAgentAdapter({
+      attachedFiles,
+      fileName: documentAgentApi.getFileName(),
+      currentFile: documentAgentApi.getCurrentFile(),
+      workspacePath: documentAgentApi.getWorkspacePath(),
+      editorMode,
+      setEditorMode,
+      isElectron: documentAgentApi.isElectron(),
+      currentFilePath: documentAgentApi.getCurrentFilePath(),
+      silentSaveToFile,
+      replaceViaDsl: documentAgentApi.replaceViaDsl,
+      replaceWithFormat: documentAgentApi.replaceWithFormat,
+      replaceInDocument: documentAgentApi.replaceInDocument,
+      insertViaDsl: documentAgentApi.insertViaDsl,
+      insertInDocument: documentAgentApi.insertInDocument,
+      deleteViaDsl: documentAgentApi.deleteViaDsl,
+      deleteInDocument: documentAgentApi.deleteInDocument,
+      previewWordOps: documentAgentApi.previewOps,
+      applyWordOps: documentAgentApi.applyOps,
+      prepareTemplateFillOutput: documentAgentApi.prepareTemplateFillOutput,
+      createNewDocument: documentAgentApi.createDocument,
+      createDocumentFromDsl: documentAgentApi.createDocumentFromDsl,
+      getTiptapDocumentStructure: documentAgentApi.readOutline,
+      getSelectionSnapshot: documentAgentApi.readSelection,
+      readDocumentDsl: documentAgentApi.readDocumentDsl,
+      listPendingChanges: documentAgentApi.listPendingChanges,
+      acceptChange: documentAgentApi.acceptChange,
+      rejectChange: documentAgentApi.rejectChange,
+      acceptAllChanges: documentAgentApi.acceptAllChanges,
+      rejectAllChanges: documentAgentApi.rejectAllChanges,
+    })
+  }, [
+    attachedFiles,
+    documentAgentApi,
+    editorMode,
+    setEditorMode,
+    silentSaveToFile,
+  ])
 
   // 构建文件上下文
   const buildFilesContext = useCallback(async () => {
@@ -2166,6 +2137,392 @@ export default function ChatPanel() {
     return `=== 用户拖入的文件夹 ===\n${lines.join('\n\n')}\n\n⚠️ 不要一次性读取所有文件，请根据需要选择性查看。`
   }, [attachedFolders])
 
+  const phaseOneToolExecutor = useMemo(() => {
+    return createPhaseOneToolExecutor({
+      word: {
+        adapter: documentAgentAdapter,
+        fileName: currentFile?.name || '褰撳墠鏂囨。',
+        currentFile: currentFile || null,
+        attachedFiles,
+        workspacePath,
+        editorMode,
+        setEditorMode,
+        flushUiFrame,
+        isElectron,
+        currentFilePath: currentFile?.path || null,
+        silentSaveToFile,
+        claimOrRegisterToolActivity,
+        completeToolActivity,
+        patchToolActivity,
+        updateAgentAction,
+        completeAgentStep,
+        updateAgentFile,
+        addAgentFileOperation,
+        buildReplaceSearchCandidates,
+        replaceViaDsl,
+        replaceWithFormat,
+        replaceInDocument,
+        insertViaDsl,
+        insertInDocument,
+        deleteViaDsl,
+        deleteInDocument,
+        previewWordOps,
+        applyWordOps,
+        prepareTemplateFillOutput,
+        setPendingWordOps,
+        createNewDocument,
+        createDocumentFromDsl,
+        refreshFiles,
+        openFile,
+        resolveWorkspaceFile: (args) => workspaceDomainAdapter.resolveWorkspaceFile(args),
+      },
+      excel: {
+        adapter: excelDomainAdapter,
+        registerToolActivity,
+        completeToolActivity,
+        updateAgentAction,
+        truncateLabel,
+      },
+      ppt: {
+        adapter: pptDomainAdapter,
+        settings,
+        pendingImages,
+        pptEditContext,
+        registerToolActivity,
+        completeToolActivity,
+        updateAgentAction,
+        completeAgentStep,
+        updateAgentFile,
+        addAgentFileOperation,
+        finishAgentProgress,
+        truncateLabel,
+      },
+      memory: {
+        registerToolActivity,
+        completeToolActivity,
+        updateAgentAction,
+        truncateLabel,
+      },
+      knowledge: {
+        registerToolActivity,
+        completeToolActivity,
+        updateAgentAction,
+        truncateLabel,
+      },
+      workspace: {
+        workspaceReadMaxChars: WORKSPACE_READ_MAX_CHARS,
+        workspaceSummaryMaxChars: WORKSPACE_SUMMARY_MAX_CHARS,
+        workspacePptxMaxSlides: WORKSPACE_PPTX_MAX_SLIDES,
+        getWorkspaceFolderPath: () => workspaceDomainAdapter.getWorkspaceFolderPath(),
+        registerToolActivity,
+        completeToolActivity,
+        updateAgentAction,
+        truncateLabel,
+        buildWorkspaceIndex: (folderPath, refresh) =>
+          workspaceDomainAdapter.buildWorkspaceIndex(folderPath, refresh),
+        formatWorkspaceIndex: (flatFiles, folderPath) =>
+          workspaceDomainAdapter.formatWorkspaceIndex(flatFiles, folderPath),
+        resolveWorkspaceFile: (args) => workspaceDomainAdapter.resolveWorkspaceFile(args),
+        summarizeWorkspaceFile,
+        buildWorkspaceProfile: (folderPath, refresh) =>
+          workspaceDomainAdapter.buildWorkspaceProfile(folderPath, refresh),
+        openFile,
+      },
+      web: {
+        registerToolActivity,
+        completeToolActivity,
+        updateAgentAction,
+        truncateLabel,
+      },
+    })
+  }, [
+    attachedFiles,
+    documentAgentAdapter,
+    excelDomainAdapter,
+    pptDomainAdapter,
+    workspaceDomainAdapter,
+    claimOrRegisterToolActivity,
+    completeAgentStep,
+    completeToolActivity,
+    createDocumentFromDsl,
+    createNewDocument,
+    currentFile?.name,
+    currentFile?.path,
+    deleteInDocument,
+    deleteViaDsl,
+    editorMode,
+    flushUiFrame,
+    insertInDocument,
+    insertViaDsl,
+    pendingImages,
+    patchToolActivity,
+    pptEditContext,
+    prepareTemplateFillOutput,
+    previewWordOps,
+    applyWordOps,
+    refreshFiles,
+    registerToolActivity,
+    replaceInDocument,
+    replaceViaDsl,
+    replaceWithFormat,
+    setEditorMode,
+    settings,
+    silentSaveToFile,
+    summarizeWorkspaceFile,
+    truncateLabel,
+    updateAgentAction,
+    updateAgentFile,
+    addAgentFileOperation,
+    finishAgentProgress,
+    openFile,
+  ])
+
+  useEffect(() => {
+    syncRuntimeTools(phaseOneToolExecutor.listDefinitions())
+  }, [phaseOneToolExecutor, syncRuntimeTools])
+
+  const [workspaceSkills, setWorkspaceSkills] = useState<AgentSkillDefinition[]>([])
+  const [workspaceSkillWarnings, setWorkspaceSkillWarnings] = useState<string[]>([])
+  const [workspaceSkillSources, setWorkspaceSkillSources] = useState<string[]>([])
+  const workspaceSkillLoader = useMemo(() => {
+    return new WorkspaceSkillLoader({
+      readFile: window.electronAPI?.readFile,
+      readFolder: window.electronAPI?.readFolder,
+    })
+  }, [isElectron])
+
+  const workspaceSkillRoot = useMemo(() => {
+    return workspacePath || workspaceDomainAdapter.getWorkspaceFolderPath()
+  }, [workspaceDomainAdapter, workspacePath])
+
+  useEffect(() => {
+    let cancelled = false
+
+    if (!isElectron || !workspaceSkillRoot) {
+      setWorkspaceSkills([])
+      setWorkspaceSkillWarnings([])
+      setWorkspaceSkillSources([])
+      syncRuntimeSkills([])
+      return () => {
+        cancelled = true
+      }
+    }
+
+    workspaceSkillLoader
+      .load(workspaceSkillRoot)
+      .then((result) => {
+        if (cancelled) return
+        setWorkspaceSkills(result.skills)
+        setWorkspaceSkillWarnings(result.warnings)
+        setWorkspaceSkillSources(result.sources)
+        syncRuntimeSkills(result.skills)
+        result.warnings.forEach((warning) => {
+          console.warn('[WorkspaceSkillLoader]', warning)
+        })
+      })
+      .catch((error) => {
+        if (cancelled) return
+        console.warn('[WorkspaceSkillLoader] load failed:', error)
+        setWorkspaceSkills([])
+        setWorkspaceSkillWarnings([String(error)])
+        setWorkspaceSkillSources([])
+        syncRuntimeSkills([])
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [isElectron, workspaceSkillLoader, workspaceSkillRoot, syncRuntimeSkills])
+
+  const skillRegistry = useMemo(() => {
+    const registry = new SkillRegistry()
+    registry.registerMany(BUILTIN_SKILLS)
+    registry.registerMany(workspaceSkills)
+    return registry
+  }, [workspaceSkills])
+
+  const skillExecutor = useMemo(() => {
+    return new SkillExecutor(skillRegistry)
+  }, [skillRegistry])
+
+  const availableSkillDescriptions = useMemo(() => {
+    return skillRegistry
+      .list()
+      .filter((skill) => !skill.hidden)
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((skill) => {
+        const commands = skill.invocation?.slashCommands?.length
+          ? skill.invocation.slashCommands.map((command) => `/${command}`).join(', ')
+          : `/${skill.id}`
+        const source = skill.source || 'builtin'
+        const safety = skill.safety || 'mutating'
+        return `${commands} | ${source} | ${safety}\n${skill.description}`
+      })
+      .join('\n\n')
+  }, [skillRegistry])
+
+  const executeRuntimeTool = useCallback(async (
+    tool: string,
+    args: Record<string, string>,
+  ): Promise<ToolResult> => {
+    const phaseOneDelegatedResult = await phaseOneToolExecutor.execute(tool, args)
+    if (phaseOneDelegatedResult) {
+      const pipelineState = phaseOneToolExecutor.getLastPipelineState()
+      if (pipelineState) {
+        recordRuntimeToolExecution(pipelineState)
+      }
+      return phaseOneDelegatedResult
+    }
+
+    return {
+      tool,
+      success: false,
+      message: `Unsupported tool in phase1 runtime: ${tool}`,
+    }
+  }, [phaseOneToolExecutor, recordRuntimeToolExecution])
+
+  const executeSubagentTool = useCallback(async (
+    tool: string,
+    args: Record<string, string>,
+  ) => {
+    const result = await phaseOneToolExecutor.execute(tool, args)
+    const pipelineState = phaseOneToolExecutor.getLastPipelineState()
+
+    return {
+      result: result || {
+        tool,
+        success: false,
+        message: `Unsupported subagent tool: ${tool}`,
+      },
+      pipelineState,
+    }
+  }, [phaseOneToolExecutor])
+
+  const subagentWorkflowRunner = useMemo(() => {
+    return new SubagentWorkflowRunner({
+      spawnSubagent: spawnRuntimeSubagent,
+      startSubagent: startRuntimeSubagent,
+      completeSubagent: completeRuntimeSubagent,
+      failSubagent: failRuntimeSubagent,
+      appendSubagentTranscript: appendRuntimeSubagentTranscript,
+      invokeTool: executeSubagentTool,
+      runSession: runRuntimeSubagentSession,
+    })
+  }, [
+    appendRuntimeSubagentTranscript,
+    completeRuntimeSubagent,
+    executeSubagentTool,
+    failRuntimeSubagent,
+    runRuntimeSubagentSession,
+    spawnRuntimeSubagent,
+    startRuntimeSubagent,
+  ])
+
+  const [runtimeSnapshotState, setRuntimeSnapshotState] = useState(() =>
+    getAgentRuntimeSnapshot(),
+  )
+  const [selectedSubagentId, setSelectedSubagentId] = useState<string | null>(null)
+  const [selectedSubagentTranscript, setSelectedSubagentTranscript] = useState<ReturnType<typeof loadRuntimeSubagentTranscript>>(null)
+
+  useEffect(() => {
+    const updateSnapshot = () => {
+      setRuntimeSnapshotState(getAgentRuntimeSnapshot())
+    }
+
+    updateSnapshot()
+    const timer = window.setInterval(updateSnapshot, 1000)
+    return () => {
+      window.clearInterval(timer)
+    }
+  }, [getAgentRuntimeSnapshot])
+
+  useEffect(() => {
+    if (!selectedSubagentId) {
+      setSelectedSubagentTranscript(null)
+      return
+    }
+    setSelectedSubagentTranscript(loadRuntimeSubagentTranscript(selectedSubagentId))
+  }, [loadRuntimeSubagentTranscript, runtimeSnapshotState, selectedSubagentId])
+
+  const handleCancelSubagent = useCallback((subagentId: string) => {
+    const cancelled = cancelRuntimeSubagent(subagentId)
+    if (!cancelled) return
+    addMessage({
+      role: 'assistant',
+      content: `Subagent ${cancelled.label} cancelled.`,
+    })
+  }, [addMessage, cancelRuntimeSubagent])
+
+  const buildSubagentDocumentContext = useCallback(() => {
+    if (!currentFile) return ''
+
+    const lowerName = currentFile.name.toLowerCase()
+    const isExcelFile = lowerName.endsWith('.xlsx') || lowerName.endsWith('.xls')
+
+    if (isExcelFile && excelData?.sheets?.length) {
+      const sheetNames = excelData.sheets.map((sheet) => sheet.name).join(', ')
+      const firstSheet = excelData.sheets[0]
+      const previewLines: string[] = []
+
+      if (firstSheet?.cells?.length) {
+        const maxRows = 5
+        const maxCols = 6
+        const cellMap = new Map<string, string>()
+        firstSheet.cells.forEach((cell) => {
+          if (cell.r < maxRows && cell.c < maxCols) {
+            cellMap.set(
+              `${cell.r}-${cell.c}`,
+              cell.display || cell.w || String(cell.v || ''),
+            )
+          }
+        })
+
+        for (let row = 0; row < maxRows; row += 1) {
+          const cols: string[] = []
+          for (let col = 0; col < maxCols; col += 1) {
+            cols.push(cellMap.get(`${row}-${col}`) || '')
+          }
+          if (cols.some(Boolean)) {
+            previewLines.push(cols.join('\t'))
+          }
+        }
+      }
+
+      return [
+        `Active workbook: ${currentFile.name}`,
+        `Sheets: ${sheetNames}`,
+        previewLines.length > 0
+          ? `Preview of ${firstSheet?.name || 'Sheet1'}:\n${previewLines.join('\n')}`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('\n\n')
+    }
+
+    return getTiptapDocumentStructure()
+  }, [currentFile, excelData, getTiptapDocumentStructure])
+
+  const buildSubagentFilesContext = useCallback(async (profileId: string) => {
+    const blocks: string[] = []
+    const attachedContext = await buildFilesContext()
+    if (attachedContext) {
+      blocks.push(attachedContext)
+    }
+
+    if (
+      profileId === 'workspace-explore' ||
+      profileId === 'ppt-builder' ||
+      profileId === 'verification'
+    ) {
+      const workspaceContext = await buildWorkspaceContext()
+      if (workspaceContext) {
+        blocks.push(workspaceContext)
+      }
+    }
+
+    return blocks.join('\n\n')
+  }, [buildFilesContext, buildWorkspaceContext])
+
   const handleSend = useCallback(async () => {
     if ((!input.trim() && pendingImages.length === 0) || isLoading) return
 
@@ -2180,7 +2537,9 @@ export default function ChatPanel() {
       setPptEditContext(null)
     }
     
-    const operation = detectOperation(userMessage)
+    let runtimeUserMessage = userMessage
+    let activeSkill: AgentSkillDefinition | null = null
+    let activeSkillToolIds: string[] | undefined
     const fileNames = attachedFiles.map(f => f.name).join(', ')
     const allImages = [
       ...(currentPptEditContext?.imageBase64 ? [currentPptEditContext.imageBase64] : []),
@@ -2203,6 +2562,142 @@ export default function ChatPanel() {
       role: 'user', 
       content: displayMessage
     })
+
+    const parsedSubagentCommand = parseSubagentCommand(userMessage)
+    if (parsedSubagentCommand) {
+      const runtimeSnapshot = getAgentRuntimeSnapshot()
+      const profile = runtimeSnapshot.subagents.profiles.find(
+        (item) => item.id === parsedSubagentCommand.profileId,
+      )
+
+      if (!profile) {
+        addMessage({
+          role: 'assistant',
+          content: `Unknown subagent profile: ${parsedSubagentCommand.profileId}`,
+        })
+        if (pendingImages.length > 0) {
+          setPendingImages([])
+        }
+        return
+      }
+
+      const requestedMode = parsedSubagentCommand.mode || profile.defaultMode
+      const needsDocumentContext = [
+        'doc-explore',
+        'doc-editor',
+        'verification',
+        'excel-operator',
+      ].includes(profile.id)
+      const needsFilesContext =
+        attachedFiles.length > 0 ||
+        [
+          'workspace-explore',
+          'ppt-builder',
+          'verification',
+        ].includes(profile.id)
+      const needsWorkspaceProfile = [
+        'workspace-explore',
+        'ppt-builder',
+        'verification',
+      ].includes(profile.id)
+
+      const subagentDocumentContext = needsDocumentContext
+        ? buildSubagentDocumentContext()
+        : ''
+      const subagentFilesContext = needsFilesContext
+        ? await buildSubagentFilesContext(profile.id)
+        : ''
+      const subagentWorkspaceProfile = needsWorkspaceProfile
+        ? await buildWorkspaceProfile()
+        : ''
+      const runPromise = subagentWorkflowRunner.run({
+        profile,
+        request: parsedSubagentCommand.request,
+        mode: requestedMode,
+        parentTurnId: runtimeSnapshot.conversation.currentTurnId,
+        documentContext: subagentDocumentContext || undefined,
+        filesContext: subagentFilesContext || undefined,
+        workspaceProfile: subagentWorkspaceProfile || undefined,
+        images: profile.id === 'ppt-builder' ? allImages : undefined,
+      })
+
+      const latestSubagent =
+        getAgentRuntimeSnapshot().subagents.agents
+          .filter((agent) => agent.profileId === profile.id)
+          .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0] ||
+        null
+
+      if (requestedMode === 'background') {
+        addMessage({
+          role: 'assistant',
+          content: latestSubagent
+            ? `Started background subagent ${profile.displayName}.\n\nTask: ${latestSubagent.taskId}\nSubagent: ${latestSubagent.subagentId}`
+            : `Started background subagent ${profile.displayName}.`,
+        })
+        if (pendingImages.length > 0) {
+          setPendingImages([])
+        }
+        void runPromise
+          .then((result) => {
+            addMessage({
+              role: 'assistant',
+              content: `Background subagent ${result.subagent.label} finished.\n\n${result.summary}`,
+            })
+          })
+          .catch((error) => {
+            addMessage({
+              role: 'assistant',
+              content: `Background subagent ${profile.displayName} failed: ${error instanceof Error ? error.message : String(error)}`,
+            })
+          })
+        return
+      }
+
+      try {
+        const result = await runPromise
+        addMessage({
+          role: 'assistant',
+          content: `Subagent ${result.subagent.label} finished.\n\n${result.summary}`,
+        })
+      } catch (error) {
+        addMessage({
+          role: 'assistant',
+          content: `Subagent ${profile.displayName} failed: ${error instanceof Error ? error.message : String(error)}`,
+        })
+      }
+      if (pendingImages.length > 0) {
+        setPendingImages([])
+      }
+      return
+    }
+
+    const skillExecution = await skillExecutor.execute(userMessage, {
+      invokeTool: executeRuntimeTool,
+      buildWorkspaceProfile: (refresh) =>
+        workspaceDomainAdapter.buildWorkspaceProfile(undefined, !!refresh),
+      currentFileName: currentFile?.name || null,
+      workspacePath: workspaceDomainAdapter.getWorkspaceFolderPath(),
+      workspaceSkillWarnings,
+      workspaceSkillSources,
+    })
+
+    if (skillExecution?.mode === 'handled') {
+      addMessage({
+        role: 'assistant',
+        content:
+          skillExecution.assistantMessage ||
+          `Skill completed: ${skillExecution.skill.displayName}`,
+      })
+      return
+    }
+
+    if (skillExecution?.mode === 'transform' && skillExecution.transformedInput) {
+      activeSkill = skillExecution.skill
+      activeSkillToolIds = skillExecution.allowedToolIds
+      runtimeUserMessage = skillExecution.transformedInput
+    }
+
+    const operation = detectOperation(runtimeUserMessage)
 
     if (pendingImages.length > 0) {
       setPendingImages([])
@@ -2282,7 +2777,7 @@ export default function ChatPanel() {
   - 用于数据可视化：饼图(pie)、柱状图(column)、折线图(line)等
   - sheet 必须填当前工作表名称：${firstSheet?.name || 'Sheet1'}
 
-❌ 不要使用 replace/delete/insert 这些 Word 文档工具！`
+❌ 不要使用 word.read / word.create / word.edit / word.format / word.resolve_change / word.chart 这些 Word 工具！`
         
         fullContext = fullContext ? `${excelContext}\n\n${fullContext}` : excelContext
       } else {
@@ -2386,6 +2881,7 @@ export default function ChatPanel() {
     }
     
     const workspaceContext = await buildWorkspaceContext()
+    const workspaceProfile = await buildWorkspaceProfile()
     if (workspaceContext) {
       fullContext = fullContext ? `${fullContext}\n\n${workspaceContext}` : workspaceContext
     }
@@ -2400,7 +2896,7 @@ export default function ChatPanel() {
 ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContext.regionRect.x}, y=${currentPptEditContext.regionRect.y}, w=${currentPptEditContext.regionRect.w}, h=${currentPptEditContext.regionRect.h}` : ''}
 
 ⚠️ 重要：用户拖拽/框选了 PPT 页面并发送了修改要求。**此请求与 Word 文档无关**，必须使用 **ppt_edit** 工具来处理。
-🚫 禁止：replace / insert / delete / create / create_from_template（这些是 Word/Excel 工具，会导致错误操作）
+🚫 禁止：word.read / word.create / word.edit / word.format / word.resolve_change / word.chart（这些是 Word 工具，会导致错误操作）
 根据用户的描述判断：
 - 如果用户对整体不满意（太丑、换风格、重做等），使用 mode="regenerate"
 - 如果用户只想修改局部细节（改颜色、换文字、调整位置等），使用 mode="partial_edit"
@@ -2420,7 +2916,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
     toolCallLogger.log({
       type: 'request_context',
       data: {
-        userMessage: userMessage.slice(0, 500),
+        userMessage: runtimeUserMessage.slice(0, 500),
         documentContextLength: documentContextForAI?.length || 0,
         fullContextLength: fullContext?.length || 0,
         hasPptEditContext: !!currentPptEditContext,
@@ -2430,7 +2926,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
 
     // 使用 Agent 模式发送消息
     await sendAgentMessage(
-      userMessage,
+      runtimeUserMessage,
       documentContextForAI,
       fullContext || undefined,
       {
@@ -2489,2131 +2985,18 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
         },
 
         onToolCall: async (tool, args): Promise<ToolResult> => {
-          if (tool === 'replace') {
-            const search = args.search || ''
-            const replaceText = args.replace || ''
-            const blockIndex = args.blockIndex ? parseInt(args.blockIndex) : undefined
-
-            if (!search) {
-              return { tool, success: false, message: '缺少 search 参数' }
-            }
-
-            const activityId = claimOrRegisterToolActivity('replace', args, `Replace: ${truncateLabel(search, 24)}`, { searchText: search, replaceText })
-            await flushUiFrame()
-
-            // 如果当前是 ONLYOFFICE 模式，自动切换到内置编辑器以显示 diff 标记
-            if (editorMode === 'onlyoffice') {
-              setEditorMode('tiptap')
-              // 等待编辑器切换完成
-              await new Promise(resolve => setTimeout(resolve, 100))
-            }
-
-            // 如果提供了 blockIndex，优先走 DSL 路径
-            if (blockIndex !== undefined && !isNaN(blockIndex)) {
-              const format = args.bold === 'true' || args.italic === 'true' || args.underline === 'true' || args.color || args.fontSize
-                ? {
-                    bold: args.bold === 'true' || undefined,
-                    italic: args.italic === 'true' || undefined,
-                    underline: args.underline === 'true' || undefined,
-                    color: args.color || undefined,
-                    fontSize: args.fontSize ? parseFloat(args.fontSize) : undefined,
-                  }
-                : undefined
-
-              updateAgentAction(`正在替换 [块${blockIndex}]「${search.slice(0, 20)}...」`)
-              completeAgentStep()
-              updateAgentFile({ status: 'writing', name: fileName })
-
-              const dslResult = replaceViaDsl(search, replaceText, { blockIndex, format: format as any })
-
-              if (dslResult.success) {
-                totalReplacements += dslResult.count
-                updateAgentFile({ additions: dslResult.count, status: 'writing', name: fileName })
-                if (isElectron && currentFile) silentSaveToFile().catch(() => {})
-                completeToolActivity(activityId, 'success', `${dslResult.count} 处`)
-                return { tool, success: true, message: dslResult.message, data: { count: dslResult.count, blockIndex } }
-              } else {
-                // DSL 失败，回退到 HTML 路径
-                console.warn('[replace] DSL path failed, falling back to HTML:', dslResult.message)
-              }
-            }
-
-            // 解析格式化参数
-            const format = {
-              bold: args.bold === 'true',
-              italic: args.italic === 'true',
-              underline: args.underline === 'true',
-              color: args.color || undefined,
-              backgroundColor: args.backgroundColor || undefined,
-              fontSize: args.fontSize || undefined
-            }
-            const hasFormat = format.bold || format.italic || format.underline || 
-                             format.color || format.backgroundColor || format.fontSize
-
-            // 更新 Agent 进度 - 显示正在执行替换
-            const formatInfo = hasFormat ? ' (带格式)' : ''
-            updateAgentAction(`正在替换「${search.slice(0, 20)}${search.length > 20 ? '...' : ''}」${formatInfo}`)
-            completeAgentStep()
-            updateAgentFile({ status: 'writing', name: fileName })
-            addAgentFileOperation(`替换: "${search.slice(0, 15)}..." → "${replaceText.slice(0, 15)}..."`)
-
-            // AI 编辑始终使用内置编辑器（Tiptap）的方法
-            // ONLYOFFICE 仅用于预览，不参与 AI 编辑
-            const attemptedSearches = buildReplaceSearchCandidates(search)
-            const maxAttempts = Math.min(8, attemptedSearches.length)
-
-            let result: ReturnType<typeof replaceInDocument> | ReturnType<typeof replaceWithFormat> | null = null
-            let usedSearch = search
-
-            for (let i = 0; i < maxAttempts; i++) {
-              const candidateSearch = attemptedSearches[i]
-              const attemptResult = hasFormat
-                ? replaceWithFormat(candidateSearch, replaceText, format)
-                : replaceInDocument(candidateSearch, replaceText)
-
-              result = attemptResult
-              usedSearch = candidateSearch
-
-              if (attemptResult.success && attemptResult.count > 0) {
-                break
-              }
-            }
-
-            const fallbackCount = attemptedSearches.slice(0, maxAttempts).length
-
-            if (result && result.success && result.count > 0) {
-              totalReplacements += result.count
-              updateAgentFile({ additions: result.count, status: 'writing', name: fileName })
-
-              // 自动保存到磁盘
-              if (isElectron && currentFile) {
-                silentSaveToFile().catch(() => {})
-              }
-
-              completeToolActivity(activityId, 'success', `${result.count} 处`)
-
-              const fallbackHint = usedSearch !== search
-                ? `（自动修正 search 后命中）`
-                : ''
-
-              return {
-                tool,
-                success: true,
-                message: `成功替换 ${result.count} 处${fallbackHint}：「${search}」→「${replaceText}」`,
-                data: {
-                  count: result.count,
-                  searchText: usedSearch,
-                  originalSearchText: search,
-                  replaceText,
-                  positions: result.positions,
-                  attemptedSearches: attemptedSearches.slice(0, maxAttempts),
-                }
-              }
-            }
-
-            const failMessageCore = result?.message || `未找到「${search}」，请检查是否与文档内容完全匹配`
-            const failMessage = `${failMessageCore}；已自动尝试 ${fallbackCount} 种 search 变体`
-            const shortReason = failMessage.length > 26 ? `${failMessage.slice(0, 26)}...` : failMessage
-            completeToolActivity(activityId, 'error', shortReason)
-
+          if (activeSkillToolIds?.length && !activeSkillToolIds.includes(tool)) {
+            const reason = `blocked by skill ${activeSkill?.id || 'unknown'}`
+            markToolPreviewSkipped(tool, args, reason)
             return {
               tool,
               success: false,
-              message: failMessage,
-              data: {
-                count: result?.count || 0,
-                searchText: result?.searchText || search,
-                originalSearchText: search,
-                usedSearch,
-                replaceText,
-                attemptedSearches: attemptedSearches.slice(0, maxAttempts),
-                debug: result?.debug,
-              }
+              message: `Tool "${tool}" is not allowed while skill "${activeSkill?.displayName || activeSkill?.id || 'unknown'}" is active.`,
             }
           }
-
-          if (tool === 'review') {
-            // 文档审查工具：原位替换 + 审查元数据（reason/type）+ DSL 格式参数
-            const search = args.search || ''
-            const replaceText = args.replace || ''
-            const reason = args.reason || ''
-            const reviewType = args.type || 'style'
-
-            if (!search) {
-              return { tool, success: false, message: '缺少 search 参数' }
-            }
-
-            const reviewTypeLabels: Record<string, string> = {
-              grammar: '语法', logic: '逻辑', style: '措辞', typo: '错别字', format: '格式'
-            }
-            const typeLabel = reviewTypeLabels[reviewType] || reviewType
-
-            const activityId = claimOrRegisterToolActivity('review', args, `[${typeLabel}] ${truncateLabel(reason || search, 30)}`, { searchText: search, replaceText: replaceText })
-            await flushUiFrame()
-
-            // 如果当前是 ONLYOFFICE 模式，自动切换到内置编辑器以显示 diff 标记
-            if (editorMode === 'onlyoffice') {
-              setEditorMode('tiptap')
-              await new Promise(resolve => setTimeout(resolve, 100))
-            }
-
-            // 解析 DSL 格式参数
-            const format = {
-              bold: args.bold === 'true',
-              italic: args.italic === 'true',
-              underline: args.underline === 'true',
-              color: args.color || undefined,
-              backgroundColor: args.backgroundColor || undefined,
-              fontSize: args.fontSize || undefined,
-              fontFamily: args.fontFamily || undefined,
-            }
-            const hasFormat = format.bold || format.italic || format.underline ||
-                             format.color || format.backgroundColor || format.fontSize || format.fontFamily
-
-            updateAgentAction(`[${typeLabel}] 审查：${search.slice(0, 20)}${search.length > 20 ? '...' : ''}`)
-            completeAgentStep()
-            updateAgentFile({ status: 'writing', name: fileName })
-            addAgentFileOperation(`审查: [${typeLabel}] "${search.slice(0, 15)}..." → "${replaceText.slice(0, 15)}..."`)
-
-            // 执行替换（传入审查元数据）
-            const reviewMeta = { reason, type: reviewType }
-            const result = hasFormat
-              ? replaceWithFormat(search, replaceText, format, reviewMeta)
-              : replaceInDocument(search, replaceText, reviewMeta)
-
-            if (result.success && result.count > 0) {
-              totalReplacements += result.count
-              updateAgentFile({ additions: result.count, status: 'writing', name: fileName })
-
-              // 自动保存到磁盘
-              if (isElectron && currentFile) {
-                silentSaveToFile().catch(() => {})
-              }
-
-              completeToolActivity(activityId, 'success', `[${typeLabel}] ${result.count} 处`)
-              return {
-                tool,
-                success: true,
-                message: `[${typeLabel}] ${reason}\n替换 ${result.count} 处：「${search}」→「${replaceText}」`,
-                data: { count: result.count, reason, type: reviewType }
-              }
-            } else {
-              const failMessage = result.message || `未找到「${search}」，请检查是否与文档内容完全匹配`
-              const shortReason = failMessage.length > 26 ? `${failMessage.slice(0, 26)}...` : failMessage
-              completeToolActivity(activityId, 'error', shortReason)
-              return {
-                tool,
-                success: false,
-                message: failMessage,
-                data: {
-                  count: result.count,
-                  reason,
-                  type: reviewType,
-                  searchText: result.searchText || search,
-                  replaceText,
-                  debug: result.debug,
-                }
-              }
-            }
-          }
-
-          if (tool === 'word_edit_ops') {
-            // Structured document operations: support dry-run preview and then apply.
-            const rawOps = args.ops || ''
-            const dryRunTop = (args.dryRun || '').toLowerCase() === 'true'
-            const activityId = claimOrRegisterToolActivity('word_edit_ops', args, 'WordOps: running')
-            await flushUiFrame()
-
-            let ops: any[] = []
-            if (rawOps) {
-              try {
-                ops = JSON.parse(rawOps)
-              } catch {
-                completeToolActivity(activityId, 'error', 'ops JSON invalid')
-                return { tool, success: false, message: 'ops parse failed: expected a JSON array' }
-              }
-            }
-
-            if (!Array.isArray(ops) || ops.length === 0) {
-              completeToolActivity(activityId, 'error', 'ops empty')
-              return { tool, success: false, message: 'missing ops: expected a non-empty JSON array' }
-            }
-
-            patchToolActivity(activityId, { label: `WordOps: ${ops.length} ops` })
-
-            const inferredDryRun = ops.some((op) => op?.dryRun === true)
-            const isDryRun = dryRunTop || inferredDryRun
-
-            if (isDryRun) {
-              const preview = previewWordOps(ops)
-              const lines = (preview.data?.lines as string[] | undefined) || []
-              setPendingWordOps({
-                ops,
-                previewMessage: preview.message,
-                previewLines: lines,
-              })
-              completeToolActivity(activityId, preview.success ? 'success' : 'error', preview.success ? `${ops.length} ops preview` : 'preview failed')
-              return {
-                tool,
-                success: preview.success,
-                message: preview.success
-                  ? `${preview.message}${lines.length ? `\n- ${lines.join('\n- ')}` : ''}\n\nClick Apply Revisions below to execute.`
-                  : preview.message,
-                data: preview.data,
-              }
-            }
-
-            const prep = await prepareTemplateFillOutput(ops)
-            if (!prep.success) {
-              completeToolActivity(activityId, 'error', 'prepare failed')
-              return { tool, success: false, message: prep.message || 'template fill preparation failed' }
-            }
-
-            const result = applyWordOps(ops)
-            const createdCount = Number((result.data as { created?: number } | undefined)?.created ?? -1)
-            const activityDetail = result.success
-              ? (createdCount >= 0 ? `${createdCount} changes` : `${ops.length} ops`)
-              : (createdCount === 0 ? '0 changes' : 'apply failed')
-            completeToolActivity(activityId, result.success ? 'success' : 'error', activityDetail)
-            return {
-              tool,
-              success: result.success,
-              message: result.message,
-              data: result.data,
-            }
-          }
-
-          if (tool === 'create') {
-            const title = args.title || '新文档'
-            const content = args.content || ''
-            const activityId = registerToolActivity('create', `创建：${truncateLabel(title, 24)}`)
-            const styleRefPathArg = args.styleRefPath || args.styleRefFileName || args.styleRefName || ''
-            const contentRefPathArg = args.contentRefPath || args.contentRefFileName || args.contentRefName || ''
-            
-            // 检查是否有 elements 参数（带格式创建）
-            let elements: Array<{
-              type: 'heading' | 'paragraph' | 'table'
-              content?: string
-              level?: number
-              bold?: boolean
-              fontSize?: number
-              fontFamily?: string
-              alignment?: 'left' | 'center' | 'right' | 'justify'
-              rows?: number
-              cols?: number
-              data?: string[][]
-            }> = []
-            
-            // 检查是否有 DSL 参数（最高优先级）
-            const dslProvided = !!args.dsl
-            let parsedDsl: DocDsl | null = null
-            let dslError: string | null = null
-            if (args.dsl) {
-              try {
-                const dslObj = JSON.parse(args.dsl)
-                const validation = validateDocDsl(dslObj)
-                if (validation.valid) {
-                  parsedDsl = dslObj
-                  console.log('解析到 DSL:', { blocksCount: parsedDsl?.blocks?.length })
-                } else {
-                  dslError = validation.errors.map(e => `${e.path}: ${e.message}`).join('\n')
-                  console.error('DSL 校验失败:', validation.errors)
-                }
-              } catch (e) {
-                dslError = `DSL 解析失败: ${(e as Error).message}`
-                console.error('解析 DSL 失败:', e)
-              }
-            }
-
-            if (args.elements) {
-              try {
-                elements = JSON.parse(args.elements)
-              } catch (e) {
-                console.error('解析 elements 失败:', e)
-                // 继续使用 content 方式
-              }
-            }
-
-            // 更新 Agent 进度
-            updateAgentAction(`正在创建「${title}.docx」`)
-            completeAgentStep()
-            updateAgentFile({ status: 'writing', name: `${title}.docx` })
-
-            try {
-              const resolveRefPath = (maybePathOrName: string): string => {
-                if (!maybePathOrName) return ''
-                // Heuristic: absolute Windows path or UNC path
-                if (/[A-Za-z]:\\/.test(maybePathOrName) || maybePathOrName.startsWith('\\\\')) return maybePathOrName
-                const byAttached = attachedFiles.find((f) => f.name === maybePathOrName)
-                if (byAttached?.path) return byAttached.path
-                if (currentFile?.name === maybePathOrName) return currentFile.path
-                return ''
-              }
-
-              const styleRefPath = resolveRefPath(String(styleRefPathArg || ''))
-              const contentRefPath = resolveRefPath(String(contentRefPathArg || ''))
-
-              if (styleRefPathArg && !styleRefPath) {
-                completeToolActivity(activityId, 'error', '缺少样式参考')
-                return {
-                  tool,
-                  success: false,
-                  message: `找不到样式参考文件：${styleRefPathArg}。请把“格式参考.docx”拖拽为附件，或提供绝对路径（如 C:\\...\\格式参考.docx）。`,
-                }
-              }
-              if (contentRefPathArg && !contentRefPath) {
-                completeToolActivity(activityId, 'error', '缺少内容参考')
-                return {
-                  tool,
-                  success: false,
-                  message: `找不到内容参考文件：${contentRefPathArg}。请把“内容参考.docx”拖拽为附件，或提供绝对路径（如 C:\\...\\内容参考.docx）。`,
-                }
-              }
-
-              // 如果提供了“内容参考 docx”，自动解析为 elements（优先级：args.elements > contentRefPath > content）
-              let previewHtml = content
-              if (elements.length === 0 && contentRefPath) {
-                if (!isElectron || !window.electronAPI?.readFile) {
-                  completeToolActivity(activityId, 'error', '不支持')
-                  return { tool, success: false, message: 'contentRefPath 需要桌面版（Electron）才能读取本地文件' }
-                }
-
-                const read = await window.electronAPI.readFile(contentRefPath)
-                if (!read.success || !read.data) {
-                  completeToolActivity(activityId, 'error', '读取失败')
-                  return { tool, success: false, message: `读取内容参考失败：${read.error || '未知错误'}` }
-                }
-                if (read.type !== 'docx') {
-                  completeToolActivity(activityId, 'error', '类型不匹配')
-                  return { tool, success: false, message: 'contentRefPath 必须是 .docx 文件' }
-                }
-
-                const parsed = await parseDocxToHtmlForAgent(read.data)
-                const parsedElements = docxHtmlToElements(parsed.html || '')
-                if (parsedElements.length > 0) {
-                  elements = parsedElements as any
-                  previewHtml = elementsToHtmlPreview(parsedElements)
-                } else {
-                  previewHtml = parsed.html || content
-                }
-              }
-
-              console.log('create 工具参数:', {
-                title,
-                content: content.slice(0, 100),
-                elementsCount: elements.length,
-                hasDsl: !!parsedDsl,
-                styleRefPath,
-                contentRefPath,
-                rawArgs: args
-              })
-              
-              if (dslProvided && !parsedDsl) {
-                completeToolActivity(activityId, 'error', 'DSL 校验失败')
-                finishAgentProgress()
-                return {
-                  tool,
-                  success: false,
-                  message: dslError || 'DSL 校验失败，请检查 DSL 结构是否正确'
-                }
-              }
-
-              // 如果有 DSL，使用 DSL 方式创建（最高优先级）
-              if (parsedDsl) {
-                console.log('使用 DSL 创建文档:', parsedDsl.blocks?.length, '个块')
-                const result = await createDocumentFromDsl(title, parsedDsl)
-                if (result.success) {
-                  completeToolActivity(activityId, 'success', `${parsedDsl.blocks?.length || 0} 块`)
-                  finishAgentProgress()
-                  return {
-                    tool,
-                    success: true,
-                    message: result.message,
-                    data: { fileName: `${title}.docx`, blockCount: parsedDsl.blocks?.length, filePath: result.filePath }
-                  }
-                } else {
-                  completeToolActivity(activityId, 'error', 'DSL 错误')
-                  finishAgentProgress()
-                  return { tool, success: false, message: result.message }
-                }
-              }
-
-              // 如果有 elements，使用带格式创建（直接用 docx 库生成文件）
-              if (elements.length > 0) {
-                console.log('使用 elements 创建带格式文档:', elements)
-                await createNewDocument(title, previewHtml || content, elements as any, styleRefPath || undefined)
-
-                // 轻量验证：确保文件真实落盘，并包含关键样式（字体/缩进）
-                if (isElectron && window.electronAPI?.readFile && workspacePath) {
-                  const safeTitle = String(title).replace(/[<>:"/\\|?*]/g, '_').slice(0, 50)
-                  const finalTitle = safeTitle.toLowerCase().endsWith('.docx') ? safeTitle.slice(0, -5) : safeTitle
-                  const outPath = `${workspacePath}\\${finalTitle}.docx`
-                  const out = await window.electronAPI.readFile(outPath)
-                  if (!out.success || !out.data) {
-                    completeToolActivity(activityId, 'error', '未写入')
-                    finishAgentProgress()
-                    return { tool, success: false, message: `文档创建后读取失败，可能未写入成功：${out.error || outPath}` }
-                  }
-                  if (out.type === 'docx') {
-                    try {
-                      const bin = atob(out.data)
-                      const bytes = new Uint8Array(bin.length)
-                      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-                      const zip = await JSZip.loadAsync(bytes)
-                      const stylesXml = await zip.file('word/styles.xml')?.async('string')
-                      const hasRFonts = !!stylesXml && /<w:rFonts\b/.test(stylesXml)
-                      const hasIndent = !!stylesXml && /<w:ind\b[^>]*w:firstLine=/.test(stylesXml)
-                      // eslint-disable-next-line no-console
-                      console.log('[create.verify] styles:', { hasRFonts, hasIndent })
-                    } catch (e) {
-                      // ignore
-                    }
-                  }
-                }
-                const elemSavedToDisk = !!(isElectron && window.electronAPI && workspacePath)
-                 completeToolActivity(activityId, 'success', `${elements.length} 段`)
-                finishAgentProgress()
-                return {
-                  tool,
-                  success: true,
-                  message: elemSavedToDisk
-                    ? `已创建并保存文档：${title}.docx（包含 ${elements.length} 个格式化元素）`
-                    : `已在编辑器中创建文档：${title}.docx（包含 ${elements.length} 个格式化元素，尚未保存到磁盘，请用户点击保存）`,
-                  data: { fileName: `${title}.docx`, elementCount: elements.length, styleRefPath, contentRefPath, savedToDisk: elemSavedToDisk }
-                }
-              }
-              
-              // 普通方式创建（纯文本内容）
-              console.log('使用纯文本创建文档:', { title, contentLen: content.length, workspacePath })
-              await createNewDocument(title, content, undefined, styleRefPath || undefined)
-              const lineCount = content.split('\n').length
-
-              // 验证文件是否真正写入磁盘
-              let savedToDisk = false
-              if (isElectron && window.electronAPI?.readFile && workspacePath) {
-                const safeT = String(title).replace(/[<>:"/\\|?*]/g, '_').slice(0, 50)
-                const finalT = safeT.toLowerCase().endsWith('.docx') ? safeT.slice(0, -5) : safeT
-                const outPath = `${workspacePath}\\${finalT}.docx`
-                try {
-                  const verify = await window.electronAPI.readFile(outPath)
-                  savedToDisk = !!(verify.success && verify.data)
-                  if (!savedToDisk) {
-                    console.warn('[create] 文件验证失败:', outPath, verify.error)
-                  }
-                } catch (verifyErr) {
-                  console.warn('[create] 文件验证异常:', verifyErr)
-                }
-              }
-
-              completeToolActivity(activityId, savedToDisk ? 'success' : 'error', `${lineCount} 行`)
-              finishAgentProgress()
-              
-              return { 
-                tool, 
-                success: true, 
-                message: savedToDisk
-                  ? `已创建并保存文档：${title}.docx（${lineCount} 行内容）。现在可以用 replace 工具继续填充内容。`
-                  : `文档已在编辑器中打开但未保存到磁盘（${lineCount} 行内容）。请用户先 Ctrl+S 保存，然后再继续用 replace 填充内容。`,
-                data: { fileName: `${title}.docx`, lines: lineCount, styleRefPath, contentRefPath, savedToDisk }
-              }
-            } catch (e) {
-              console.error('创建文档失败:', e)
-              completeToolActivity(activityId, 'error', '创建失败')
-              return { tool, success: false, message: `创建失败: ${e}` }
-            }
-          }
-
-          if (tool === 'ppt_create') {
-            const title = args.title || '新建演示文稿'
-            const theme = args.theme || ''
-            const style = args.style || ''
-            const outline = args.outline || ''
-            const activityId = registerToolActivity('ppt_create', `PPT：${truncateLabel(title, 24)}`)
-
-            if (!isElectron || !window.electronAPI?.pptGenerateDeck) {
-              completeToolActivity(activityId, 'error', '不支持')
-              return { tool, success: false, message: 'PPT 生成仅支持桌面版（Electron）' }
-            }
-
-            if (!outline || outline.trim().length < 10) {
-              completeToolActivity(activityId, 'error', '缺少大纲')
-              return { tool, success: false, message: '缺少 outline 参数（需要 PPT 大纲内容）' }
-            }
-
-            // 输出路径：优先当前文件目录，其次工作区根目录
-            const dir = currentFile?.path
-              ? currentFile.path.substring(0, currentFile.path.lastIndexOf('\\'))
-              : (workspacePath || null)
-
-            if (!dir) {
-              completeToolActivity(activityId, 'error', '缺少工作区')
-              return { tool, success: false, message: '缺少工作区路径，请先打开一个文件夹' }
-            }
-
-            const safeTitle = String(title).replace(/[<>:"/\\|?*]/g, '_').slice(0, 60) || '新建演示文稿'
-            const pptxName = safeTitle.toLowerCase().endsWith('.pptx') ? safeTitle : `${safeTitle}.pptx`
-            const outputPath = `${dir}\\${pptxName}`
-
-            // 获取 API Keys
-            const openRouterApiKey = settings?.openRouterApiKey || ''
-            // 优先使用专门的 DashScope API Key
-            const dashscopeApiKey = settings?.dashscopeApiKey || settings?.apiKey || ''
-
-            // 计算大概的页数
-            const slideCountMatch = outline.match(/第\s*(\d+)\s*页/g)
-            const estimatedSlideCount = slideCountMatch ? slideCountMatch.length : 3
-
-            try {
-              // ========== 阶段1：调用 Gemini 生成文生图提示词 ==========
-              updateAgentAction(`正在让 Gemini 设计视觉风格...`)
-              completeAgentStep()
-              updateAgentFile({ status: 'writing', name: pptxName })
-              addAgentFileOperation(`PPT: 正在设计 ${estimatedSlideCount} 页视觉`)
-
-              let slides: Array<{ prompt: string; negativePrompt?: string }> = []
-              let deckDesignConcept = ''
-              let deckColorPalette = ''
-
-              if (window.electronAPI?.openrouterGeminiPptPrompts) {
-                const geminiResult = await window.electronAPI.openrouterGeminiPptPrompts({
-                  apiKey: openRouterApiKey,
-                  outline,
-                  slideCount: estimatedSlideCount,
-                  theme,
-                  style,
-                  // 主模型回退参数（当没有 OpenRouter API Key 时使用）
-                  mainApiKey: settings?.apiKey || '',
-                  mainBaseUrl: settings?.baseUrl || '',
-                  mainModel: settings?.model || '',
-                })
-
-                if (!geminiResult.success || !geminiResult.slides) {
-                  completeToolActivity(activityId, 'error', '设计生成失败')
-                  return { tool, success: false, message: `设计提示词生成失败: ${geminiResult.error || '未知错误'}` }
-                }
-
-                deckDesignConcept = geminiResult.designConcept || ''
-                deckColorPalette = geminiResult.colorPalette || ''
-
-                slides = geminiResult.slides.map((s) => ({
-                  prompt: s.prompt,
-                  negativePrompt: s.negativePrompt,
-                }))
-
-                updateAgentAction(`设计完成，共 ${slides.length} 页，开始生成图片...`)
-              } else {
-                completeToolActivity(activityId, 'error', '缺少 API')
-                return { 
-                  tool, 
-                  success: false, 
-                  message: '缺少可用的 API。请在设置中配置 OpenRouter API Key 或主模型 API Key。' 
-                }
-              }
-
-              // ========== 阶段2：调用 DashScope 生成图片 ==========
-              updateAgentAction(`正在生成「${pptxName}」(${slides.length} 页，两张两张生图)...`)
-              addAgentFileOperation(`PPT: 生成 ${slides.length} 页图片`)
-
-              // 注意：负面词用于“去廉价/去AI味”，避免过强霓虹、塑料感、模板化等距城市
-              const negativeDefault =
-                'watermark, logo, brand name text, badge, QR code, UI, screenshot, HUD, sci-fi interface, holographic UI, futuristic dashboard, neon cyberpunk, neon cyan, bright cyan, fluorescent cyan, neon teal, cheap turquoise, generic isometric city, isometric cityscape, circuit-board city, lowres, blurry, garbled Chinese, wrong characters, text distortion, misspelling, random letters, gibberish, extra text, english text, ugly typography, amateur layout, noisy background, oversaturated, cheap plastic, toy-like, glossy, harsh specular, overbloom, stock 3d icons, generic template, ai artifacts, uncanny'
-
-              // 根据用户选择的模型决定分辨率（默认使用 Gemini 生图）
-              const pptImageModel = settings?.pptImageModel || 'gemini-image'
-              const imageSize = pptImageModel === 'z-image-turbo' ? '2048*1152' : '1664*928'
-              console.log(`[PPT Tool] 使用生图模型: ${pptImageModel}`)
-
-              const result = await window.electronAPI.pptGenerateDeck({
-                outputPath,
-                slides: slides.map((s) => ({
-                  prompt: s.prompt,
-                  negativePrompt: s.negativePrompt || negativeDefault,
-                })),
-                // 主模型 API Key（用于 Gemini 生图）
-                mainApiKey: settings?.apiKey || '',
-                dashscope: {
-                  apiKey: dashscopeApiKey,
-                  region: 'cn',
-                  size: imageSize,
-                  model: pptImageModel,
-                  promptExtend: false,
-                  watermark: false,
-                  negativePromptDefault: negativeDefault,
-                },
-                postprocess: { mode: 'letterbox' },
-                repair: {
-                  enabled: !!openRouterApiKey, // 只有配置了 OpenRouter 才启用修复
-                  openRouterApiKey,
-                  model: 'google/gemini-3-pro-preview',
-                  maxAttempts: 2,
-                  deckContext: {
-                    designConcept: deckDesignConcept,
-                    colorPalette: deckColorPalette,
-                  },
-                },
-              })
-
-              if (!result.success || !result.path) {
-                completeToolActivity(activityId, 'error', result.error || '失败')
-                return { tool, success: false, message: `PPT 生成失败: ${result.error || '未知错误'}` }
-              }
-
-              await refreshFiles()
-
-              // 打开新生成的 PPT
-              await openFile({ name: pptxName, path: result.path, type: 'file' as const })
-
-              updateAgentFile({ additions: slides.length, status: 'done', name: pptxName })
-              finishAgentProgress()
-              completeToolActivity(activityId, 'success', `${slides.length} 页`)
-
-              return {
-                tool,
-                success: true,
-                message: `已生成 PPT：${pptxName}（${slides.length} 页，由 Gemini 设计 + DashScope 生图，已导出到工作区）`,
-                data: { fileName: pptxName, path: result.path, slideCount: slides.length },
-              }
-            } catch (e) {
-              console.error('PPT 生成失败:', e)
-              completeToolActivity(activityId, 'error', '异常')
-              return { tool, success: false, message: `PPT 生成失败: ${e}` }
-            }
-          }
-          
-          // PPT 编辑工具（拖拽/框选触发）
-          if (tool === 'ppt_edit') {
-            const pageNumber = Number(args.pageNumber) || 1
-            const mode = args.mode === 'partial_edit' ? 'partial_edit' : 'regenerate'
-            const feedback = args.feedback || ''
-            const pptxPath = args.pptxPath || currentPptEditContext?.pptxPath || ''
-            
-            // 注意：Agent 参数解析默认都是 string，这里做一次安全解析
-            let regionRect: { x: number; y: number; w: number; h: number } | undefined = currentPptEditContext?.regionRect
-            if (typeof args.regionRect === 'string' && args.regionRect.trim()) {
-              try {
-                regionRect = JSON.parse(args.regionRect)
-              } catch {
-                // ignore
-              }
-            }
-            const regionScreenshot =
-              (typeof args.regionScreenshot === 'string' && args.regionScreenshot.trim())
-                ? args.regionScreenshot
-                : currentPptEditContext?.imageBase64
-            
-            const modeLabel = mode === 'regenerate' ? '整页重做' : '局部编辑'
-            const activityId = registerToolActivity('ppt_edit', `PPT ${modeLabel}：第 ${pageNumber} 页`)
-            
-            if (!isElectron || !window.electronAPI?.pptEditSlides) {
-              completeToolActivity(activityId, 'error', '不支持')
-              return { tool, success: false, message: 'PPT 编辑仅支持桌面版（Electron）' }
-            }
-            
-            if (!pptxPath) {
-              completeToolActivity(activityId, 'error', '缺少路径')
-              return { tool, success: false, message: '缺少 PPTX 文件路径' }
-            }
-            
-            try {
-              updateAgentAction(`正在${modeLabel}第 ${pageNumber} 页...`)
-              
-              const openRouterApiKey = settings?.openRouterApiKey || ''
-              // 优先使用专门的 DashScope API Key
-              const dashscopeApiKey = settings?.dashscopeApiKey || settings?.apiKey || ''
-              
-              const result = await window.electronAPI.pptEditSlides({
-                pptxPath,
-                pageNumbers: [pageNumber],
-                mode,
-                feedback,
-                regionScreenshot,
-                regionRect,
-                openRouterApiKey,
-                dashscopeApiKey,
-                mainApiKey: settings?.apiKey || '',
-                pptImageModel: settings?.pptImageModel || 'gemini-image',
-              })
-              
-              if (!result.success) {
-                completeToolActivity(activityId, 'error', result.error || '失败')
-                return { tool, success: false, message: `PPT 编辑失败: ${result.error || '未知错误'}` }
-              }
-              
-              // 刷新文件并跳转到编辑的页面
-              await refreshFiles()
-              
-              // 触发跳转事件
-              window.dispatchEvent(new CustomEvent('ppt-jump-to-page', {
-                detail: { pageNumber }
-              }))
-              
-              // 重新打开文件以刷新预览
-              if (currentFile?.path === pptxPath) {
-                await openFile({ name: currentFile.name, path: pptxPath, type: 'file' as const })
-              }
-              
-              completeToolActivity(activityId, 'success', modeLabel)
-              
-              return {
-                tool,
-                success: true,
-                message: `已完成第 ${pageNumber} 页的${modeLabel}`,
-                data: { pageNumber, mode, fileName: (pptxPath.split(/[\\/]/).pop() || ''), pptxPath },
-              }
-            } catch (e) {
-              console.error('PPT 编辑失败:', e)
-              completeToolActivity(activityId, 'error', '异常')
-              return { tool, success: false, message: `PPT 编辑失败: ${e}` }
-            }
-          }
-
-          // ── word_chart: 在 Word 文档中插入图表 ──
-          if (tool === 'word_chart') {
-            const chartType = (args.type || 'bar') as ChartConfig['type']
-            const title = args.title || ''
-            const position = args.position || 'end'
-            const width = args.width ? parseInt(args.width) : 500
-            const height = args.height ? parseInt(args.height) : 300
-
-            let categories: string[]
-            let series: ChartSeries[]
-            try {
-              categories = JSON.parse(args.categories || '[]')
-              series = JSON.parse(args.series || '[]')
-            } catch (e) {
-              return { tool, success: false, message: `图表参数解析失败: ${(e as Error).message}` }
-            }
-
-            if (!categories.length || !series.length) {
-              return { tool, success: false, message: '缺少 categories 或 series 数据' }
-            }
-
-            const chartConfig: ChartConfig = {
-              type: chartType,
-              title: title || undefined,
-              categories,
-              series,
-              widthPx: width,
-              heightPx: height,
-              stacking: args.stacking as ChartConfig['stacking'],
-              legendPosition: (args.legendPosition || 'bottom') as ChartConfig['legendPosition'],
-            }
-
-            const encoded = encodeURIComponent(JSON.stringify(chartConfig))
-            const chartHtml = `<div data-type="docx-chart" data-chart-config="${encoded}" style="width:${width}px;height:${height}px"></div>`
-
-            const activityId = claimOrRegisterToolActivity('word_chart', args, `Chart: ${chartType}`, { searchText: '', replaceText: title || chartType })
-            await flushUiFrame()
-
-            if (editorMode === 'onlyoffice') {
-              setEditorMode('tiptap')
-              await new Promise(resolve => setTimeout(resolve, 100))
-            }
-
-            updateAgentAction(`正在插入${title || chartType}图表`)
-            completeAgentStep()
-
-            const result = insertInDocument(position, chartHtml)
-
-            if (result.success) {
-              updateAgentFile({ additions: 1, status: 'writing', name: fileName })
-              let savedMsg = ''
-              if (isElectron && currentFile) {
-                const saveResult = await silentSaveToFile()
-                savedMsg = saveResult.success ? '（已自动保存）' : `（保存失败: ${saveResult.error}）`
-              }
-              completeToolActivity(activityId, 'success', `${chartType} 图表`)
-              return {
-                tool,
-                success: true,
-                message: `已插入${title ? `"${title}"` : ''}${chartType}图表到${position === 'end' ? '末尾' : position === 'start' ? '开头' : position}${savedMsg}`,
-              }
-            } else {
-              completeToolActivity(activityId, 'error', result.message)
-              return { tool, success: false, message: result.message }
-            }
-          }
-
-          if (tool === 'insert') {
-            const position = args.position || 'end'
-            let content = args.content || ''
-
-            // 支持 DSL 参数：解析为带格式的 HTML 后插入
-            let dslBlockCount = 0
-            if (args.dsl) {
-              try {
-                const dslObj: DocDsl = JSON.parse(args.dsl)
-                const validation = validateDocDsl(dslObj)
-                if (!validation.valid) {
-                  const errMsg = validation.errors.map((e: any) => `${e.path}: ${e.message}`).join('; ')
-                  return { tool, success: false, message: `DSL 校验失败: ${errMsg}` }
-                }
-                content = dslToHtml(dslObj)
-                dslBlockCount = dslObj.blocks?.length || 0
-                console.log('[insert] DSL → HTML:', { blocks: dslBlockCount, htmlLen: content.length })
-              } catch (e) {
-                return { tool, success: false, message: `DSL 解析失败: ${(e as Error).message}` }
-              }
-            }
-
-            if (!content) {
-              return { tool, success: false, message: '缺少 content 或 dsl 参数' }
-            }
-
-            const activityId = claimOrRegisterToolActivity('insert', args, `Insert: ${position}`, { searchText: args.target || position, replaceText: content })
-            await flushUiFrame()
-
-            // 如果当前是 ONLYOFFICE 模式，自动切换到内置编辑器
-            if (editorMode === 'onlyoffice') {
-              setEditorMode('tiptap')
-              await new Promise(resolve => setTimeout(resolve, 100))
-            }
-            
-            // 更新 Agent 进度
-            updateAgentAction(`正在插入内容到 ${position === 'start' ? '开头' : position === 'end' ? '末尾' : position}`)
-            completeAgentStep()
-            addAgentFileOperation(`插入: ${dslBlockCount ? `${dslBlockCount} 个 DSL 块` : content.slice(0, 30) + '...'}`)
-            
-            // AI 编辑始终使用内置编辑器（Tiptap）的方法
-            // 如果有 DSL 参数且 position 支持 blockIndex，走 DSL 路径
-            let result: { success: boolean; message: string }
-            if (args.dsl && (position.startsWith('blockIndex:') || position === 'start' || position === 'end' || position.startsWith('after:') || position.startsWith('before:'))) {
-              try {
-                const dslObj: DocDsl = JSON.parse(args.dsl)
-                result = insertViaDsl(position, dslObj.blocks || [])
-              } catch (e) {
-                result = insertInDocument(position, content)
-              }
-            } else {
-              result = insertInDocument(position, content)
-            }
-            
-            if (result.success) {
-              updateAgentFile({ additions: 1, status: 'writing', name: fileName })
-              
-              // 自动保存到磁盘（确保 .docx 文件包含插入的内容）
-              let savedMsg = ''
-              if (isElectron && currentFile) {
-                const saveResult = await silentSaveToFile()
-                savedMsg = saveResult.success ? '（已自动保存）' : `（保存失败: ${saveResult.error}）`
-              }
-              
-              completeToolActivity(activityId, 'success', dslBlockCount ? `${dslBlockCount} 块` : undefined)
-              return { 
-                tool, 
-                success: true, 
-                message: (dslBlockCount
-                  ? `已插入 ${dslBlockCount} 个 DSL 格式块到${position === 'end' ? '末尾' : position === 'start' ? '开头' : position}`
-                  : result.message) + savedMsg,
-                data: { position, contentLength: content.length, dslBlocks: dslBlockCount || undefined }
-              }
-            } else {
-              completeToolActivity(activityId, 'error', result.message)
-              return { tool, success: false, message: result.message }
-            }
-          }
-          
-          if (tool === 'delete') {
-            const target = args.target || ''
-            const blockIndex = args.blockIndex ? parseInt(args.blockIndex) : undefined
-
-            if (!target && blockIndex === undefined) {
-              return { tool, success: false, message: '缺少 target 或 blockIndex 参数' }
-            }
-
-            const activityId = claimOrRegisterToolActivity('delete', args, `Delete: ${truncateLabel(target, 24)}`, { searchText: target })
-            await flushUiFrame()
-
-            // 如果当前是 ONLYOFFICE 模式，自动切换到内置编辑器
-            if (editorMode === 'onlyoffice') {
-              setEditorMode('tiptap')
-              await new Promise(resolve => setTimeout(resolve, 100))
-            }
-            
-            // 更新 Agent 进度
-            updateAgentAction(`正在删除「${target.slice(0, 20)}${target.length > 20 ? '...' : ''}」`)
-            completeAgentStep()
-            addAgentFileOperation(`删除: "${target.slice(0, 30)}..."`)
-            
-            // 如果有 blockIndex，走 DSL 路径
-            const result = (blockIndex !== undefined && !isNaN(blockIndex))
-              ? deleteViaDsl(target, { blockIndex })
-              : deleteInDocument(target)
-            
-            if (result.success) {
-              updateAgentFile({ deletions: result.count, status: 'writing', name: fileName })
-              completeToolActivity(activityId, 'success', `${result.count} 处`)
-              return { 
-                tool, 
-                success: true, 
-                message: result.message,
-                data: { count: result.count, target }
-              }
-            } else {
-              completeToolActivity(activityId, 'error', result.message)
-              return { tool, success: false, message: result.message }
-            }
-          }
-
-          // 复制模板并自动替换内容
-          // 方案：先复制文件，再用 ONLYOFFICE 在编辑器中执行替换
-          if (tool === 'copy_template' || tool === 'create_from_template') {
-            const newTitle = args.newTitle || '新文档'
-            let replacements: Array<{search: string, replace: string}> = []
-            const activityId = registerToolActivity(tool, `模板：${truncateLabel(newTitle, 24)}`)
-            
-            if (args.replacements) {
-              try {
-                replacements = JSON.parse(args.replacements)
-              } catch (e) {
-                console.error('解析替换数据失败:', e)
-              }
-            }
-
-            if (!currentFile) {
-              completeToolActivity(activityId, 'error', '缺少模板')
-              return { tool, success: false, message: '没有打开的文档作为模板' }
-            }
-
-            updateAgentAction(`正在基于模板创建「${newTitle}.docx」`)
-            completeAgentStep()
-
-            try {
-              if (isElectron && window.electronAPI) {
-                const sourcePath = currentFile.path
-                const dir = sourcePath.substring(0, sourcePath.lastIndexOf('\\'))
-                const newPath = `${dir}\\${newTitle}.docx`
-                
-                // 第一步：复制文件
-                updateAgentAction(`正在复制模板...`)
-                const sourceContent = await window.electronAPI.readFile(sourcePath)
-                if (!sourceContent.success) {
-                  return { tool, success: false, message: '读取模板文件失败' }
-                }
-                
-                if (sourceContent.type === 'docx') {
-                  await window.electronAPI.writeBinaryFile(newPath, sourceContent.data!)
-                } else {
-                  await window.electronAPI.writeFile(newPath, sourceContent.data!)
-                }
-                
-                // 刷新文件列表
-                await refreshFiles()
-                
-                // 第二步：打开新文件
-                updateAgentAction(`正在打开新文档...`)
-                const newFile = { name: `${newTitle}.docx`, path: newPath, type: 'file' as const }
-                await openFile(newFile)
-                
-                // 第三步：等待 ONLYOFFICE 加载完成并执行替换
-                if (replacements.length > 0) {
-                  updateAgentAction(`等待编辑器加载...`)
-                  
-                  // 等待 connector 就绪
-                  let connectorReady = false
-                  for (let retry = 0; retry < 40; retry++) {
-                    await new Promise(resolve => setTimeout(resolve, 500))
-                    
-                    if (window.onlyOfficeConnector?.searchAndReplace) {
-                      try {
-                        const testText = await window.onlyOfficeConnector.getDocumentText()
-                        if (testText && testText.length > 10) {
-                          connectorReady = true
-                          console.log('✓ ONLYOFFICE connector 已就绪')
-                          break
-                        }
-                      } catch (e) {
-                        console.log('等待 connector...', retry)
-                      }
-                    }
-                  }
-                  
-                  if (!connectorReady) {
-                    updateAgentFile({ additions: 0, status: 'done', name: `${newTitle}.docx` })
-                    finishAgentProgress()
-                    completeToolActivity(activityId, 'success', '已创建')
-                    return { 
-                      tool, 
-                      success: true, 
-                      message: `已创建「${newTitle}.docx」，但编辑器未就绪，请手动替换内容`
-                    }
-                  }
-                  
-                  // 执行替换
-                  await new Promise(resolve => setTimeout(resolve, 1000))
-                  
-                  let successCount = 0
-                  updateAgentAction(`正在替换内容 (0/${replacements.length})...`)
-                  
-                  for (let i = 0; i < replacements.length; i++) {
-                    const item = replacements[i]
-                    updateAgentAction(`替换 (${i+1}/${replacements.length}): ${item.search.slice(0, 20)}...`)
-                    
-                    try {
-                      console.log(`尝试替换: "${item.search}" -> "${item.replace}"`)
-                      const result = await window.onlyOfficeConnector!.searchAndReplace(item.search, item.replace, true)
-                      if (result) {
-                        successCount++
-                        console.log(`✓ 替换成功`)
-                      } else {
-                        console.log(`✗ 未找到匹配`)
-                      }
-                    } catch (e) {
-                      console.error(`替换失败:`, e)
-                    }
-                    
-                    await new Promise(resolve => setTimeout(resolve, 300))
-                  }
-                  
-                  updateAgentFile({ additions: successCount, status: 'done', name: `${newTitle}.docx` })
-                  finishAgentProgress()
-                  completeToolActivity(activityId, 'success', `${successCount}/${replacements.length}`)
-                  
-                  const resultMsg = successCount > 0
-                    ? `已创建「${newTitle}.docx」，成功替换 ${successCount}/${replacements.length} 处内容`
-                    : `已创建「${newTitle}.docx」，但替换未成功（可能是搜索文字不精确）`
-                  
-                  return { 
-                    tool, 
-                    success: true, 
-                    message: resultMsg,
-                    data: { 
-                      fileName: `${newTitle}.docx`,
-                      totalReplacements: replacements.length,
-                      successfulReplacements: successCount
-                    }
-                  }
-                } else {
-                  updateAgentFile({ additions: 0, status: 'done', name: `${newTitle}.docx` })
-                  finishAgentProgress()
-                  completeToolActivity(activityId, 'success')
-                  
-                  return { 
-                    tool, 
-                    success: true, 
-                    message: `已复制创建「${newTitle}.docx」`
-                  }
-                }
-              } else {
-                completeToolActivity(activityId, 'error', '仅支持桌面')
-                return { tool, success: false, message: '此功能需要在桌面应用中使用' }
-              }
-            } catch (e) {
-              console.error('复制模板失败:', e)
-              completeToolActivity(activityId, 'error', '复制失败')
-              return { tool, success: false, message: `复制模板失败: ${e}` }
-            }
-          }
-
-          if (tool === 'workspace_list') {
-            const folderArg = (args.folder || args.path || '').trim()
-            const refresh = (args.refresh || '').toLowerCase() === 'true'
-            const folderPath = folderArg || getWorkspaceFolderPath()
-            if (!folderPath) {
-              return { tool, success: false, message: '无法确定工作夹目录，请先打开一个文件' }
-            }
-            const activityId = registerToolActivity('workspace_list', `索引：${truncateLabel(folderPath, 24)}`)
-            updateAgentAction('正在读取工作夹文件清单')
-            const index = await buildWorkspaceIndex(folderPath, refresh)
-            if (!index) {
-              completeToolActivity(activityId, 'error', '读取失败')
-              return { tool, success: false, message: '读取工作夹失败，请稍后重试' }
-            }
-            const indexText = formatWorkspaceIndex(index.flatFiles, folderPath)
-            completeToolActivity(activityId, 'success', `${index.flatFiles.length} 个文件`)
-            return {
-              tool,
-              success: true,
-              message: `=== 工作夹目录（${folderPath}）===\n${indexText}`,
-              data: { folderPath, total: index.flatFiles.length }
-            }
-          }
-
-          if (tool === 'workspace_open') {
-            const targetPath = (args.path || args.file || args.filePath || '').trim()
-            const targetName = (args.name || '').trim()
-            const targetRel = (args.relativePath || '').trim()
-            const file = await resolveWorkspaceFile({ path: targetPath || targetRel, name: targetName, relativePath: targetRel })
-            if (!file) {
-              return { tool, success: false, message: '未找到指定文件，请先使用 workspace_list 查看路径' }
-            }
-            const activityId = registerToolActivity('workspace_open', `打开：${truncateLabel(file.name, 24)}`)
-            updateAgentAction(`正在打开 ${file.name}`)
-            await openFile(file)
-            completeToolActivity(activityId, 'success')
-            return { tool, success: true, message: `已打开文件：${file.name}`, data: { filePath: file.path } }
-          }
-
-          if (tool === 'workspace_summarize' || tool === 'workspace_read') {
-            const targetPath = (args.path || args.file || args.filePath || '').trim()
-            const targetName = (args.name || '').trim()
-            const targetRel = (args.relativePath || '').trim()
-            const format = (args.format || '').trim().toLowerCase()
-            const file = await resolveWorkspaceFile({ path: targetPath || targetRel, name: targetName, relativePath: targetRel })
-            if (!file) {
-              return { tool, success: false, message: '未找到指定文件，请先使用 workspace_list 查看路径' }
-            }
-            const maxCharsArg = args.maxChars ? parseInt(args.maxChars, 10) : undefined
-            const maxSlidesArg = args.maxSlides ? parseInt(args.maxSlides, 10) : undefined
-            const maxChars = Math.min(Math.max(maxCharsArg || (tool === 'workspace_read' ? WORKSPACE_READ_MAX_CHARS : WORKSPACE_SUMMARY_MAX_CHARS), 500), 20000)
-            const maxSlides = Math.min(Math.max(maxSlidesArg || WORKSPACE_PPTX_MAX_SLIDES, 1), 20)
-            const activityId = registerToolActivity(tool, `读取：${truncateLabel(file.name, 24)}`)
-            updateAgentAction(`正在读取 ${file.name}`)
-            const content = await summarizeWorkspaceFile(file, { maxChars, maxSlides, format: format || undefined })
-            completeToolActivity(activityId, 'success')
-            return {
-              tool,
-              success: true,
-              message: content,
-              data: { filePath: file.path, fileName: file.name, maxChars, format }
-            }
-          }
-
-          if (tool === 'web_search') {
-            const query = (args.query || args.q || args.keyword || '').trim()
-            if (!query) {
-              return { tool, success: false, message: '缺少 query 参数' }
-            }
-            const locale = args.hl || args.locale || 'zh-CN'
-            const region = args.gl || args.region || 'cn'
-            const num = args.num ? parseInt(args.num, 10) || 5 : 5
-
-            const activityId = registerToolActivity('web_search', `搜索：${truncateLabel(query, 28)}`)
-            updateAgentAction(`正在检索外部信息：${truncateLabel(query, 28)}`)
-
-            const searchResponse = await runWebSearch(query, { locale, region, num, braveApiKey: settings.braveApiKey })
-
-            const webResults = searchResponse.results ?? []
-            if (!searchResponse.success || webResults.length === 0) {
-              completeToolActivity(activityId, 'error', searchResponse.message || '0 条结果')
-              return { 
-                tool, 
-                success: false, 
-                message: searchResponse.message || '未获取到搜索结果，请稍后重试' 
-              }
-            }
-
-            const extraTotal = (searchResponse.sections?.faq?.length ?? 0)
-              + (searchResponse.sections?.news?.length ?? 0)
-              + (searchResponse.sections?.videos?.length ?? 0)
-              + (searchResponse.sections?.discussions?.length ?? 0)
-            const summaryLabel = `${webResults.length}${extraTotal ? `+${extraTotal}` : ''} 条`
-
-            completeToolActivity(activityId, 'success', summaryLabel)
-            const formatted = formatSearchResults(searchResponse, query)
-
-            return {
-              tool,
-              success: true,
-              message: formatted,
-              data: {
-                query,
-                locale,
-                region,
-                results: webResults,
-                sections: searchResponse.sections,
-                summarizerKey: searchResponse.summarizerKey
-              }
-            }
-          }
-
-          // ==================== Excel 工具处理 ====================
-          
-          // 检查是否有打开的 Excel 文件
-          const isExcelFile = currentFile?.name?.toLowerCase().endsWith('.xlsx') || currentFile?.name?.toLowerCase().endsWith('.xls')
-          const excelFilePath = currentFile?.path
-          
-          if (tool === 'excel_read') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const range = args.range || 'A1'
-            const activityId = registerToolActivity('excel_read', `读取：${sheet}!${range}`)
-            
-            try {
-              const result = await window.electronAPI!.excelReadCells(excelFilePath, sheet, range)
-              if (result.success && result.cells) {
-                const cellsInfo = result.cells.map(c => `${c.address}: ${c.text || c.value || '(空)'}`).join('\n')
-                completeToolActivity(activityId, 'success', `${result.cells.length} 个单元格`)
-                return {
-                  tool,
-                  success: true,
-                  message: `读取 ${sheet}!${range} 成功：\n${cellsInfo}`,
-                  data: { cells: result.cells, count: result.cells.length }
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '读取失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '读取失败')
-              return { tool, success: false, message: `读取失败: ${e}` }
-            }
-          }
-
-          if (tool === 'excel_search') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const text = args.text || args.searchText || ''
-            if (!text) {
-              return { tool, success: false, message: '缺少搜索文本' }
-            }
-            const activityId = registerToolActivity('excel_search', `搜索：${truncateLabel(text, 20)}`)
-            
-            try {
-              const result = await window.electronAPI!.excelSearch(excelFilePath, sheet, text)
-              if (result.success) {
-                const count = result.count || 0
-                if (count === 0) {
-                  completeToolActivity(activityId, 'success', '未找到')
-                  return { tool, success: true, message: `在 ${sheet} 中未找到 "${text}"` }
-                }
-                const cellsInfo = result.results?.slice(0, 10).map(c => `${c.address}: ${c.text}`).join('\n')
-                completeToolActivity(activityId, 'success', `${count} 处`)
-                return {
-                  tool,
-                  success: true,
-                  message: `在 ${sheet} 中找到 ${count} 处 "${text}"：\n${cellsInfo}${count > 10 ? `\n...还有 ${count - 10} 处` : ''}`,
-                  data: { results: result.results, count }
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '搜索失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '搜索失败')
-              return { tool, success: false, message: `搜索失败: ${e}` }
-            }
-          }
-
-          if (tool === 'excel_write') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            let updates: Array<{address: string, value?: any, style?: any}> = []
-            
-            if (args.updates) {
-              try {
-                updates = JSON.parse(args.updates)
-              } catch (e) {
-                return { tool, success: false, message: '无效的 updates 参数格式' }
-              }
-            }
-            
-            if (updates.length === 0) {
-              return { tool, success: false, message: '缺少要更新的单元格数据' }
-            }
-            
-            const activityId = registerToolActivity('excel_write', `写入：${sheet}`)
-            updateAgentAction(`正在写入 ${updates.length} 个单元格...`)
-            
-            try {
-              const result = await window.electronAPI!.excelWriteCells(excelFilePath, sheet, updates)
-              if (result.success) {
-                // 刷新预览
-                await refreshExcelData()
-                completeToolActivity(activityId, 'success', `${result.count} 个`)
-                return {
-                  tool,
-                  success: true,
-                  message: `成功写入 ${result.count} 个单元格：${result.updatedCells?.join(', ')}`,
-                  data: { updatedCells: result.updatedCells, count: result.count }
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '写入失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '写入失败')
-              return { tool, success: false, message: `写入失败: ${e}` }
-            }
-          }
-
-          if (tool === 'excel_insert_rows') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const startRow = parseInt(args.startRow, 10) || 1
-            const count = parseInt(args.count, 10) || 1
-            let data: any[][] | undefined
-            
-            if (args.data) {
-              try {
-                data = JSON.parse(args.data)
-              } catch (e) {
-                // 忽略解析错误，data 可选
-              }
-            }
-            
-            const activityId = registerToolActivity('excel_insert_rows', `插入行：${startRow}`)
-            
-            try {
-              const result = await window.electronAPI!.excelInsertRows(excelFilePath, sheet, startRow, count, data)
-              if (result.success) {
-                await refreshExcelData()
-                completeToolActivity(activityId, 'success', `${count} 行`)
-                return {
-                  tool,
-                  success: true,
-                  message: `成功在第 ${startRow} 行插入 ${count} 行`,
-                  data: { insertedAt: result.insertedAt, count: result.count }
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '插入失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '插入失败')
-              return { tool, success: false, message: `插入失败: ${e}` }
-            }
-          }
-
-          if (tool === 'excel_insert_columns') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const startCol = parseInt(args.startCol, 10) || 1
-            const count = parseInt(args.count, 10) || 1
-            
-            const activityId = registerToolActivity('excel_insert_columns', `插入列：${startCol}`)
-            
-            try {
-              const result = await window.electronAPI!.excelInsertColumns(excelFilePath, sheet, startCol, count)
-              if (result.success) {
-                await refreshExcelData()
-                completeToolActivity(activityId, 'success', `${count} 列`)
-                return {
-                  tool,
-                  success: true,
-                  message: `成功在第 ${startCol} 列插入 ${count} 列`,
-                  data: { insertedAt: result.insertedAt, count: result.count }
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '插入失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '插入失败')
-              return { tool, success: false, message: `插入失败: ${e}` }
-            }
-          }
-
-          if (tool === 'excel_delete_rows') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const startRow = parseInt(args.startRow, 10) || 1
-            const count = parseInt(args.count, 10) || 1
-            
-            const activityId = registerToolActivity('excel_delete_rows', `删除行：${startRow}`)
-            
-            try {
-              const result = await window.electronAPI!.excelDeleteRows(excelFilePath, sheet, startRow, count)
-              if (result.success) {
-                await refreshExcelData()
-                completeToolActivity(activityId, 'success', `${count} 行`)
-                return {
-                  tool,
-                  success: true,
-                  message: `成功删除第 ${startRow} 行开始的 ${count} 行`,
-                  data: { deletedFrom: result.deletedFrom, count: result.count }
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '删除失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '删除失败')
-              return { tool, success: false, message: `删除失败: ${e}` }
-            }
-          }
-
-          if (tool === 'excel_delete_columns') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const startCol = parseInt(args.startCol, 10) || 1
-            const count = parseInt(args.count, 10) || 1
-            
-            const activityId = registerToolActivity('excel_delete_columns', `删除列：${startCol}`)
-            
-            try {
-              const result = await window.electronAPI!.excelDeleteColumns(excelFilePath, sheet, startCol, count)
-              if (result.success) {
-                await refreshExcelData()
-                completeToolActivity(activityId, 'success', `${count} 列`)
-                return {
-                  tool,
-                  success: true,
-                  message: `成功删除第 ${startCol} 列开始的 ${count} 列`,
-                  data: { deletedFrom: result.deletedFrom, count: result.count }
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '删除失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '删除失败')
-              return { tool, success: false, message: `删除失败: ${e}` }
-            }
-          }
-
-          if (tool === 'excel_add_sheet') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const name = args.name || args.sheetName || '新工作表'
-            
-            const activityId = registerToolActivity('excel_add_sheet', `新建：${name}`)
-            
-            try {
-              const result = await window.electronAPI!.excelAddSheet(excelFilePath, name)
-              if (result.success) {
-                await refreshExcelData()
-                completeToolActivity(activityId, 'success')
-                return {
-                  tool,
-                  success: true,
-                  message: `成功创建工作表 "${name}"`,
-                  data: { sheetName: result.sheetName }
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '创建失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '创建失败')
-              return { tool, success: false, message: `创建失败: ${e}` }
-            }
-          }
-
-          if (tool === 'excel_delete_sheet') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const name = args.name || args.sheetName || ''
-            if (!name) {
-              return { tool, success: false, message: '缺少工作表名称' }
-            }
-            
-            const activityId = registerToolActivity('excel_delete_sheet', `删除：${name}`)
-            
-            try {
-              const result = await window.electronAPI!.excelDeleteSheet(excelFilePath, name)
-              if (result.success) {
-                await refreshExcelData()
-                completeToolActivity(activityId, 'success')
-                return {
-                  tool,
-                  success: true,
-                  message: `成功删除工作表 "${name}"`,
-                  data: { deletedSheet: result.deletedSheet }
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '删除失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '删除失败')
-              return { tool, success: false, message: `删除失败: ${e}` }
-            }
-          }
-
-          if (tool === 'excel_merge') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const range = args.range || ''
-            if (!range) {
-              return { tool, success: false, message: '缺少合并范围 range（如 A1:C1）' }
-            }
-            
-            const activityId = registerToolActivity('excel_merge', `合并：${range}`)
-            
-            try {
-              const result = await window.electronAPI!.excelMergeCells(excelFilePath, sheet, range)
-              if (result.success) {
-                await refreshExcelData()
-                completeToolActivity(activityId, 'success')
-                return {
-                  tool,
-                  success: true,
-                  message: `成功合并单元格 ${range}`,
-                  data: { mergedRange: result.mergedRange }
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '合并失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '合并失败')
-              return { tool, success: false, message: `合并失败: ${e}` }
-            }
-          }
-
-          if (tool === 'excel_unmerge') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const range = args.range || ''
-            if (!range) {
-              return { tool, success: false, message: '缺少取消合并范围 range（如 A1:C1）' }
-            }
-            
-            const activityId = registerToolActivity('excel_unmerge', `取消合并：${range}`)
-            
-            try {
-              const result = await window.electronAPI!.excelUnmergeCells(excelFilePath, sheet, range)
-              if (result.success) {
-                await refreshExcelData()
-                completeToolActivity(activityId, 'success')
-                return {
-                  tool,
-                  success: true,
-                  message: `成功取消合并单元格 ${range}`,
-                  data: { unmergedRange: result.unmergedRange }
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '取消合并失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '取消合并失败')
-              return { tool, success: false, message: `取消合并失败: ${e}` }
-            }
-          }
-
-          // 创建新 Excel 文件
-          if (tool === 'excel_create') {
-            // 检查是否有工作区
-            if (!workspacePath) {
-              return { 
-                tool, 
-                success: false, 
-                message: '请先在左侧点击"打开文件夹"选择一个工作区，然后再创建 Excel 文件' 
-              }
-            }
-            
-            const filename = args.filename || args.name || '新建表格.xlsx'
-            let sheets: Array<{ name?: string; data?: any[][]; columnWidths?: number[]; merges?: string[] }> = []
-            
-            // 解析 sheets 参数
-            if (args.sheets) {
-              try {
-                sheets = JSON.parse(args.sheets)
-              } catch (e) {
-                // 如果解析失败，尝试简单数据格式
-              }
-            }
-            
-            // 如果没有 sheets，使用简单数据格式
-            if (sheets.length === 0 && args.data) {
-              try {
-                const data = JSON.parse(args.data)
-                sheets = [{ name: args.sheetName || 'Sheet1', data }]
-              } catch (e) {
-                return { tool, success: false, message: '无效的数据格式，请提供有效的 JSON 数组' }
-              }
-            }
-            
-            // 如果还是没有数据，创建空表格
-            if (sheets.length === 0) {
-              sheets = [{ name: 'Sheet1', data: [] }]
-            }
-            
-            // 构建文件路径 - 保存到工作区
-            let finalFilename = filename
-            // 确保文件名以 .xlsx 结尾
-            if (!finalFilename.toLowerCase().endsWith('.xlsx')) {
-              finalFilename += '.xlsx'
-            }
-            // 使用工作区路径
-            const filePath = `${workspacePath}/${finalFilename}`
-            
-            const activityId = registerToolActivity('excel_create', `创建：${finalFilename}`)
-            
-            try {
-              const result = await window.electronAPI!.excelCreate(filePath, { sheets, openAfterCreate: true })
-              if (result.success) {
-                completeToolActivity(activityId, 'success')
-                
-                // 刷新文件列表，让新文件出现在左侧
-                await refreshFiles()
-                
-                // 自动打开创建的文件
-                if (result.openAfterCreate && result.filePath) {
-                  const newFile = {
-                    name: finalFilename,
-                    path: result.filePath,
-                    type: 'file' as const
-                  }
-                  await openFile(newFile)
-                }
-                
-                return {
-                  tool,
-                  success: true,
-                  message: `成功创建 Excel 文件：${result.filePath}\n工作表：${result.sheetsCreated?.join(', ')}\n文件已保存到工作区并自动打开`,
-                  data: { filePath: result.filePath, fileName: finalFilename, sheetsCreated: result.sheetsCreated }
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '创建失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '创建失败')
-              return { tool, success: false, message: `创建失败: ${e}` }
-            }
-          }
-
-          // Excel 公式设置
-          if (tool === 'excel_formula') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            let formulas: Array<{ address: string; formula: string; numberFormat?: string }> = []
-            
-            try {
-              if (args.formulas) {
-                formulas = JSON.parse(args.formulas)
-              } else if (args.address && args.formula) {
-                formulas = [{ address: args.address, formula: args.formula, numberFormat: args.numberFormat }]
-              }
-            } catch {
-              return { tool, success: false, message: '无效的公式格式' }
-            }
-            
-            if (formulas.length === 0) {
-              return { tool, success: false, message: '缺少公式参数' }
-            }
-            
-            const activityId = registerToolActivity('excel_formula', `设置 ${formulas.length} 个公式`)
-            
-            try {
-              const result = await window.electronAPI!.excelSetFormula(excelFilePath, sheet, formulas)
-              if (result.success) {
-                await refreshExcelData()
-                completeToolActivity(activityId, 'success')
-                return {
-                  tool,
-                  success: true,
-                  message: `成功设置 ${result.count} 个公式`,
-                  data: { formulas: result.formulas }
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '设置公式失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '设置公式失败')
-              return { tool, success: false, message: `设置公式失败: ${e}` }
-            }
-          }
-
-          // Excel 排序
-          if (tool === 'excel_sort') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const range = args.range || ''
-            const column = args.column || 'A'
-            const ascending = args.ascending !== 'false'
-            const hasHeader = args.hasHeader !== 'false'
-            
-            if (!range) {
-              return { tool, success: false, message: '缺少排序范围 range（如 A1:D10）' }
-            }
-            
-            const activityId = registerToolActivity('excel_sort', `排序 ${range} 按列 ${column}`)
-            
-            try {
-              const result = await window.electronAPI!.excelSort(excelFilePath, sheet, {
-                range, column, ascending, hasHeader
-              })
-              if (result.success) {
-                await refreshExcelData()
-                completeToolActivity(activityId, 'success')
-                return {
-                  tool,
-                  success: true,
-                  message: `成功排序 ${result.sortedRows} 行，按列 ${column} ${ascending ? '升序' : '降序'}`,
-                  data: result
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '排序失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '排序失败')
-              return { tool, success: false, message: `排序失败: ${e}` }
-            }
-          }
-
-          // Excel 自动填充
-          if (tool === 'excel_autofill') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const sourceRange = args.sourceRange || args.source || ''
-            const targetRange = args.targetRange || args.target || ''
-            const fillType = (args.fillType || args.type || 'copy') as 'copy' | 'series' | 'formula'
-            
-            if (!sourceRange || !targetRange) {
-              return { tool, success: false, message: '缺少源范围或目标范围' }
-            }
-            
-            const activityId = registerToolActivity('excel_autofill', `从 ${sourceRange} 填充到 ${targetRange}`)
-            
-            try {
-              const result = await window.electronAPI!.excelAutoFill(excelFilePath, sheet, {
-                sourceRange, targetRange, fillType
-              })
-              if (result.success) {
-                await refreshExcelData()
-                completeToolActivity(activityId, 'success')
-                return {
-                  tool,
-                  success: true,
-                  message: `成功填充 ${result.filledCells} 个单元格（${fillType} 模式）`,
-                  data: result
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '自动填充失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '自动填充失败')
-              return { tool, success: false, message: `自动填充失败: ${e}` }
-            }
-          }
-
-          // Excel 设置列宽/行高
-          if (tool === 'excel_dimensions') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            let columns: Array<{ column: string | number; width?: number; hidden?: boolean }> = []
-            let rows: Array<{ row: number; height?: number; hidden?: boolean }> = []
-            
-            try {
-              if (args.columns) columns = JSON.parse(args.columns)
-              if (args.rows) rows = JSON.parse(args.rows)
-            } catch {
-              return { tool, success: false, message: '无效的列宽/行高格式' }
-            }
-            
-            const activityId = registerToolActivity('excel_dimensions', `设置 ${columns.length} 列宽, ${rows.length} 行高`)
-            
-            try {
-              const result = await window.electronAPI!.excelSetDimensions(excelFilePath, sheet, { columns, rows })
-              if (result.success) {
-                await refreshExcelData()
-                completeToolActivity(activityId, 'success')
-                return {
-                  tool,
-                  success: true,
-                  message: `成功设置 ${result.columnsSet} 列宽, ${result.rowsSet} 行高`,
-                  data: result
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '设置失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '设置失败')
-              return { tool, success: false, message: `设置失败: ${e}` }
-            }
-          }
-
-          // Excel 条件格式
-          if (tool === 'excel_conditional_format') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const range = args.range || ''
-            let rules: Array<{ type: string; operator?: string; value?: string | number | string[]; fill?: { bgColor: string } | string; font?: object }> = []
-            
-            if (!range) {
-              return { tool, success: false, message: '缺少范围 range' }
-            }
-            
-            try {
-              if (args.rules) {
-                rules = JSON.parse(args.rules)
-              } else if (args.type) {
-                // 简单格式
-                rules = [{
-                  type: args.type,
-                  operator: args.operator,
-                  value: args.value,
-                  fill: args.fill ? { bgColor: args.fill } : undefined
-                }]
-              }
-            } catch {
-              return { tool, success: false, message: '无效的规则格式' }
-            }
-            
-            const activityId = registerToolActivity('excel_conditional_format', `设置 ${rules.length} 条条件格式`)
-            
-            try {
-              const result = await window.electronAPI!.excelConditionalFormat(excelFilePath, sheet, { range, rules })
-              if (result.success) {
-                await refreshExcelData()
-                completeToolActivity(activityId, 'success')
-                return {
-                  tool,
-                  success: true,
-                  message: `成功设置 ${result.rulesApplied} 条条件格式规则`,
-                  data: result
-                }
-              } else {
-                completeToolActivity(activityId, 'error', result.error)
-                return { tool, success: false, message: result.error || '设置条件格式失败' }
-              }
-            } catch (e) {
-              completeToolActivity(activityId, 'error', '设置条件格式失败')
-              return { tool, success: false, message: `设置条件格式失败: ${e}` }
-            }
-          }
-
-          // Excel 获取计算结果
-          if (tool === 'excel_calculate') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            let addresses: string[] = []
-            
-            try {
-              if (args.addresses) {
-                addresses = JSON.parse(args.addresses)
-              } else if (args.address) {
-                addresses = [args.address]
-              }
-            } catch {
-              return { tool, success: false, message: '无效的地址格式' }
-            }
-            
-            if (addresses.length === 0) {
-              return { tool, success: false, message: '缺少单元格地址' }
-            }
-            
-            try {
-              const result = await window.electronAPI!.excelCalculate(excelFilePath, sheet, addresses)
-              if (result.success) {
-                return {
-                  tool,
-                  success: true,
-                  message: `获取了 ${result.results?.length || 0} 个单元格的值`,
-                  data: { results: result.results }
-                }
-              } else {
-                return { tool, success: false, message: result.error || '获取计算结果失败' }
-              }
-            } catch (e) {
-              return { tool, success: false, message: `获取计算结果失败: ${e}` }
-            }
-          }
-
-          // 【新增】Excel 自动筛选
-          if (tool === 'excel_filter') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const range = args.range || ''
-            const action = (args.action || 'set').toLowerCase()
-            
-            try {
-              const result = await window.electronAPI!.excelSetFilter(excelFilePath, sheet, {
-                range: range,
-                remove: action === 'remove'
-              })
-              if (result.success) {
-                await refreshExcelData()
-                return { tool, success: true, message: result.message || '已设置自动筛选' }
-              } else {
-                return { tool, success: false, message: result.error || '设置自动筛选失败' }
-              }
-            } catch (e) {
-              return { tool, success: false, message: `设置自动筛选失败: ${e}` }
-            }
-          }
-
-          // 【新增】Excel 数据验证
-          if (tool === 'excel_validation') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const range = args.range || ''
-            const type = args.type || 'list'
-            const action = (args.action || 'set').toLowerCase()
-            
-            if (!range) {
-              return { tool, success: false, message: '请指定单元格范围 (range)' }
-            }
-            
-            let values: string[] = []
-            if (args.values) {
-              try {
-                values = JSON.parse(args.values)
-              } catch {
-                // 如果不是 JSON，尝试按逗号分割
-                values = args.values.split(',').map((v: string) => v.trim())
-              }
-            }
-            
-            try {
-              const result = await window.electronAPI!.excelSetValidation(excelFilePath, sheet, {
-                range,
-                type: type as 'list' | 'whole' | 'decimal',
-                values,
-                min: args.min ? parseFloat(args.min) : undefined,
-                max: args.max ? parseFloat(args.max) : undefined,
-                remove: action === 'remove'
-              })
-              if (result.success) {
-                await refreshExcelData()
-                return { tool, success: true, message: result.message || '已设置数据验证' }
-              } else {
-                return { tool, success: false, message: result.error || '设置数据验证失败' }
-              }
-            } catch (e) {
-              return { tool, success: false, message: `设置数据验证失败: ${e}` }
-            }
-          }
-
-          // 【新增】Excel 超链接
-          if (tool === 'excel_hyperlink') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const cell = args.cell || ''
-            const url = args.url || ''
-            const text = args.text || url
-            const action = (args.action || 'set').toLowerCase()
-            
-            if (!cell) {
-              return { tool, success: false, message: '请指定单元格地址 (cell)' }
-            }
-            
-            try {
-              const result = await window.electronAPI!.excelSetHyperlink(excelFilePath, sheet, {
-                cell,
-                url,
-                text,
-                tooltip: args.tooltip,
-                remove: action === 'remove'
-              })
-              if (result.success) {
-                await refreshExcelData()
-                return { tool, success: true, message: result.message || '已设置超链接' }
-              } else {
-                return { tool, success: false, message: result.error || '设置超链接失败' }
-              }
-            } catch (e) {
-              return { tool, success: false, message: `设置超链接失败: ${e}` }
-            }
-          }
-
-          // 【新增】Excel 查找替换
-          if (tool === 'excel_find_replace') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const find = args.find || ''
-            const replace = args.replace || ''
-            
-            if (!find) {
-              return { tool, success: false, message: '请指定要查找的内容 (find)' }
-            }
-            
-            try {
-              const result = await window.electronAPI!.excelFindReplace(excelFilePath, sheet, {
-                find,
-                replace,
-                matchCase: args.matchCase === 'true',
-                matchWholeCell: args.matchWholeCell === 'true',
-                allSheets: args.allSheets === 'true'
-              })
-              if (result.success) {
-                await refreshExcelData()
-                return { 
-                  tool, 
-                  success: true, 
-                  message: result.message || `已替换 ${result.count || 0} 处`,
-                  data: { count: result.count, details: result.details }
-                }
-              } else {
-                return { tool, success: false, message: result.error || '查找替换失败' }
-              }
-            } catch (e) {
-              return { tool, success: false, message: `查找替换失败: ${e}` }
-            }
-          }
-
-          // 【新增】Excel 图表
-          if (tool === 'excel_chart') {
-            if (!isExcelFile || !excelFilePath) {
-              return { tool, success: false, message: '请先打开一个 Excel 文件（.xlsx）' }
-            }
-            const sheet = args.sheet || 'Sheet1'
-            const type = args.type || 'column'
-            const dataRange = args.dataRange || ''
-            const title = args.title || ''
-            const position = args.position || 'E1'
-            
-            if (!dataRange) {
-              return { tool, success: false, message: '请指定数据范围 (dataRange)' }
-            }
-            
-            try {
-              const result = await window.electronAPI!.excelInsertChart(excelFilePath, sheet, {
-                type: type as 'column' | 'bar' | 'line' | 'pie',
-                dataRange,
-                title,
-                position,
-                width: args.width ? parseInt(args.width) : 500,
-                height: args.height ? parseInt(args.height) : 300
-              })
-              if (result.success) {
-                await refreshExcelData()
-                return { 
-                  tool, 
-                  success: true, 
-                  message: result.message || '已添加图表配置',
-                  data: { chartConfig: result.chartConfig }
-                }
-              } else {
-                return { tool, success: false, message: result.error || '添加图表失败' }
-              }
-            } catch (e) {
-              return { tool, success: false, message: `添加图表失败: ${e}` }
-            }
-          }
-
-          return { tool, success: false, message: `未知工具: ${tool}` }
+          return executeRuntimeTool(tool, args)
         },
 
-        // 完成时的处理
         onComplete: (content, toolResults) => {
           // 完成 Agent 进度
           finishAgentProgress()
@@ -4642,8 +3025,19 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             // Also remove any trailing text-only stream cards.
             clearTrailingStreamTextItems()
             const successCount = toolResults.filter(r => r.success).length
-            const replaceResults = toolResults.filter(r => r.tool === 'replace' && r.success)
-            const reviewResults = toolResults.filter(r => r.tool === 'review' && r.success)
+            const replaceResults = toolResults.filter((r) =>
+              r.success && (
+                r.tool === 'replace' ||
+                r.tool === 'word.replace_via_dsl' ||
+                (r.tool === 'word.edit' && r.data?.operation === 'replace')
+              ),
+            )
+            const reviewResults = toolResults.filter((r) =>
+              r.success && (
+                r.tool === 'review' ||
+                (r.tool === 'word.edit' && r.data?.operation === 'review')
+              ),
+            )
             const createResults = toolResults.filter(r => r.tool === 'create' && r.success)
             const excelCreateResults = toolResults.filter(r => r.tool === 'excel_create' && r.success)
             
@@ -4662,6 +3056,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             } else if (replaceResults.length > 0 || reviewResults.length > 0) {
               const diffSource = [...replaceResults, ...reviewResults]
               const diffChanges = diffSource.map(r => ({
+                diffId: r.data?.diffId as string | undefined,
                 searchText: r.data?.searchText as string || '',
                 replaceText: r.data?.replaceText as string || '',
                 count: (r.data?.count as number) || 0
@@ -4741,7 +3136,28 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
           return getTiptapDocumentStructure()
         }
       },
-      { workspaceKey: memoryWorkspaceKey, workspaceSummary: memoryWorkspaceSummary },
+      {
+        workspaceKey: memoryWorkspaceKey,
+        workspaceSummary: memoryWorkspaceSummary,
+        workspaceProfile: workspaceProfile || undefined,
+        skillDescriptions: availableSkillDescriptions || undefined,
+        activeSkill: activeSkill
+          ? {
+              id: activeSkill.id,
+              displayName: activeSkill.displayName,
+              description: activeSkill.description,
+              safety: activeSkill.safety || 'mutating',
+              toolIds: activeSkillToolIds,
+            }
+          : undefined,
+        availableToolsDelta: activeSkillToolIds?.length
+          ? {
+              source: 'active_skill',
+              skillId: activeSkill?.id,
+              allowedToolIds: activeSkillToolIds,
+            }
+          : undefined,
+      },
       allImages.length > 0 ? allImages : undefined
     )
   }, [
@@ -4753,8 +3169,12 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
     sendAgentMessage,
     appendAgentDebugLog,
     document.content,
+    availableSkillDescriptions,
+    buildSubagentDocumentContext,
+    buildSubagentFilesContext,
     buildFilesContext,
     buildWorkspaceContext,
+    buildWorkspaceProfile,
     createNewDocument,
     createDocumentFromDsl,
     currentFile?.name,
@@ -4771,6 +3191,8 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
     insertInDocument,
     deleteInDocument,
     currentFile?.path,
+    handleCancelSubagent,
+    getAgentRuntimeSnapshot,
     resetCurrentTurnToolActivity,
     registerToolActivity,
     claimOrRegisterToolActivity,
@@ -4783,10 +3205,16 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
     settings,
     refreshFiles,
     openFile,
+    executeRuntimeTool,
+    subagentWorkflowRunner,
     workspacePath,
+    workspaceDomainAdapter,
     prepareTemplateFillOutput,
     getLatestContent,
-    pendingImages
+    pendingImages,
+    skillExecutor,
+    workspaceSkillSources,
+    workspaceSkillWarnings,
   ])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -4880,6 +3308,10 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
 
   // 快捷命令
   const quickCommands = [
+    { icon: <Folder className="w-3 h-3" />, label: '初始化', command: '/init' },
+    { icon: <Bot className="w-3 h-3" />, label: '技能', command: '/skills' },
+    { icon: <Folder className="w-3 h-3" />, label: '探索工作区', command: '/workspace-explore' },
+    { icon: <Eye className="w-3 h-3" />, label: '验证', command: '/verification' },
     { icon: <FilePlus className="w-3 h-3" />, label: '创建', command: '帮我创建一份' },
     { icon: <FileEdit className="w-3 h-3" />, label: '润色', command: '润色当前文档' },
     { icon: <Eye className="w-3 h-3" />, label: '总结', command: '总结要点' },
@@ -5156,6 +3588,134 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
     )
   }
 
+  const renderSubagentMonitor = () => {
+    if (
+      runtimeSnapshotState.subagents.agents.length === 0 &&
+      runtimeSnapshotState.notifications.count === 0
+    ) {
+      return null
+    }
+
+    const sortedAgents = runtimeSnapshotState.subagents.agents
+      .slice()
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+
+    return (
+      <div className="glass-card-soft border border-border rounded-xl px-3 py-2 mt-3">
+        <div className="text-[10px] text-text-dim uppercase tracking-wider mb-2">
+          Subagent Runtime
+        </div>
+        <div className="space-y-1 max-h-[180px] overflow-y-auto">
+          {sortedAgents.slice(0, 6).map((agent) => {
+            const isSelected = selectedSubagentId === agent.subagentId
+            return (
+              <button
+                key={agent.subagentId}
+                type="button"
+                onClick={() =>
+                  setSelectedSubagentId((current) =>
+                    current === agent.subagentId ? null : agent.subagentId,
+                  )
+                }
+                className={`w-full text-left rounded px-1.5 py-1 transition-colors border ${
+                  isSelected
+                    ? 'border-accent/40 bg-accent/5'
+                    : 'border-black/10 dark:border-white/10 bg-black/5 dark:bg-white/5 hover:bg-white/8'
+                }`}
+              >
+                <div className="flex items-center gap-1.5 text-[11px] text-text-secondary">
+                  {agent.status === 'running' || agent.status === 'queued' ? (
+                    <Loader2 className="w-3 h-3 text-accent animate-spin flex-shrink-0" />
+                  ) : agent.status === 'completed' ? (
+                    <CheckCircle2 className="w-3 h-3 text-success flex-shrink-0" />
+                  ) : agent.status === 'cancelled' ? (
+                    <Circle className="w-3 h-3 text-text-muted flex-shrink-0" />
+                  ) : (
+                    <X className="w-3 h-3 text-error flex-shrink-0" />
+                  )}
+                  <span className="truncate flex-1">{agent.label}</span>
+                  <span className="text-[10px] text-text-muted flex-shrink-0">{agent.mode}</span>
+                  {(agent.status === 'running' || agent.status === 'queued') && (
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        handleCancelSubagent(agent.subagentId)
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          handleCancelSubagent(agent.subagentId)
+                        }
+                      }}
+                      className="text-[10px] text-error flex-shrink-0 hover:underline"
+                    >
+                      cancel
+                    </span>
+                  )}
+                </div>
+                <div className="mt-0.5 text-[10px] text-text-dim">
+                  {agent.profileId} | {agent.status}
+                  {agent.summary ? ` | ${agent.summary.slice(0, 96)}` : ''}
+                </div>
+              </button>
+            )
+          })}
+        </div>
+
+        {selectedSubagentTranscript && (
+          <div className="mt-2 border-t border-border pt-2">
+            <div className="text-[10px] text-text-dim uppercase tracking-wider mb-1">
+              Transcript Preview
+            </div>
+            <div className="text-[10px] text-text-dim mb-2">
+              messages: {selectedSubagentTranscript.messages.length} | tool calls: {selectedSubagentTranscript.toolCalls.length} | tool results: {selectedSubagentTranscript.toolResults.length}
+            </div>
+            <div className="space-y-1 max-h-[160px] overflow-y-auto">
+              {selectedSubagentTranscript.messages.slice(-6).map((message) => (
+                <div
+                  key={message.id}
+                  className="rounded px-1.5 py-1 bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10"
+                >
+                  <div className="text-[10px] text-text-muted uppercase tracking-wider mb-0.5">
+                    {message.role}
+                  </div>
+                  <div className="text-[11px] text-text-secondary whitespace-pre-wrap">
+                    {message.content}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {runtimeSnapshotState.notifications.count > 0 && (
+          <div className="mt-2 border-t border-border pt-2">
+            <div className="text-[10px] text-text-dim uppercase tracking-wider mb-1">
+              Notifications ({runtimeSnapshotState.notifications.count})
+            </div>
+            <div className="space-y-1 max-h-[100px] overflow-y-auto">
+              {runtimeSnapshotState.notifications.items
+                .slice()
+                .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+                .slice(0, 4)
+                .map((item) => (
+                  <div
+                    key={`${item.taskId}-${item.createdAt}`}
+                    className="rounded px-1.5 py-1 bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 text-[10px] text-text-dim"
+                  >
+                    {item.message}
+                  </div>
+                ))}
+            </div>
+          </div>
+        )}
+      </div>
+    )
+  }
+
   return (
     <div 
       className={`flex flex-col h-full bg-transparent ${isDragOver ? 'ring-2 ring-accent/40 ring-inset' : ''}`}
@@ -5389,7 +3949,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                         {message.diffChanges.slice(0, 5).map((diff, i) => (
                           <button
                             key={i}
-                            onClick={() => scrollToChange(diff.replaceText)}
+                            onClick={() => jumpToDiffChange(diff)}
                             className="w-full text-left px-2 py-1.5 rounded bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-colors border border-black/10 dark:border-white/10"
                           >
                             <div className="flex items-center gap-2 text-[11px]">
@@ -5780,6 +4340,8 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             </motion.div>
           )}
         </AnimatePresence>
+
+        {renderSubagentMonitor()}
 
         <div ref={messagesEndRef} />
       </div>

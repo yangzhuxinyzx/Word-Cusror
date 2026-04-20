@@ -23,8 +23,8 @@ import { DiffOld, DiffNew } from '../extensions/DiffMark'
 import { DiffBlock } from '../extensions/DiffBlock'
 import { TrackInsert, TrackDelete } from '../extensions/TrackChanges'
 import { CommentMark } from '../extensions/CommentMark'
-import { motion, AnimatePresence, animate } from 'framer-motion'
-import { useDocument } from '../context/DocumentContext'
+import { motion, AnimatePresence } from 'framer-motion'
+import { useDocument } from '../context/useDocument'
 import { useAI } from '../context/AIContext'
 import { useComments } from '../context/CommentContext'
 import { 
@@ -32,6 +32,7 @@ import {
   Download,
   FileText,
   Loader2,
+  AlertCircle,
   Check,
   X,
   Sparkles,
@@ -42,10 +43,12 @@ import {
 } from 'lucide-react'
 import { parseDocxToHtml, parseDocxComplete, type DocxParseResult } from '../utils/docxParser'
 import { parseDocxComments } from '../utils/docxCommentsParser'
+import { buildInlineDiffPairHtml } from '../utils/diffMarkup'
 import { commonSystemFonts, normalizeFontFamilyForDisplay } from '../fonts/fontManifest'
 import { extractFontFamiliesFromHtml, loadFontsByNames } from '../fonts/loadWorkspaceFonts'
 import InlineEditPopup from './InlineEditPopup'
 import ContextMenu from './ContextMenu'
+import CanvasPagePreview from './CanvasPagePreview'
 import ExcelPreview from './ExcelPreview'
 import PptPreviewHtml from './PptPreviewHtml'
 import RevisionPanel from './RevisionPanel'
@@ -318,6 +321,49 @@ const DocxTableCell = TableCell.extend({
   },
 })
 
+const DOCX_TOC_LINE_RE = /^(.*?)([.．·•。…]{6,})(\s*\d+)\s*$/
+const DOCX_TOC_SUBITEM_RE = /^[（(][一二三四五六七八九十0-9]+[）)]/
+
+function parseDocxTocLine(text: string): { left: string; leader: string; right: string; depth: 0 | 1 } | null {
+  const normalized = (text || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim()
+  if (!normalized) return null
+
+  const match = normalized.match(DOCX_TOC_LINE_RE)
+  if (!match) return null
+
+  const left = match[1]?.trimEnd() || ''
+  const leader = match[2] || '.'.repeat(48)
+  const right = match[3]?.trim() || ''
+  if (!left || !right) return null
+
+  return {
+    left,
+    leader,
+    right,
+    depth: DOCX_TOC_SUBITEM_RE.test(left) ? 1 : 0,
+  }
+}
+
+function applyNodeViewAttrs(el: HTMLElement, attrs: Record<string, any>) {
+  const nextClass = typeof attrs.class === 'string' ? attrs.class : ''
+  const nextStyle = typeof attrs.style === 'string' ? attrs.style : ''
+
+  if (nextClass) el.setAttribute('class', nextClass)
+  else el.removeAttribute('class')
+
+  if (nextStyle) el.setAttribute('style', nextStyle)
+  else el.removeAttribute('style')
+
+  const customAttrs = ['data-docx-tab-leader', 'data-docx-toc-structured', 'data-docx-toc-depth']
+  customAttrs.forEach((name) => {
+    if (attrs[name] != null && attrs[name] !== '') {
+      el.setAttribute(name, String(attrs[name]))
+    } else {
+      el.removeAttribute(name)
+    }
+  })
+}
+
 const DocxParagraph = Paragraph.extend({
   addAttributes() {
     return {
@@ -338,6 +384,64 @@ const DocxParagraph = Paragraph.extend({
         renderHTML: (attrs) =>
           attrs['data-docx-tab-leader'] ? { 'data-docx-tab-leader': attrs['data-docx-tab-leader'] } : {},
       },
+    }
+  },
+  addNodeView() {
+    return ({ node, HTMLAttributes }) => {
+      const className = String(node.attrs.class || '')
+
+      if (!className.includes('docx-toc')) {
+        const dom = document.createElement('p')
+        applyNodeViewAttrs(dom, HTMLAttributes)
+        return {
+          dom,
+          contentDOM: dom,
+        }
+      }
+
+      const dom = document.createElement('p')
+
+      const renderToc = (currentNode: any, attrs: Record<string, any>) => {
+        const parsed = parseDocxTocLine(currentNode.textContent || '')
+        applyNodeViewAttrs(dom, {
+          ...attrs,
+          'data-docx-toc-structured': parsed ? '1' : null,
+          'data-docx-toc-depth': parsed ? String(parsed.depth) : null,
+        })
+        dom.innerHTML = ''
+
+        if (!parsed) {
+          dom.textContent = currentNode.textContent || ''
+          return
+        }
+
+        const left = document.createElement('span')
+        left.className = 'docx-toc-left'
+        left.textContent = parsed.left
+
+        const leader = document.createElement('span')
+        leader.className = 'docx-toc-leader'
+        leader.textContent = parsed.leader
+
+        const right = document.createElement('span')
+        right.className = 'docx-toc-right'
+        right.textContent = parsed.right
+
+        dom.append(left, leader, right)
+      }
+
+      renderToc(node, HTMLAttributes)
+
+      return {
+        dom,
+        update: (updatedNode) => {
+          const updatedClassName = String(updatedNode.attrs.class || '')
+          if (!updatedClassName.includes('docx-toc')) return false
+          renderToc(updatedNode, HTMLAttributes)
+          return true
+        },
+        ignoreMutation: () => true,
+      }
     }
   },
 })
@@ -388,6 +492,37 @@ const PagedLayout = Extension.create({
     const BOTTOM_MARGIN_PX = 25.4 * PX_PER_MM // 2.54cm
     const PAGE_GAP_PX = 32 // 页间距（接近原版显示，可继续微调）
 
+    const getTableRows = (tableEl: HTMLElement) => {
+      const filterRows = (rows: HTMLElement[]) =>
+        rows.filter((row) => {
+          if (row.classList.contains('pm-page-break-row')) return false
+          if (row.querySelector('.pm-page-break-cell, .pm-page-break')) return false
+          return true
+        })
+
+      const bodyRows = filterRows(Array.from(tableEl.querySelectorAll(':scope > tbody > tr')) as HTMLElement[])
+      if (bodyRows.length > 0) return bodyRows
+      return filterRows(Array.from(tableEl.querySelectorAll(':scope > tr')) as HTMLElement[])
+    }
+
+    const getTableElement = (blockEl: HTMLElement | null) => {
+      if (!blockEl) return null
+      if (blockEl.tagName === 'TABLE') return blockEl
+      if (blockEl.classList.contains('tableWrapper')) {
+        return blockEl.querySelector('table') as HTMLElement | null
+      }
+      return blockEl.querySelector('table') as HTMLElement | null
+    }
+
+    const getTableColumnCount = (tableEl: HTMLElement) => {
+      const firstRow = getTableRows(tableEl)[0] || null
+      if (!firstRow) return 1
+      return Array.from(firstRow.children).reduce((sum, cell) => {
+        const span = Number.parseInt((cell as HTMLElement).getAttribute('colspan') || '1', 10)
+        return sum + (Number.isFinite(span) && span > 0 ? span : 1)
+      }, 0)
+    }
+
     const buildDecorations = (view: any) => {
       const root = view.dom as HTMLElement
       if (!root) return DecorationSet.empty
@@ -416,9 +551,24 @@ const PagedLayout = Extension.create({
         (parsePx(rootStyle.fontSize) ? parsePx(rootStyle.fontSize) * 1.5 : 0) ||
         20 // fallback ~15pt line
 
+      const getRenderedHeight = (el: HTMLElement) => {
+        const rectHeight = el.getBoundingClientRect().height
+        return rectHeight > 0 ? rectHeight / scale : el.offsetHeight
+      }
+
+      const isBlankCarryBlock = (el: HTMLElement | null) => {
+        if (!el) return false
+        if (el.classList.contains('pm-page-break') || el.classList.contains('pm-page-end')) return false
+        if (getTableElement(el)) return false
+        if (el.querySelector('img, hr, [data-type="docx-chart"], [data-type="docx-image"]')) return false
+        return ((el.textContent || '').replace(/\u00a0/g, ' ').trim().length === 0)
+      }
+
       const blocks = Array.from(root.children).filter((el) => {
-        const rectHeight = (el as HTMLElement).getBoundingClientRect().height
-        const h = rectHeight > 0 ? rectHeight / scale : (el as HTMLElement).offsetHeight
+        if ((el as HTMLElement).tagName === 'HR') {
+          return true
+        }
+        const h = getRenderedHeight(el as HTMLElement)
         if (h <= epsilon) return false
         return !(
           (el as HTMLElement).classList?.contains('pm-page-break') ||
@@ -431,25 +581,221 @@ const PagedLayout = Extension.create({
       let prevMarginBottom = 0
 
       for (const el of blocks) {
-        const rectHeight = el.getBoundingClientRect().height
-        const h = rectHeight > 0 ? rectHeight / scale : el.offsetHeight
+        if (el.tagName === 'HR') {
+          const atPageStart = y <= epsilon
+          if (!atPageStart) {
+            let anchorEl = el.nextElementSibling as HTMLElement | null
+            while (anchorEl && isBlankCarryBlock(anchorEl)) {
+              anchorEl = anchorEl.nextElementSibling as HTMLElement | null
+            }
+            const rawPos = view.posAtDOM(anchorEl || el, 0)
+            const pos = Math.max(0, rawPos - 1)
+            const fillToEndOfPage = Math.max(0, contentHeightPx + bottomMarginPx - y)
+            const widget = Decoration.widget(
+              pos,
+              () => {
+                const dom = document.createElement('div')
+                dom.className = 'pm-page-break'
+                dom.style.setProperty('--fill', `${fillToEndOfPage}px`)
+                dom.style.setProperty('--gap', `${PAGE_GAP_PX}px`)
+                dom.style.setProperty('--top', `${topMarginPx}px`)
+                dom.style.height = `${fillToEndOfPage + PAGE_GAP_PX + topMarginPx}px`
+                return dom
+              },
+              { key: `pm-hard-pb-${pos}`, side: -1 }
+            )
+            decorations.push(widget)
+          }
+          y = 0
+          prevMarginBottom = 0
+          continue
+        }
+
+        const h = getRenderedHeight(el)
         if (h <= epsilon) continue
         const style = window.getComputedStyle(el)
         const marginTop = parsePx(style.marginTop)
         const marginBottom = parsePx(style.marginBottom)
         const collapsedMargin = Math.max(prevMarginBottom, marginTop)
+        const blockLineH = parsePx(style.lineHeight) || lineHeightPx
+        const atPageStart = y <= epsilon
+
+        const tableEl = getTableElement(el)
+
+        let forceBreakBefore = false
+        if (!tableEl) {
+          const blockText = (el.textContent || '').replace(/\s+/g, '').trim()
+          const isTocHeading =
+            el.tagName === 'P' &&
+            (el.textContent || '').trim() === '目录' &&
+            style.textAlign === 'center'
+          const looksLikeSectionHeading =
+            /^[一二三四五六七八九十]+、/.test(blockText) ||
+            /^[（(][一二三四五六七八九十0-9]+[）)]/.test(blockText)
+          const isHeadingLike =
+            /^H[1-6]$/.test(el.tagName) ||
+            (
+              el.tagName === 'P' &&
+              parsePx(style.fontSize) >= 18 &&
+              (
+                style.fontWeight === 'bold' ||
+                style.fontWeight === '700' ||
+                style.fontWeight === '800' ||
+                style.fontWeight === '900' ||
+                Number.parseInt(style.fontWeight || '0', 10) >= 600 ||
+                style.textAlign === 'center' ||
+                looksLikeSectionHeading
+              )
+            )
+          let prevBlock = el.previousElementSibling as HTMLElement | null
+          while (
+            prevBlock &&
+            (
+              isBlankCarryBlock(prevBlock) ||
+              prevBlock.classList.contains('pm-page-break') ||
+              prevBlock.classList.contains('pm-page-end')
+            )
+          ) {
+            prevBlock = prevBlock.previousElementSibling as HTMLElement | null
+          }
+          const carryBlocks: HTMLElement[] = []
+          let nextBlock = el.nextElementSibling as HTMLElement | null
+          while (nextBlock && isBlankCarryBlock(nextBlock)) {
+            carryBlocks.push(nextBlock)
+            nextBlock = nextBlock.nextElementSibling as HTMLElement | null
+          }
+          const nextTableBlock = getTableElement(nextBlock) ? nextBlock : null
+
+          if (isHeadingLike && nextTableBlock && !atPageStart) {
+            const nextStyle = window.getComputedStyle(nextTableBlock)
+            const nextMarginTop = parsePx(nextStyle.marginTop)
+            const nextTableEl = getTableElement(nextTableBlock)
+            const tableRows = nextTableEl ? getTableRows(nextTableEl) : []
+            const previewRows = tableRows.slice(0, Math.min(3, tableRows.length))
+            const previewRowsHeight = previewRows.reduce((sum, row) => {
+              const rowHeight = getRenderedHeight(row)
+              return sum + (rowHeight > epsilon ? rowHeight : 0)
+            }, 0)
+            const fallbackPreviewHeight =
+              previewRowsHeight > 0
+                ? previewRowsHeight
+                : Math.max(blockLineH * 3, lineHeightPx * Math.min(3, Math.max(tableRows.length, 1)))
+
+            let carryHeight = 0
+            let carryPrevMarginBottom = marginBottom
+            for (const carryBlock of carryBlocks) {
+              const carryStyle = window.getComputedStyle(carryBlock)
+              const carryMarginTop = parsePx(carryStyle.marginTop)
+              const carryMarginBottom = parsePx(carryStyle.marginBottom)
+              const carryBlockHeight = getRenderedHeight(carryBlock)
+              carryHeight += Math.max(carryPrevMarginBottom, carryMarginTop) + carryBlockHeight
+              carryPrevMarginBottom = carryMarginBottom
+            }
+
+            const combinedHeight =
+              collapsedMargin +
+              h +
+              carryHeight +
+              Math.max(carryPrevMarginBottom, nextMarginTop) +
+              fallbackPreviewHeight
+
+            if (y + combinedHeight > contentHeightPx + blockLineH * 0.5) {
+              forceBreakBefore = true
+            }
+          }
+
+          if (isTocHeading) {
+            let tocGroupHeight = collapsedMargin + h
+            let tocPrevMarginBottom = marginBottom
+            let nextEl = el.nextElementSibling as HTMLElement | null
+
+            while (nextEl?.classList.contains('docx-toc')) {
+              const nextStyle = window.getComputedStyle(nextEl)
+              const nextMarginTop = parsePx(nextStyle.marginTop)
+              const nextMarginBottom = parsePx(nextStyle.marginBottom)
+              const nextHeight = getRenderedHeight(nextEl)
+
+              if (nextHeight > epsilon) {
+                tocGroupHeight += Math.max(tocPrevMarginBottom, nextMarginTop) + nextHeight
+                tocPrevMarginBottom = nextMarginBottom
+              }
+
+              nextEl = nextEl.nextElementSibling as HTMLElement | null
+            }
+
+            if (y + tocGroupHeight > contentHeightPx + blockLineH * 2) {
+              forceBreakBefore = true
+            }
+          }
+
+          if (isTocHeading && !atPageStart) {
+            forceBreakBefore = true
+          }
+
+        }
+
+        if (tableEl) {
+          const rows = getTableRows(tableEl)
+          const colCount = getTableColumnCount(tableEl)
+          y += collapsedMargin
+          prevMarginBottom = marginBottom
+
+          for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+            const row = rows[rowIndex]
+            const rowHeight = getRenderedHeight(row)
+            if (rowHeight <= epsilon) continue
+
+            const rowStyle = window.getComputedStyle(row)
+            const rowLineH = parsePx(rowStyle.lineHeight) || lineHeightPx
+            const wouldOverflow = y + rowHeight > contentHeightPx + rowLineH * 0.5
+
+            if (wouldOverflow && !atPageStart) {
+              const rawPos = view.posAtDOM(row, 0)
+              const pos = Math.max(0, rawPos - 1)
+              const fillToEndOfPage = Math.max(0, contentHeightPx + bottomMarginPx - y)
+
+              const widget = Decoration.widget(
+                pos,
+                () => {
+                  const tr = document.createElement('tr')
+                  tr.className = 'pm-page-break-row'
+
+                  const td = document.createElement('td')
+                  td.colSpan = Math.max(colCount, 1)
+                  td.className = 'pm-page-break-cell'
+
+                  const dom = document.createElement('div')
+                  dom.className = 'pm-page-break in-table'
+                  dom.style.setProperty('--fill', `${fillToEndOfPage}px`)
+                  dom.style.setProperty('--gap', `${PAGE_GAP_PX}px`)
+                  dom.style.setProperty('--top', `${topMarginPx}px`)
+                  dom.style.height = `${fillToEndOfPage + PAGE_GAP_PX + topMarginPx}px`
+
+                  td.appendChild(dom)
+                  tr.appendChild(td)
+                  return tr
+                },
+                { key: `pm-pb-table-${pos}-${rowIndex}`, side: -1 }
+              )
+              decorations.push(widget)
+
+              y = rowHeight
+            } else {
+              y += rowHeight
+            }
+          }
+
+          continue
+        }
+
         const blockHeight = collapsedMargin + h
 
         // 只要“下一个块”会进入底边距区域，就在它前面插入换页占位
         // 用每个段落自身的行高作为容差（中文28pt≈37px，英文12pt≈16px）
         // 允许约2行溢出进入下边距，更接近 Word 的分页行为
-        const blockLineH = parsePx(style.lineHeight) || lineHeightPx
         const wouldOverflow = y + blockHeight > contentHeightPx + blockLineH * 2
 
-        // 避免在一页开头反复插入空页（遇到超大表格/块时允许其自然溢出）
-        const atPageStart = y <= epsilon
-
-        if (wouldOverflow && !atPageStart) {
+        if ((forceBreakBefore || wouldOverflow) && !atPageStart) {
           // 用 pos-1 让 widget 放在段落节点外部（作为 .word-editor-content 的直接子节点）
           // 这样 CSS 的 calc(100% + margins) 才能基于正确的父宽度计算
           const rawPos = view.posAtDOM(el, 0)
@@ -524,6 +870,7 @@ const PagedLayout = Extension.create({
         view(view) {
           let raf = 0
           let isDispatching = false
+          const fonts = (document as any).fonts as FontFaceSet | undefined
           const schedule = () => {
             if (isDispatching) return
             cancelAnimationFrame(raf)
@@ -537,7 +884,10 @@ const PagedLayout = Extension.create({
               isDispatching = false
             })
           }
+          const handleFontsReady = () => schedule()
           schedule()
+          fonts?.ready.then(handleFontsReady).catch(() => {})
+          fonts?.addEventListener?.('loadingdone', handleFontsReady)
           return {
             update(view, prevState) {
               // 只在文档内容变化时重建分页装饰，滚动/选区变化不触发
@@ -547,6 +897,7 @@ const PagedLayout = Extension.create({
             },
             destroy() {
               cancelAnimationFrame(raf)
+              fonts?.removeEventListener?.('loadingdone', handleFontsReady)
             },
           }
         },
@@ -557,6 +908,7 @@ const PagedLayout = Extension.create({
 
 const DIFF_BLOCK_SELECTOR = 'p, li, div, td, th, h1, h2, h3, h4, h5, h6, blockquote, tr'
 const REVEAL_BLOCK_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, li, blockquote, table, ul, ol, pre, div'
+const ENABLE_EDITOR_CONTENT_MOTION = false
 
 export default function WordEditor() {
   const {
@@ -567,6 +919,7 @@ export default function WordEditor() {
     pptData,
     hasUnsavedChanges,
     saveDocument,
+    setDocument,
     updateContent,
     lastReplacement,
     pendingChanges,
@@ -582,6 +935,12 @@ export default function WordEditor() {
     setEditorMode,
     headerFooterSetup,
     typographyProfile,
+    docxInspectionReport,
+    wordOracleArtifact,
+    renderAlignmentReport,
+    oracleStatus,
+    oracleError,
+    compareCurrentRenderWithWordOracle,
   } = useDocument()
   const { getCompletion, cancelCompletion, isCompleting, settings } = useAI()
   const { setComments, addComment, replyToComment, setSelectedCommentId } = useComments()
@@ -591,6 +950,15 @@ export default function WordEditor() {
   const [isConfirming, setIsConfirming] = useState(false)
   const [showRevisionPanel, setShowRevisionPanel] = useState(false)
   const [showCommentPanel, setShowCommentPanel] = useState(false)
+  const [printInteractionMode, setPrintInteractionMode] = useState<'stable' | 'table-edit'>('stable')
+  const pendingChangeLabel = useMemo(() => {
+    if (pendingChanges.length === 0) return '待确认修改'
+    const reviewCount = pendingChanges.filter((item) => item.reviewReason || item.reviewType).length
+    if (reviewCount === pendingChanges.length) return '待审查建议'
+    if (reviewCount > 0) return '待处理修订'
+    return '待确认修改'
+  }, [pendingChanges])
+  const lastOracleCompareRef = useRef('')
   
   // 补全相关状态
   const [completionSuggestion, setCompletionSuggestion] = useState<string | null>(null)
@@ -602,6 +970,7 @@ export default function WordEditor() {
   // 跟踪上一次同步的文档内容，避免重复同步
   const lastSyncedContentRef = useRef<string>('')
   const lastLoadedCommentsKeyRef = useRef<string>('')
+  const suppressEditorSyncRef = useRef(false)
   
   // 内联编辑和右键菜单状态
   const [showInlineEdit, setShowInlineEdit] = useState(false)
@@ -624,7 +993,8 @@ export default function WordEditor() {
     headerStyle?: { fontSize?: string; alignment?: string; color?: string }
     footerStyle?: { fontSize?: string; alignment?: string; color?: string }
   } | null>(null)
-
+  const [previewSourceHtml, setPreviewSourceHtml] = useState('')
+  
   // --- Docx floating image positioning (wp:anchor) ---
   // NOTE: implementation is defined after `const editor = useEditor(...)` to avoid TDZ issues.
   const positionDocxFloatingImages = useCallback(() => {}, [])
@@ -638,6 +1008,16 @@ export default function WordEditor() {
     selectionTo: 0,
   }))
   const [pageStats, setPageStats] = useState(() => ({ current: 1, total: 1 }))
+  const forceCanvasPrintPreview = useMemo(() => {
+    if (typeof window === 'undefined') return false
+    const params = new URLSearchParams(window.location.search)
+    return params.get('canvas-print') === '1' || params.get('render-mode') === 'canvas'
+  }, [])
+
+  const currentPageMismatch = useMemo(() => {
+    return renderAlignmentReport?.pages?.find((page) => page.pageIndex === pageStats.current && page.thresholdExceeded) || null
+  }, [pageStats.current, renderAlignmentReport])
+  const tableResizable = viewMode !== 'print' || printInteractionMode === 'table-edit'
 
   const pageSize = useMemo(() => {
     let width = '210mm'
@@ -892,7 +1272,7 @@ export default function WordEditor() {
       Subscript,
       Superscript,
       DocxTable.configure({
-        resizable: true,
+        resizable: tableResizable,
       }),
       DocxTableRow,
       DocxTableHeader,
@@ -931,6 +1311,20 @@ export default function WordEditor() {
       // 更新 lastSyncedContentRef 以防止无限循环
       // （Tiptap 会标准化 HTML，导致输入输出不一致）
       lastSyncedContentRef.current = html
+      const text = editor.getText()
+      lastTextRef.current = text
+
+      // 文档统计：字数/字符数
+      // 中文场景下“字数”更接近“非空白字符数”，这里同时提供 words(按空白分词) 与 chars(总字符)
+      const trimmed = (text || '').trim()
+      const words = trimmed ? trimmed.split(/\s+/).filter(Boolean).length : 0
+      const chars = (text || '').length
+      setDocStats((prev) => ({ ...prev, words, chars }))
+
+      if (suppressEditorSyncRef.current) {
+        return
+      }
+      setPreviewSourceHtml(html)
       
       updateContent(html)
       
@@ -941,15 +1335,6 @@ export default function WordEditor() {
       }
       
       // 获取当前文本，用于触发补全
-      const text = editor.getText()
-      lastTextRef.current = text
-
-      // 文档统计：字数/字符数
-      // 中文场景下“字数”更接近“非空白字符数”，这里同时提供 words(按空白分词) 与 chars(总字符)
-      const trimmed = (text || '').trim()
-      const words = trimmed ? trimmed.split(/\s+/).filter(Boolean).length : 0
-      const chars = (text || '').length
-      setDocStats((prev) => ({ ...prev, words, chars }))
     },
     onSelectionUpdate: ({ editor }) => {
       // 选区变化时更新工具栏显示
@@ -964,7 +1349,7 @@ export default function WordEditor() {
         selectionChars,
       }))
     },
-  })
+  }, [tableResizable])
 
   // Parse DOCX comments (word/comments.xml) when a docx is opened
   useEffect(() => {
@@ -1159,6 +1544,12 @@ export default function WordEditor() {
     }
   }, [])
 
+  useEffect(() => {
+    if (viewMode !== 'print' && printInteractionMode !== 'stable') {
+      setPrintInteractionMode('stable')
+    }
+  }, [printInteractionMode, viewMode])
+
   // 使用 ProseMirror 的 DOMSerializer 从选区获取 HTML（保留格式）
   const getSelectionHtml = useCallback(() => {
     if (!editor) return ''
@@ -1192,7 +1583,7 @@ export default function WordEditor() {
     // 新内容：如果 AI 返回的是 HTML 格式则直接使用，否则转换为 HTML
     const newHtml = isHtml ? newText : textToHtml(newText)
 
-    const html = `<span class="diff-old" data-diff-id="${diffId}">${oldHtml}</span><span class="diff-new" data-diff-id="${diffId}">${newHtml}</span>`
+    const html = buildInlineDiffPairHtml(diffId, oldHtml, newHtml)
 
     editor.chain().focus().deleteSelection().insertContent(html).run()
 
@@ -1213,6 +1604,7 @@ export default function WordEditor() {
   }, [])
 
   const animateBlockReveal = useCallback((element: HTMLElement, delay: number) => {
+    if (!ENABLE_EDITOR_CONTENT_MOTION) return
     element.style.opacity = '0'
     element.style.transform = 'translateY(32px)'
     element.style.filter = 'blur(12px)'
@@ -1233,6 +1625,7 @@ export default function WordEditor() {
   }, [])
 
   const animateDiffMark = useCallback((element: HTMLElement, delay: number) => {
+    if (!ENABLE_EDITOR_CONTENT_MOTION) return
     element.style.opacity = '0'
     element.style.filter = 'blur(6px)'
     element.style.willChange = 'opacity, filter, background-color'
@@ -1250,6 +1643,7 @@ export default function WordEditor() {
   }, [])
 
   const runDiffInsertionAnimation = useCallback(() => {
+    if (!ENABLE_EDITOR_CONTENT_MOTION) return
     if (!editor) return
     const root = editor.view.dom as HTMLElement
     const diffNodes = Array.from(root.querySelectorAll<HTMLElement>('span.diff-new'))
@@ -1275,6 +1669,7 @@ export default function WordEditor() {
   }, [editor, findBlockContainer, animateBlockReveal, animateDiffMark])
 
   const runDocumentRevealAnimation = useCallback(() => {
+    if (!ENABLE_EDITOR_CONTENT_MOTION) return
     if (!editor) return
     const root = editor.view.dom as HTMLElement
     const blockNodes = Array.from(root.querySelectorAll<HTMLElement>(REVEAL_BLOCK_SELECTOR))
@@ -1567,6 +1962,11 @@ ${contentToProcess}
       
       // Escape 键取消补全或关闭弹窗，或拒绝待确认修改
       if (event.key === 'Escape') {
+        if (viewMode === 'print' && printInteractionMode === 'table-edit') {
+          event.preventDefault()
+          setPrintInteractionMode('stable')
+          return
+        }
         // 优先处理待确认修改
         if (pendingChangesTotal > 0) {
           event.preventDefault()
@@ -1618,7 +2018,7 @@ ${contentToProcess}
         editorElement.removeEventListener('keydown', handleKeyDown as EventListener)
       }
     }
-  }, [editor, showCompletion, completionSuggestion, acceptCompletion, dismissCompletion, triggerCompletion, openInlineEdit, showInlineEdit, showContextMenu, handleConfirmClick, pendingChangesTotal, rejectAllChanges])
+  }, [editor, showCompletion, completionSuggestion, acceptCompletion, dismissCompletion, triggerCompletion, openInlineEdit, showInlineEdit, showContextMenu, handleConfirmClick, pendingChangesTotal, printInteractionMode, rejectAllChanges, viewMode])
 
   // 编辑器加载后也更新一次
   useEffect(() => {
@@ -1663,6 +2063,37 @@ ${contentToProcess}
     }
   }, [editor, getSelectionHtml])
 
+  useEffect(() => {
+    if (!editor) return
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (viewMode !== 'print') return
+      const target = event.target as HTMLElement | null
+      if (!target) return
+
+      const inTable = !!target.closest('table, td, th, .tableWrapper')
+      if (inTable) {
+        setPrintInteractionMode('table-edit')
+        return
+      }
+
+      if (printInteractionMode === 'table-edit') {
+        setPrintInteractionMode('stable')
+      }
+    }
+
+    const editorElement = window.document.querySelector('.word-editor-content')
+    if (editorElement) {
+      editorElement.addEventListener('mousedown', handlePointerDown)
+    }
+
+    return () => {
+      if (editorElement) {
+        editorElement.removeEventListener('mousedown', handlePointerDown)
+      }
+    }
+  }, [editor, printInteractionMode, viewMode])
+
   // 当 docx 数据或文档内容变化时，解析并加载到编辑器
   useEffect(() => {
     const loadContent = async () => {
@@ -1706,9 +2137,15 @@ ${contentToProcess}
             }
             
             // 强制清空再设置，确保完全刷新
+            suppressEditorSyncRef.current = true
             editor.commands.clearContent()
             const migrated = migrateBlockFontStylesToInlineSpan(document.content)
             editor.commands.setContent(migrated)
+            setPreviewSourceHtml(document.content)
+            lastSyncedContentRef.current = document.content
+            requestAnimationFrame(() => {
+              suppressEditorSyncRef.current = false
+            })
             // 注意：lastSyncedContentRef 会在 onUpdate 中被更新为 editor.getHTML()
             // 重算浮动图片位置（如果存在）
             requestAnimationFrame(() => positionDocxFloatingImagesImpl())
@@ -1747,9 +2184,10 @@ ${contentToProcess}
                   }
                 : undefined
 
-            setPageSetup({ ...nextSetup, ...(customSize || {}) })
+            setPageSetup({ ...nextSetup, ...(customSize || {}) }, { markDirty: false })
           }
           const htmlContent = parseResult.bodyHtml
+          setPreviewSourceHtml(htmlContent)
           
           // 保存页眉/页脚数据，供单独渲染使用
           if (parseResult.headerHtml || parseResult.footerHtml) {
@@ -1791,15 +2229,20 @@ ${contentToProcess}
             })
           }
           
+          suppressEditorSyncRef.current = true
           editor.commands.setContent(htmlContent)
           
           // 直接更新 lastSyncedContentRef，避免 onUpdate 触发后再次同步
-          lastSyncedContentRef.current = editor.getHTML()
+          lastSyncedContentRef.current = htmlContent
           requestAnimationFrame(() => positionDocxFloatingImagesImpl())
-          // 同步内容到 document.content，这样 AI 替换才能正常工作
-          // 使用 setTimeout 避免在 effect 中直接触发状态更新
+          // 同步内容到 document.content，但不要把程序化解析当成用户修改
+          setDocument(prev => ({
+            ...prev,
+            content: htmlContent,
+            lastModified: prev.lastModified,
+          }))
           setTimeout(() => {
-            updateContent(lastSyncedContentRef.current)
+            suppressEditorSyncRef.current = false
           }, 0)
         } catch (err) {
           console.error('Failed to parse docx:', err)
@@ -1837,25 +2280,52 @@ ${contentToProcess}
                              (!hasDiffMarkers && currentHasDiff)
           
           if (needsUpdate) {
+            suppressEditorSyncRef.current = true
             const migrated = migrateBlockFontStylesToInlineSpan(document.content)
             editor.commands.setContent(migrated)
+            setPreviewSourceHtml(document.content)
+            requestAnimationFrame(() => {
+              suppressEditorSyncRef.current = false
+            })
             requestAnimationFrame(() => positionDocxFloatingImagesImpl())
           }
         } else {
           // Markdown 转 HTML
           const html = markdownToHtml(document.content)
           if (currentHtml !== html) {
+            suppressEditorSyncRef.current = true
             editor.commands.setContent(html)
+            setPreviewSourceHtml(html)
+            requestAnimationFrame(() => {
+              suppressEditorSyncRef.current = false
+            })
             requestAnimationFrame(() => positionDocxFloatingImagesImpl())
           }
         }
       } else {
+        const isDocxReloading =
+          (currentFile?.name || '').toLowerCase().endsWith('.docx') &&
+          !docxData &&
+          !document.content &&
+          !!lastSyncedContentRef.current.trim()
+
+        if (isDocxReloading) {
+          setIsLoading(true)
+          return
+        }
+
+        suppressEditorSyncRef.current = true
         editor.commands.setContent('')
+        setPreviewSourceHtml('')
+        requestAnimationFrame(() => {
+          suppressEditorSyncRef.current = false
+        })
       }
     }
 
     loadContent()
-  }, [docxData, document.content, editor, updateContent, positionDocxFloatingImagesImpl, migrateBlockFontStylesToInlineSpan])
+  }, [currentFile?.name, docxData, document.content, editor, updateContent, positionDocxFloatingImagesImpl, migrateBlockFontStylesToInlineSpan])
+
 
   const locateCommentInDom = useCallback((commentId: string) => {
     try {
@@ -1959,34 +2429,157 @@ ${contentToProcess}
   }, [])
 
   const recomputePageStats = useCallback(() => {
+    if (forceCanvasPrintPreview || printInteractionMode === 'table-edit') return
     const container = editorContainerRef.current
     if (!container) return
 
-    // 总页数：分页占位块数量 + 1（视觉页）
-    const breaks = window.document.querySelectorAll('.word-editor-content .pm-page-break')
-    const total = Math.max(1, (breaks?.length || 0) + 1)
+    const root = container.querySelector('.word-editor-content') as HTMLElement | null
+    const breaks = root
+      ? Array.from(root.querySelectorAll<HTMLElement>('.pm-page-break'))
+      : []
+    const total = Math.max(1, breaks.length + 1)
 
-    // 当前页数：按滚动位置粗略估算（匹配 PagedLayout 的 PAGE_HEIGHT_PX + PAGE_GAP_PX）
-    // 注意：zoom 通过 transform 实现，不影响布局尺寸；这里用未缩放的滚动高度估算即可
-    const PAGE_HEIGHT_PX = 1122.5
-    const PAGE_GAP_PX = 32
-    const step = PAGE_HEIGHT_PX + PAGE_GAP_PX
-    const current = Math.min(total, Math.max(1, Math.floor((container.scrollTop + 120) / step) + 1))
+    if (viewMode !== 'print' || !root) {
+      setPageStats(prev => (prev.current === 1 && prev.total === total ? prev : { current: 1, total }))
+      return
+    }
 
-    setPageStats({ current, total })
-  }, [])
+    const pageStartOffsets = [root.offsetTop]
+    for (const breakEl of breaks) {
+      pageStartOffsets.push(root.offsetTop + breakEl.offsetTop + breakEl.offsetHeight)
+    }
+
+    const anchorY = container.scrollTop + Math.min(Math.max(container.clientHeight * 0.3, 120), 240)
+    let current = 1
+
+    for (let i = 0; i < pageStartOffsets.length; i += 1) {
+      if (anchorY >= pageStartOffsets[i] - 1) {
+        current = i + 1
+      } else {
+        break
+      }
+    }
+
+    current = Math.min(total, Math.max(1, current))
+    setPageStats(prev => (prev.current === current && prev.total === total ? prev : { current, total }))
+  }, [forceCanvasPrintPreview, printInteractionMode, viewMode])
 
   useEffect(() => {
     recomputePageStats()
-  }, [recomputePageStats, document.content, docEntryAnimationKey, zoomLevel])
+  }, [recomputePageStats, document.content, docEntryAnimationKey, viewMode, zoomLevel])
 
   useEffect(() => {
+    if (forceCanvasPrintPreview || printInteractionMode === 'table-edit') return
     const container = editorContainerRef.current
     if (!container) return
     const onScroll = () => recomputePageStats()
     container.addEventListener('scroll', onScroll, { passive: true })
     return () => container.removeEventListener('scroll', onScroll)
-  }, [recomputePageStats])
+  }, [forceCanvasPrintPreview, printInteractionMode, recomputePageStats])
+
+  useEffect(() => {
+    if (forceCanvasPrintPreview || printInteractionMode === 'table-edit') return
+    const root = window.document.querySelector('.word-editor-content')
+    if (!(root instanceof HTMLElement)) return
+
+    let raf = 0
+    const schedule = () => {
+      cancelAnimationFrame(raf)
+      raf = requestAnimationFrame(() => {
+        recomputePageStats()
+      })
+    }
+
+    const observer = new MutationObserver((mutations) => {
+      const shouldRecompute = mutations.some((mutation) => {
+        if (mutation.type === 'childList') {
+          const added = Array.from(mutation.addedNodes)
+          const removed = Array.from(mutation.removedNodes)
+          return [...added, ...removed].some((node) => {
+            return (
+              node instanceof HTMLElement &&
+              (node.classList.contains('pm-page-break') ||
+                node.classList.contains('pm-page-end') ||
+                !!node.querySelector?.('.pm-page-break, .pm-page-end'))
+            )
+          })
+        }
+
+        return (
+          mutation.target instanceof HTMLElement &&
+          (mutation.target.classList.contains('pm-page-break') ||
+            mutation.target.classList.contains('pm-page-end'))
+        )
+      })
+
+      if (shouldRecompute) {
+        schedule()
+      }
+    })
+
+    observer.observe(root, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['style', 'class'],
+    })
+
+    schedule()
+
+    return () => {
+      cancelAnimationFrame(raf)
+      observer.disconnect()
+    }
+  }, [document.content, forceCanvasPrintPreview, printInteractionMode, recomputePageStats, viewMode])
+
+  useEffect(() => {
+    if (forceCanvasPrintPreview || printInteractionMode === 'table-edit') return
+    const container = editorContainerRef.current
+    if (!container) return
+    container.scrollTop = 0
+    requestAnimationFrame(() => {
+      recomputePageStats()
+    })
+  }, [currentFile?.path, docEntryAnimationKey, forceCanvasPrintPreview, printInteractionMode, recomputePageStats])
+
+  useEffect(() => {
+    if (!editor) return
+    const text = editor.getText()
+    lastTextRef.current = text
+    const trimmed = (text || '').trim()
+    const words = trimmed ? trimmed.split(/\s+/).filter(Boolean).length : 0
+    const chars = (text || '').length
+    setDocStats((prev) => (
+      prev.words === words && prev.chars === chars
+        ? prev
+        : { ...prev, words, chars }
+    ))
+  }, [document.content, editor])
+
+  const previewDocxData = useMemo(() => {
+    if (!docxData) return null
+    return {
+      ...docxData,
+      bodyHtml: previewSourceHtml || document.content,
+      headerHtml: docxHeaderFooter?.headerHtml || docxData.headerHtml,
+      footerHtml: docxHeaderFooter?.footerHtml || docxData.footerHtml,
+    }
+  }, [
+    docxData,
+    document.content,
+    docxHeaderFooter?.footerHtml,
+    docxHeaderFooter?.headerHtml,
+    previewSourceHtml,
+  ])
+
+  const handleCanvasPageChange = useCallback((current: number, total: number) => {
+    setPageStats(prev => {
+      if (prev.current === current && prev.total === total) {
+        return prev
+      }
+      return { current, total }
+    })
+  }, [])
 
   // 监听滚动到文本的事件
   useEffect(() => {
@@ -2114,6 +2707,94 @@ ${contentToProcess}
     }
   }, [])
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+
+    const debugPayload = {
+      isLoading,
+      viewMode,
+      printInteractionMode,
+      tableEditActive: printInteractionMode === 'table-edit',
+      editorMode,
+      printRenderMode: forceCanvasPrintPreview ? 'canvas' : 'tiptap',
+      currentFilePath: currentFile?.path || null,
+      currentFileName: currentFile?.name || null,
+      documentTitle: document.title || null,
+      zoomLevel,
+      pageStats,
+      hasDocxData: !!docxData,
+      oracleStatus,
+      oracleError,
+      alignmentStatus: renderAlignmentReport?.status || null,
+      alignmentMismatchPages: renderAlignmentReport?.currentPageIndicesOverThreshold || [],
+    }
+
+    ;(window as any).__wordCursorWordEditorDebug = debugPayload
+    return () => {
+      if ((window as any).__wordCursorWordEditorDebug === debugPayload) {
+        delete (window as any).__wordCursorWordEditorDebug
+      }
+    }
+  }, [
+    currentFile?.name,
+    currentFile?.path,
+    docxData,
+    document.title,
+    editorMode,
+    forceCanvasPrintPreview,
+    isLoading,
+    oracleError,
+    oracleStatus,
+    renderAlignmentReport,
+    pageStats,
+    printInteractionMode,
+    viewMode,
+    zoomLevel,
+  ])
+
+  useEffect(() => {
+    if (!forceCanvasPrintPreview) return
+    if (!currentFile?.path || viewMode !== 'print' || !wordOracleArtifact?.pages?.length) return
+    if (oracleStatus === 'exporting' || oracleStatus === 'inspecting' || oracleStatus === 'unavailable') return
+    const previewRoot = window.document.querySelector('[data-testid="word-render-canvas-preview"][data-render-status="ready"]')
+    if (!previewRoot) return
+
+    const canvases = Array.from(previewRoot.querySelectorAll<HTMLCanvasElement>('canvas'))
+    if (canvases.length === 0) return
+
+    const compareSignature = [
+      currentFile.path,
+      wordOracleArtifact.exportId,
+      canvases.length,
+      zoomLevel,
+      document.lastModified?.getTime?.() || 0,
+      document.content.length,
+    ].join('|')
+
+    if (lastOracleCompareRef.current === compareSignature) return
+    lastOracleCompareRef.current = compareSignature
+
+    const timeoutId = window.setTimeout(() => {
+      const pages = canvases.map((canvas, index) => ({
+        pageIndex: index + 1,
+        dataUrl: canvas.toDataURL('image/png'),
+      }))
+      void compareCurrentRenderWithWordOracle(pages)
+    }, 350)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [
+    compareCurrentRenderWithWordOracle,
+    currentFile?.path,
+    document.content.length,
+    forceCanvasPrintPreview,
+    document.lastModified,
+    oracleStatus,
+    viewMode,
+    wordOracleArtifact,
+    zoomLevel,
+  ])
+
   if (!editor) {
     return (
       <div className="flex items-center justify-center h-full bg-background">
@@ -2147,7 +2828,13 @@ ${contentToProcess}
   }
 
   return (
-    <div className="flex flex-col h-full bg-background overflow-hidden relative">
+    <div
+      className="flex flex-col h-full bg-background overflow-hidden relative"
+      data-testid="word-editor-shell"
+      data-word-view-mode={viewMode}
+      data-word-editor-mode={editorMode}
+      data-word-loading={isLoading ? 'true' : 'false'}
+    >
       {/* RibbonShell：固定在顶部（不随文档滚动） */}
       <div className="flex-shrink-0">
         {/* 顶部信息栏 - 柔和玻璃态 */}
@@ -2172,6 +2859,19 @@ ${contentToProcess}
                 )}
                 <span className="opacity-50">|</span>
                 Word 模式
+                {oracleStatus === 'ready' && renderAlignmentReport && (
+                  <>
+                    <span className="opacity-50">|</span>
+                    {currentPageMismatch ? (
+                      <span className="text-[10px] text-red-500 flex items-center gap-1">
+                        <AlertCircle className="w-3 h-3" />
+                        当前页未对齐
+                      </span>
+                    ) : (
+                      <span className="text-[10px] text-emerald-500">Oracle 已对齐</span>
+                    )}
+                  </>
+                )}
               </span>
             </div>
           </div>
@@ -2207,6 +2907,12 @@ ${contentToProcess}
           applyFontSize={(v) => editor.chain().focus().setMark('textStyle', { fontSize: v }).run()}
           viewMode={viewMode}
           setViewMode={setViewMode}
+          printInteractionMode={printInteractionMode}
+          canTogglePrintTableEdit={viewMode === 'print' && (printInteractionMode === 'table-edit' || editor.isActive('table'))}
+          onTogglePrintTableEdit={() => {
+            if (viewMode !== 'print') return
+            setPrintInteractionMode((current) => current === 'table-edit' ? 'stable' : 'table-edit')
+          }}
           zoomLevel={zoomLevel}
           setZoomLevel={setZoomLevel}
           pageSetup={pageSetup}
@@ -2266,16 +2972,34 @@ ${contentToProcess}
         )}
 
         {/* 缩放容器 */}
+        {viewMode === 'print' && previewDocxData && forceCanvasPrintPreview ? (
+          <CanvasPagePreview
+            html={previewSourceHtml || document.content}
+            docxData={previewDocxData}
+            docxInspectionReport={docxInspectionReport}
+            headerHtml={docxHeaderFooter?.headerHtml || headerFooterSetup.header?.content || ''}
+            footerHtml={docxHeaderFooter?.footerHtml || headerFooterSetup.footer?.content || ''}
+            pageSettings={previewDocxData.pageSettings}
+            scale={zoomLevel / 100}
+            showPageNumbers
+            onPageChange={handleCanvasPageChange}
+          />
+        ) : (
         <div 
           className="zoom-container"
           style={{
-            transform: `scale(${zoomLevel / 100})`,
-            transformOrigin: 'top center',
-            transition: 'transform 0.1s ease-out',
+            ...(zoomLevel === 100
+              ? {}
+              : ({
+                  zoom: zoomLevel / 100,
+                } as React.CSSProperties)),
           }}
         >
           <div 
             className={`word-page relative ${pageSetup.orientation === 'landscape' ? 'landscape' : ''} ${viewMode === 'web' ? 'web' : ''}`}
+            data-testid="word-render-tiptap-page"
+            data-render-mode={forceCanvasPrintPreview ? 'canvas' : 'tiptap'}
+            data-print-interaction-mode={printInteractionMode}
             style={{
               // 根据页面设置动态调整边距
               '--page-margin-top': pageSetup.margins.top,
@@ -2336,6 +3060,7 @@ ${contentToProcess}
             )}
           </div>
         </div>
+        )}
         
         {/*（缩放控制已迁移到底部状态栏，避免遮挡内容）*/}
         
@@ -2411,7 +3136,7 @@ ${contentToProcess}
                 <div className="px-4 py-2.5 border-b border-border flex items-center justify-between gap-4 bg-black/10 dark:bg-white/10 backdrop-blur-md">
                   <div className="flex items-center gap-2">
                     <div className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
-                    <span className="text-xs text-text-secondary font-medium">待确认修改</span>
+                    <span className="text-xs text-text-secondary font-medium">{pendingChangeLabel}</span>
                     <span className="text-[10px] text-text-dim bg-black/10 dark:bg-white/10 px-1.5 py-0.5 rounded border border-black/10 dark:border-white/10">
                       ×{pendingChangesTotal}
                     </span>
@@ -2501,7 +3226,9 @@ ${contentToProcess}
         {/* 左侧：页码、字数 */}
         <div className="flex items-center gap-3 text-[11px] text-text-secondary min-w-0">
           <span className="truncate">
-            第 {pageStats.current} 页 / 共 {pageStats.total} 页
+            {viewMode === 'print'
+              ? `第 ${pageStats.current} 页 / 共 ${pageStats.total} 页${printInteractionMode === 'table-edit' ? ' · 表格编辑中' : ''}`
+              : '网页视图'}
           </span>
           <span className="opacity-50">|</span>
           <span className="truncate">
@@ -2687,6 +3414,8 @@ ${contentToProcess}
           padding: 0;
           box-shadow: var(--word-page-shadow);
           position: relative;
+          contain: layout paint;
+          isolation: isolate;
           /* 不使用 overflow:hidden，让分页占位块自然展示 */
         }
 
@@ -2725,7 +3454,7 @@ ${contentToProcess}
 
         .word-page.landscape .word-editor-content {
           width: var(--page-width, 297mm);
-          min-height: var(--page-height, 210mm);
+          min-height: calc(var(--page-height, 210mm) - var(--page-margin-top, 2.54cm) - var(--page-margin-bottom, 2.54cm));
         }
 
         /* 页眉样式 - 参考 Word 的浅色显示 */
@@ -2735,7 +3464,6 @@ ${contentToProcess}
           left: var(--page-margin-left);
           right: var(--page-margin-right);
           padding-bottom: 0.3cm;
-          border-bottom: 1px dashed var(--word-rule);
           font-size: 9pt;
           color: var(--word-ink-dim);
           opacity: 0.7;
@@ -2749,7 +3477,6 @@ ${contentToProcess}
           left: var(--page-margin-left);
           right: var(--page-margin-right);
           padding-top: 0.3cm;
-          border-top: 1px dashed var(--word-rule);
           font-size: 9pt;
           color: var(--word-ink-dim);
           opacity: 0.7;
@@ -2796,7 +3523,7 @@ ${contentToProcess}
           position: absolute;
           width: 20px;
           height: 20px;
-          border: 1px solid rgb(255 255 255 / 0.22);
+          border: 1px solid rgb(0 0 0 / 0.22);
           pointer-events: none;
         }
 
@@ -2823,7 +3550,7 @@ ${contentToProcess}
           position: absolute;
           width: 20px;
           height: 20px;
-          border: 1px solid rgb(255 255 255 / 0.22);
+          border: 1px solid rgb(0 0 0 / 0.22);
           pointer-events: none;
         }
 
@@ -2855,9 +3582,10 @@ ${contentToProcess}
           background: var(--word-page-bg);
           /* 使用 CSS 变量支持动态页边距 */
           padding: var(--page-margin-top, 2.54cm) var(--page-margin-right, 3.17cm) var(--page-margin-bottom, 2.54cm) var(--page-margin-left, 3.17cm);
-          min-height: var(--page-height, 297mm); /* 至少一页高度 */
+          min-height: calc(var(--page-height, 297mm) - var(--page-margin-top, 2.54cm) - var(--page-margin-bottom, 2.54cm)); /* 内容区至少一页高度 */
           box-shadow: none;
           position: relative;
+          contain: paint;
           /* 默认字体/字号/行距：由 CSS 变量控制，便于根据 docx 的 Normal/Theme 动态覆盖 */
           font-family: var(--word-font-family-cn);
           font-size: var(--word-font-size); /* 10.5pt @ 96 DPI */
@@ -2877,15 +3605,30 @@ ${contentToProcess}
           /* 用实色三段拼接：白纸底部 + 灰色间距 + 白纸顶部 */
           background: linear-gradient(
             to bottom,
-            var(--word-page-bg) 0,
-            var(--word-page-bg) var(--fill, 0px),
+            transparent 0,
+            transparent var(--fill, 0px),
             var(--word-canvas-bg) var(--fill, 0px),
             var(--word-canvas-bg) calc(var(--fill, 0px) + var(--gap, 32px)),
-            var(--word-page-bg) calc(var(--fill, 0px) + var(--gap, 32px)),
-            var(--word-page-bg) 100%
+            transparent calc(var(--fill, 0px) + var(--gap, 32px)),
+            transparent 100%
           );
           position: relative;
           z-index: 1;
+          contain: layout paint;
+        }
+
+        .pm-page-break.in-table {
+          margin-left: 0;
+          margin-right: 0;
+          width: 100%;
+        }
+
+        .pm-page-break-row,
+        .pm-page-break-cell {
+          border: none !important;
+          padding: 0 !important;
+          height: auto !important;
+          background: transparent !important;
         }
 
         /* 末页填充占位块：仅补足到页底 */
@@ -2896,6 +3639,7 @@ ${contentToProcess}
           display: block;
           box-sizing: content-box;
           background: transparent;
+          contain: layout paint;
         }
 
         /* 取消页间分隔线，避免出现细白线 */
@@ -2912,7 +3656,9 @@ ${contentToProcess}
         .word-editor-content p {
           margin: 0;
           padding: 0;
-          /* 不设置默认 text-indent，由 docx 解析的样式控制 */
+          text-indent: 0;
+          line-height: inherit;
+          font-size: inherit;
         }
 
         /* 空段落保持行高 */
@@ -2920,14 +3666,63 @@ ${contentToProcess}
           content: '\\00a0';
         }
 
+        .word-editor-content p.docx-cover-title-line {
+          margin-top: 0 !important;
+          margin-bottom: 6pt !important;
+        }
+
+        .word-editor-content p.docx-cover-title-line > span,
+        .word-editor-content p.docx-cover-title-line > [data-para-font="1"] {
+          max-width: 100%;
+          line-height: inherit !important;
+          letter-spacing: inherit !important;
+        }
+
+        .word-editor-content p.docx-cover-display-line {
+          line-height: inherit !important;
+        }
+
+        .word-editor-content p.docx-cover-display-line > span,
+        .word-editor-content p.docx-cover-display-line > [data-para-font="1"] {
+          font-size: inherit !important;
+          line-height: inherit !important;
+          letter-spacing: inherit !important;
+        }
+
+        .word-editor-content p.docx-cover-spacer {
+          min-height: 0;
+        }
+
+        .word-editor-content p.docx-cover-spacer:first-of-type {
+          min-height: 0;
+        }
+
+        .word-editor-content p.docx-cover-display-line + p.docx-cover-spacer {
+          min-height: 12pt;
+        }
+
+        .word-editor-content p.docx-cover-meta-line {
+          margin-top: 0 !important;
+          margin-bottom: 0 !important;
+        }
+
+        .word-editor-content p.docx-cover-meta-line > span,
+        .word-editor-content p.docx-cover-meta-line > [data-para-font="1"] {
+          line-height: inherit !important;
+          letter-spacing: inherit !important;
+        }
+
         /* TOC 段落：点引导线 */
         .docx-toc {
-          width: 100%;
-          max-width: var(--docx-tab-pos, 100%);
+          width: min(100%, 85%);
+          max-width: min(var(--docx-tab-pos, 100%), 85%);
           display: flex;
           align-items: baseline;
           overflow: hidden;
           min-width: 0;
+          margin-left: auto;
+          margin-right: auto;
+          line-height: 1.12;
         }
 
         .word-editor-content .docx-toc a {
@@ -2967,14 +3762,22 @@ ${contentToProcess}
         .docx-toc-leader {
           flex: 1 1 auto;
           overflow: hidden;
-          white-space: nowrap;
-          letter-spacing: 0.15em;
           min-width: 1em;
+          align-self: baseline;
+          color: inherit;
+          font-size: 1em;
+          line-height: inherit;
+          letter-spacing: 0.04em;
+          white-space: nowrap;
         }
 
         .docx-toc-right {
           flex: 0 0 auto;
           white-space: nowrap;
+        }
+
+        .docx-toc[data-docx-toc-structured="1"][data-docx-toc-depth="1"] {
+          padding-left: 2.8em;
         }
 
         .docx-tab {
@@ -3105,14 +3908,22 @@ ${contentToProcess}
 
         .word-editor-content th,
         .word-editor-content td {
-          border: 0.5pt solid var(--word-rule);
-          padding: 2pt 5pt;
           text-align: left;
-          vertical-align: top;
+          box-sizing: border-box;
+          padding: 0;
         }
 
         .word-editor-content th {
           font-weight: bold;
+        }
+
+        .word-editor-content .docx-cell-para {
+          margin: 0;
+          min-height: 1em;
+        }
+
+        .word-editor-content hr {
+          display: none;
         }
 
         /* 图片 */
@@ -3191,8 +4002,15 @@ ${contentToProcess}
           pointer-events: none;
         }
 
+        .word-page[data-print-interaction-mode="stable"] .word-editor-content .column-resize-handle,
+        .word-page[data-print-interaction-mode="stable"] .word-editor-content .selectedCell:after,
+        .word-page[data-print-interaction-mode="stable"] .word-editor-content .resize-cursor {
+          display: none !important;
+        }
+
         .word-editor-content .tableWrapper {
-          overflow-x: auto;
+          overflow: visible;
+          width: 100%;
         }
 
         .word-editor-content .resize-cursor {

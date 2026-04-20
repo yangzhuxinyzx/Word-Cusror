@@ -15,7 +15,7 @@ import {
   PT_TO_PX
 } from './textMeasurer'
 
-const DEFAULT_LINE_HEIGHT = 1
+const DEFAULT_LINE_HEIGHT = 1.08
 
 // 布局元素类型
 export type LayoutElementType = 
@@ -82,6 +82,7 @@ export interface TableCellLayoutElement extends LayoutElement {
   type: 'tableCell'
   colspan?: number
   rowspan?: number
+  columnIndex?: number
   children: LayoutElement[]
 }
 
@@ -91,10 +92,13 @@ export interface ElementStyle {
   fontSize?: number  // pt
   fontWeight?: 'normal' | 'bold' | number
   fontStyle?: 'normal' | 'italic'
+  textAlign?: 'left' | 'center' | 'right' | 'justify'
+  verticalAlign?: 'top' | 'middle' | 'bottom'
   color?: string
   backgroundColor?: string
   textDecoration?: 'none' | 'underline' | 'line-through'
   lineHeight?: number
+  letterSpacing?: number // pt
   marginTop?: number     // px
   marginBottom?: number  // px
   marginLeft?: number    // px
@@ -197,13 +201,33 @@ export class LayoutEngine {
    * 获取内容区域尺寸
    */
   getContentArea(): { x: number; y: number; width: number; height: number } {
-    const { width, height, marginTop, marginBottom, marginLeft, marginRight, headerHeight, footerHeight } = this.pageConfig
+    const { width, height, marginTop, marginBottom, marginLeft, marginRight } = this.pageConfig
     return {
       x: marginLeft,
       y: marginTop,
       width: width - marginLeft - marginRight,
-      height: height - marginTop - marginBottom - headerHeight - footerHeight
+      height: height - marginTop - marginBottom
     }
+  }
+
+  private readStyleAttr(el: HTMLElement | null | undefined): string {
+    return el?.getAttribute('style') || ''
+  }
+
+  private resolveLineHeight(styleAttr: string, fontSize: number, fallback?: number): number {
+    const lineHeightMatch = styleAttr.match(/line-height:\s*(\d+(?:\.\d+)?)(px|pt)?/i)
+    if (!lineHeightMatch) return fallback ?? DEFAULT_LINE_HEIGHT
+
+    const value = parseFloat(lineHeightMatch[1])
+    const unit = lineHeightMatch[2]?.toLowerCase()
+    if (unit === 'pt') {
+      return fontSize > 0 ? value / fontSize : fallback ?? DEFAULT_LINE_HEIGHT
+    }
+    if (unit === 'px') {
+      const pt = value / PT_TO_PX
+      return fontSize > 0 ? pt / fontSize : fallback ?? DEFAULT_LINE_HEIGHT
+    }
+    return value
   }
   
   /**
@@ -270,6 +294,10 @@ export class LayoutEngine {
       }
     }
     
+    if (tagName === 'hr' || tagName === 'br') {
+      return null
+    }
+
     switch (tagName) {
       case 'p':
         return this.parseParagraph(el)
@@ -319,7 +347,7 @@ export class LayoutEngine {
    * 解析段落
    */
   private parseParagraph(el: HTMLElement): ParagraphLayoutElement {
-    const style = this.extractStyle(el)
+    const style = this.extractTextStyle(el)
     const isToc = el.classList.contains('docx-toc')
     let text = el.textContent || ''
     const contentArea = this.getContentArea()
@@ -351,10 +379,12 @@ export class LayoutEngine {
     // 测量文本
     const textStyle: TextStyle = {
       fontFamily: style.fontFamily || 'DengXian, "Microsoft YaHei", "SimSun", serif',
-      fontSize: style.fontSize || 10.5,
+      fontSize: style.fontSize ?? 10.5,
       fontWeight: style.fontWeight,
       fontStyle: style.fontStyle,
-      lineHeight: style.lineHeight || DEFAULT_LINE_HEIGHT
+      lineHeight: this.resolveLineHeight(computedStyle, style.fontSize ?? 10.5, style.lineHeight ?? DEFAULT_LINE_HEIGHT),
+      letterSpacing: style.letterSpacing,
+      scaleFactor: this.scale
     }
     
     if (isToc) {
@@ -378,8 +408,8 @@ export class LayoutEngine {
     )
     
     // 计算段落间距
-    const marginTop = style.marginTop || 0
-    const marginBottom = style.marginBottom || (8 * PT_TO_PX * this.scale)
+    const marginTop = style.marginTop ?? 0
+    const marginBottom = style.marginBottom ?? 0
     
     return {
       type: 'paragraph',
@@ -424,16 +454,16 @@ export class LayoutEngine {
       6: 10
     }
     
-    const fontSize = fontSizes[level] || baseFontSize
+    const fontSize = paragraph.style?.fontSize ?? fontSizes[level] ?? baseFontSize
     
-    const spacingBefore = level === 1 ? 18 : 8
-    const spacingAfter = 4
+    const spacingBefore = paragraph.style?.marginTop ?? ((level === 1 ? 18 : 8) * PT_TO_PX * this.scale)
+    const spacingAfter = paragraph.style?.marginBottom ?? (4 * PT_TO_PX * this.scale)
 
     if (paragraph.style) {
       paragraph.style.fontSize = fontSize
-      paragraph.style.fontWeight = 'bold'
-      paragraph.style.marginTop = spacingBefore * PT_TO_PX * this.scale
-      paragraph.style.marginBottom = spacingAfter * PT_TO_PX * this.scale
+      paragraph.style.fontWeight = paragraph.style.fontWeight ?? 'bold'
+      paragraph.style.marginTop = spacingBefore
+      paragraph.style.marginBottom = spacingAfter
     }
     
     // 重新测量
@@ -441,8 +471,10 @@ export class LayoutEngine {
     const textStyle: TextStyle = {
       fontFamily: paragraph.style?.fontFamily || 'DengXian, "Microsoft YaHei", "SimSun", serif',
       fontSize,
-      fontWeight: 'bold',
-      lineHeight: DEFAULT_LINE_HEIGHT
+      fontWeight: paragraph.style?.fontWeight ?? 'bold',
+      lineHeight: this.resolveLineHeight(el.getAttribute('style') || '', fontSize, paragraph.style?.lineHeight ?? DEFAULT_LINE_HEIGHT),
+      letterSpacing: paragraph.style?.letterSpacing,
+      scaleFactor: this.scale
     }
     
     const text = el.textContent || ''
@@ -570,26 +602,35 @@ export class LayoutEngine {
     }
 
     const tableRows = el.querySelectorAll('tr')
+    const rowSpanOccupancy: number[] = []
 
     for (const tr of Array.from(tableRows)) {
       const cells: TableCellLayoutElement[] = []
       let rowHeight = 0
       const trStyle = (tr as HTMLElement).getAttribute('style') || ''
-      const heightMatch = trStyle.match(/height:\s*([^;]+)/)
+      const heightMatch = trStyle.match(/(?:^|;)\s*height:\s*([^;]+)/i)
       const explicitRowHeight = parseSize(heightMatch?.[1], contentArea.height)
       const tds = tr.querySelectorAll('td, th')
       const fallbackCellWidth = tableWidth / Math.max(tds.length, 1)
       let colIndex = 0
 
       for (const td of Array.from(tds)) {
-        const text = td.textContent || ''
-        const cellStyle = this.extractStyle(td as HTMLElement)
+        while ((rowSpanOccupancy[colIndex] || 0) > 0) {
+          colIndex += 1
+        }
+
+        const text = ((td as HTMLElement).innerText || td.textContent || '')
+          .replace(/\r\n/g, '\n')
+          .replace(/\n{2,}/g, '\n')
+        const cellStyle = this.extractTextStyle(td as HTMLElement)
         const textStyle: TextStyle = {
           fontFamily: cellStyle.fontFamily || 'DengXian, "Microsoft YaHei", "SimSun", serif',
           fontSize: cellStyle.fontSize || 10.5,
           fontWeight: cellStyle.fontWeight,
           fontStyle: cellStyle.fontStyle,
-          lineHeight: cellStyle.lineHeight || DEFAULT_LINE_HEIGHT
+          lineHeight: this.resolveLineHeight((td as HTMLElement).getAttribute('style') || '', cellStyle.fontSize ?? 10.5, cellStyle.lineHeight ?? DEFAULT_LINE_HEIGHT),
+          letterSpacing: cellStyle.letterSpacing,
+          scaleFactor: this.scale
         }
 
         const parsePadding = (attr: string) => {
@@ -605,24 +646,30 @@ export class LayoutEngine {
 
         const colspan = parseInt((td as HTMLTableCellElement).getAttribute('colspan') || '1')
         const colSpan = Number.isFinite(colspan) && colspan > 0 ? colspan : 1
+        const rowSpan = parseInt((td as HTMLTableCellElement).getAttribute('rowspan') || '1')
+        const safeRowSpan = Number.isFinite(rowSpan) && rowSpan > 0 ? rowSpan : 1
         const cellWidth = columnWidths.length
           ? columnWidths.slice(colIndex, colIndex + colSpan).reduce((sum, w) => sum + w, 0) || fallbackCellWidth
           : fallbackCellWidth
+        const cellX = columnWidths.length
+          ? columnWidths.slice(0, colIndex).reduce((sum, w) => sum + w, 0)
+          : cells.reduce((sum, cell) => sum + cell.width, 0)
 
         const measured = this.measurer.measureParagraph(text, Math.max(0, cellWidth - paddingX), textStyle)
-        const cellHeight = measured.height + paddingY * 2
+        const cellHeight = measured.height + paddingY
 
         if (cellHeight > rowHeight) rowHeight = cellHeight
 
         cells.push({
           type: 'tableCell',
-          x: 0,
+          x: cellX,
           y: 0,
           width: cellWidth,
           height: cellHeight,
           pageIndex: 0,
           colspan: colSpan,
-          rowspan: parseInt((td as HTMLTableCellElement).getAttribute('rowspan') || '1'),
+          rowspan: safeRowSpan,
+          columnIndex: colIndex,
           style: cellStyle,
           children: [{
             type: 'text',
@@ -636,13 +683,20 @@ export class LayoutEngine {
             style: cellStyle
           } as TextLayoutElement]
         })
+        if (safeRowSpan > 1) {
+          for (let spanOffset = 0; spanOffset < colSpan; spanOffset += 1) {
+            rowSpanOccupancy[colIndex + spanOffset] = Math.max(
+              rowSpanOccupancy[colIndex + spanOffset] || 0,
+              safeRowSpan - 1
+            )
+          }
+        }
         colIndex += colSpan
       }
 
       if (explicitRowHeight && explicitRowHeight > rowHeight) {
         rowHeight = explicitRowHeight
       }
-
       for (const cell of cells) {
         cell.height = rowHeight
       }
@@ -658,6 +712,11 @@ export class LayoutEngine {
       })
 
       tableHeight += rowHeight
+      for (let i = 0; i < rowSpanOccupancy.length; i += 1) {
+        if ((rowSpanOccupancy[i] || 0) > 0) {
+          rowSpanOccupancy[i] -= 1
+        }
+      }
     }
 
     return {
@@ -665,7 +724,7 @@ export class LayoutEngine {
       x: 0,
       y: 0,
       width: tableWidth,
-      height: tableHeight + 20 * this.scale, // 表格间距
+      height: tableHeight,
       pageIndex: 0,
       columns: rows[0]?.cells.length || 0,
       rows
@@ -693,8 +752,10 @@ export class LayoutEngine {
         const contentArea = this.getContentArea()
         const textStyle: TextStyle = {
           fontFamily: para.style?.fontFamily || 'DengXian, "Microsoft YaHei", "SimSun", serif',
-          fontSize: para.style?.fontSize || 10.5,
-          lineHeight: para.style?.lineHeight || DEFAULT_LINE_HEIGHT
+          fontSize: para.style?.fontSize ?? 10.5,
+          lineHeight: this.resolveLineHeight(li.getAttribute('style') || '', para.style?.fontSize ?? 10.5, para.style?.lineHeight ?? DEFAULT_LINE_HEIGHT),
+          letterSpacing: para.style?.letterSpacing,
+          scaleFactor: this.scale
         }
         para.children[0].measuredText = this.measurer.measureParagraph(text, contentArea.width, textStyle)
         para.height = para.children[0].measuredText.height + 8 * this.scale
@@ -720,7 +781,71 @@ export class LayoutEngine {
   /**
    * 提取元素样式
    */
-  private extractStyle(el: HTMLElement): ElementStyle {
+  private getTextStyleContainer(el: HTMLElement): HTMLElement {
+    const selector = '.docx-cell-para, p, h1, h2, h3, h4, h5, h6, li'
+    if (el.matches(selector)) {
+      return el
+    }
+    return (el.querySelector(selector) as HTMLElement | null) || el
+  }
+
+  private getTypographySource(el: HTMLElement): HTMLElement | null {
+    const selector = [
+      '[data-para-font="1"]',
+      'span[style*="font-size"]',
+      'span[style*="font-family"]',
+      'span[style*="font-weight"]',
+      'span[style*="font-style"]',
+      'span[style*="color"]',
+      'strong',
+      'b',
+      'em',
+      'i',
+      'u',
+      's',
+      'strike',
+      'del'
+    ].join(', ')
+
+    if (el.matches(selector)) {
+      return el
+    }
+    return el.querySelector(selector) as HTMLElement | null
+  }
+
+  private extractTextStyle(el: HTMLElement): ElementStyle {
+    const container = this.getTextStyleContainer(el)
+    const source = this.getTypographySource(container)
+    const inlineStyle = source ? this.extractStyle(source) : {}
+    const blockStyle =
+      source && source !== container
+        ? this.extractStyle(container, inlineStyle.fontSize)
+        : this.extractStyle(container)
+
+    const merged: ElementStyle = {
+      ...blockStyle,
+      ...inlineStyle
+    }
+
+    const semanticSource = source || container
+    if (merged.fontWeight == null && semanticSource.closest('strong, b')) {
+      merged.fontWeight = 'bold'
+    }
+    if (merged.fontStyle == null && semanticSource.closest('em, i')) {
+      merged.fontStyle = 'italic'
+    }
+    if (merged.textDecoration == null) {
+      if (semanticSource.closest('u')) {
+        merged.textDecoration = 'underline'
+      } else if (semanticSource.closest('s, strike, del')) {
+        merged.textDecoration = 'line-through'
+      }
+    }
+
+    return merged
+  }
+
+  private extractStyle(el: HTMLElement, fallbackFontSize?: number): ElementStyle {
     const style: ElementStyle = {}
     const styleAttr = el.getAttribute('style') || ''
     
@@ -744,6 +869,10 @@ export class LayoutEngine {
     if (styleAttr.includes('font-weight: bold') || styleAttr.includes('font-weight:bold')) {
       style.fontWeight = 'bold'
     }
+    const numericWeightMatch = styleAttr.match(/font-weight:\s*(\d{3})/i)
+    if (numericWeightMatch) {
+      style.fontWeight = parseInt(numericWeightMatch[1], 10)
+    }
     
     // 解析 font-style
     if (styleAttr.includes('font-style: italic') || styleAttr.includes('font-style:italic')) {
@@ -754,6 +883,26 @@ export class LayoutEngine {
     const colorMatch = styleAttr.match(/(?:^|;)\s*color:\s*([^;]+)/)
     if (colorMatch) {
       style.color = colorMatch[1].trim()
+    }
+
+    const textAlignMatch = styleAttr.match(/text-align:\s*(left|center|right|justify)/i)
+    if (textAlignMatch) {
+      style.textAlign = textAlignMatch[1].toLowerCase() as ElementStyle['textAlign']
+    }
+
+    const verticalAlignMatch = styleAttr.match(/vertical-align:\s*(top|middle|bottom)/i)
+    if (verticalAlignMatch) {
+      style.verticalAlign = verticalAlignMatch[1].toLowerCase() as ElementStyle['verticalAlign']
+    }
+
+    const letterSpacingMatch = styleAttr.match(/letter-spacing:\s*(-?\d+(?:\.\d+)?)(px|pt|em)/i)
+    if (letterSpacingMatch) {
+      const value = parseFloat(letterSpacingMatch[1])
+      const unit = letterSpacingMatch[2]
+      const fontSize = style.fontSize ?? fallbackFontSize ?? 10.5
+      if (unit === 'pt') style.letterSpacing = value
+      else if (unit === 'px') style.letterSpacing = value / PT_TO_PX
+      else if (unit === 'em') style.letterSpacing = value * fontSize
     }
     
     // 解析 background-color
@@ -827,7 +976,7 @@ export class LayoutEngine {
     if (lineHeightMatch) {
       const value = parseFloat(lineHeightMatch[1])
       const unit = lineHeightMatch[2]
-      const fontSize = style.fontSize || 10.5
+      const fontSize = style.fontSize ?? fallbackFontSize ?? 10.5
       if (unit === 'pt') {
         style.lineHeight = fontSize > 0 ? value / fontSize : DEFAULT_LINE_HEIGHT
       } else if (unit === 'px') {
@@ -844,6 +993,65 @@ export class LayoutEngine {
   /**
    * 分页算法
    */
+  private cloneTableSegment(
+    table: TableLayoutElement,
+    startRow: number,
+    endRow: number,
+    withTrailingGap: boolean
+  ): TableLayoutElement {
+    let segmentHeight = 0
+    const rows = table.rows.slice(startRow, endRow).map((row) => {
+      const nextRow: TableRowLayoutElement = {
+        ...row,
+        y: segmentHeight,
+        pageIndex: 0,
+        cells: row.cells.map((cell) => ({
+          ...cell,
+          pageIndex: 0,
+          children: cell.children?.map((child) => ({
+            ...child,
+            pageIndex: 0,
+          })) || [],
+        })),
+      }
+      segmentHeight += row.height
+      return nextRow
+    })
+
+    return {
+      ...table,
+      x: 0,
+      y: 0,
+      pageIndex: 0,
+      rows,
+      height: segmentHeight + (withTrailingGap ? 20 * this.scale : 0),
+      columns: table.columns,
+    }
+
+    const paddingMatch = styleAttr.match(/padding:\s*([^;]+)/i)
+    if (paddingMatch) {
+      const parts = paddingMatch[1]
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+      const parsePad = (raw: string | undefined) => {
+        if (!raw) return undefined
+        if (raw.endsWith('pt')) return parseFloat(raw) * PT_TO_PX * this.scale
+        if (raw.endsWith('px')) return parseFloat(raw) * this.scale
+        const num = parseFloat(raw)
+        return Number.isFinite(num) ? num * this.scale : undefined
+      }
+      const top = parsePad(parts[0])
+      const right = parsePad(parts[1] || parts[0])
+      const bottom = parsePad(parts[2] || parts[0])
+      const left = parsePad(parts[3] || parts[1] || parts[0])
+      if (top != null) style.paddingTop = top
+      if (right != null) style.paddingRight = right
+      if (bottom != null) style.paddingBottom = bottom
+      if (left != null) style.paddingLeft = left
+    }
+  }
+
   private paginateElements(elements: LayoutElement[]): PageLayout[] {
     const pages: PageLayout[] = []
     const contentArea = this.getContentArea()
@@ -864,6 +1072,75 @@ export class LayoutEngine {
           elements: []
         }
         currentY = 0
+        continue
+      }
+
+      if (element.type === 'table') {
+        const table = element as TableLayoutElement
+        let rowIndex = 0
+
+        while (rowIndex < table.rows.length) {
+          let remainingHeight = maxHeight - currentY
+          const firstPendingRowHeight = table.rows[rowIndex]?.height || 0
+
+          if (
+            currentPage.elements.length > 0 &&
+            remainingHeight < firstPendingRowHeight * 0.75
+          ) {
+            pages.push(currentPage)
+            currentPage = {
+              pageIndex: pages.length,
+              elements: []
+            }
+            currentY = 0
+            remainingHeight = maxHeight
+          }
+
+          let consumedHeight = 0
+          let endRow = rowIndex
+          while (endRow < table.rows.length) {
+            const rowHeight = table.rows[endRow].height
+            if (endRow > rowIndex && consumedHeight + rowHeight > remainingHeight) {
+              break
+            }
+            consumedHeight += rowHeight
+            endRow += 1
+            if (consumedHeight >= remainingHeight) {
+              break
+            }
+          }
+
+          if (endRow === rowIndex) {
+            endRow = Math.min(rowIndex + 1, table.rows.length)
+          }
+
+          const segment = this.cloneTableSegment(
+            table,
+            rowIndex,
+            endRow,
+            endRow >= table.rows.length
+          )
+
+          segment.x = contentArea.x
+          segment.y = contentArea.y + currentY
+          segment.pageIndex = currentPage.pageIndex
+
+          this.updateChildPositions(segment, segment.x, segment.y, currentPage.pageIndex)
+
+          currentPage.elements.push(segment)
+          currentY += segment.height
+          rowIndex = endRow
+
+          if (rowIndex < table.rows.length) {
+            pages.push(currentPage)
+            currentPage = {
+              pageIndex: pages.length,
+              elements: []
+            }
+            currentY = 0
+          }
+        }
+
         continue
       }
       
@@ -936,7 +1213,8 @@ export class LayoutEngine {
           fontFamily: 'DengXian, "Microsoft YaHei", "SimSun", serif',
           fontSize: 9,
           color: 'var(--word-ink-muted)',
-          lineHeight: 1
+          lineHeight: 1,
+          scaleFactor: this.scale
         }
         
         const measured = this.measurer.measureParagraph(headerText, contentWidth, textStyle)
@@ -974,12 +1252,15 @@ export class LayoutEngine {
           .replace(/<[^>]+>/g, '')
           .replace(/\{PAGE\}/g, String(pageNumber))
           .replace(/\{NUMPAGES\}/g, String(totalPages))
+          .replace(new RegExp(`^(?:${pageNumber}){2,}$`), String(pageNumber))
+          .trim()
         
         const textStyle: TextStyle = {
           fontFamily: 'DengXian, "Microsoft YaHei", "SimSun", serif',
           fontSize: 9,
           color: 'var(--word-ink-muted)',
-          lineHeight: 1
+          lineHeight: 1,
+          scaleFactor: this.scale
         }
         
         const measured = this.measurer.measureParagraph(footerText, contentWidth, textStyle)
@@ -1013,7 +1294,8 @@ export class LayoutEngine {
           fontFamily: 'DengXian, "Microsoft YaHei", "SimSun", serif',
           fontSize: 9,
           color: 'var(--word-ink-muted)',
-          lineHeight: 1
+          lineHeight: 1,
+          scaleFactor: this.scale
         }
         
         const measured = this.measurer.measureParagraph(footerText, contentWidth, textStyle)

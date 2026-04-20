@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
-import { useDocument } from '../context/DocumentContext'
+import { useDocument } from '../context/useDocument'
 import { Loader2, AlertCircle, RefreshCw, FileText, CheckCircle } from 'lucide-react'
 
 // 文档服务器地址
@@ -1169,13 +1169,22 @@ export default function OnlyOfficeEditor() {
       <div className="flex-1 flex flex-col items-center justify-center bg-background p-8">
         <AlertCircle className="w-12 h-12 text-error mb-4" />
         <p className="text-error mb-4 text-center">{error}</p>
-        <button
-          onClick={handleRetry}
-          className="flex items-center gap-2 px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary-hover transition-colors"
-        >
-          <RefreshCw className="w-4 h-4" />
-          重试
-        </button>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleRetry}
+            className="flex items-center gap-2 px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary-hover transition-colors"
+          >
+            <RefreshCw className="w-4 h-4" />
+            重试
+          </button>
+          <button
+            onClick={() => setEditorMode('tiptap')}
+            className="flex items-center gap-2 px-4 py-2 bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 text-text rounded-lg hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
+          >
+            <FileText className="w-4 h-4" />
+            返回内置编辑器
+          </button>
+        </div>
         <div className="mt-6 p-4 bg-surface rounded-lg max-w-md">
           <p className="text-sm text-text-muted mb-2">请确保：</p>
           <ul className="text-xs text-text-dim space-y-1 list-disc list-inside">

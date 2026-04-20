@@ -53,6 +53,9 @@ type WordRibbonProps = {
   // view
   viewMode: 'print' | 'web'
   setViewMode: (v: 'print' | 'web') => void
+  printInteractionMode?: 'stable' | 'table-edit'
+  canTogglePrintTableEdit?: boolean
+  onTogglePrintTableEdit?: () => void
 
   // zoom
   zoomLevel: number
@@ -159,6 +162,9 @@ export default function WordRibbon(props: WordRibbonProps) {
     applyFontSize,
     viewMode,
     setViewMode,
+    printInteractionMode,
+    canTogglePrintTableEdit,
+    onTogglePrintTableEdit,
     zoomLevel,
     setZoomLevel,
     pageSetup,
@@ -644,6 +650,22 @@ export default function WordRibbon(props: WordRibbonProps) {
                 >
                   网页布局
                 </button>
+                {viewMode === 'print' && onTogglePrintTableEdit && (
+                  <button
+                    type="button"
+                    onClick={onTogglePrintTableEdit}
+                    disabled={!canTogglePrintTableEdit}
+                    className={[
+                      'px-2.5 py-1 text-xs rounded-md border transition-colors disabled:opacity-40 disabled:cursor-not-allowed',
+                      printInteractionMode === 'table-edit'
+                        ? 'bg-accent/12 border-accent/25 text-accent'
+                        : 'bg-black/5 dark:bg-white/5 border-black/10 dark:border-white/10 text-text-muted hover:text-text',
+                    ].join(' ')}
+                    title={printInteractionMode === 'table-edit' ? '退出表格编辑' : '进入表格编辑'}
+                  >
+                    {printInteractionMode === 'table-edit' ? '退出表格编辑' : '进入表格编辑'}
+                  </button>
+                )}
               </RibbonGroup>
               <RibbonGroup label="缩放">
                 <div className="flex flex-col gap-2">

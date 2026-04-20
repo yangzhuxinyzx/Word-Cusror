@@ -1,8 +1,18 @@
-import { createContext, useContext, useState, useCallback, ReactNode, useRef, useEffect } from 'react'
-import { DocumentContent, DocumentStyles, FileItem, PageSetup, HeaderFooterSetup, CustomStyle } from '../types'
+import { createContext, useContext, useState, useCallback, useMemo, ReactNode, useRef, useEffect } from 'react'
+import {
+  DocumentContent,
+  DocumentStyles,
+  FileItem,
+  PageSetup,
+  HeaderFooterSetup,
+  CustomStyle,
+  DocxInspectionReport,
+  RenderAlignmentReport,
+  WordOracleArtifact,
+} from '../types'
 import type { ExcelOpenResponse } from '../types/electron'
 import { saveAs } from 'file-saver'
-import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, Table, TableRow, TableCell, WidthType, BorderStyle, UnderlineType } from 'docx'
+import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, Table, TableRow, TableCell, WidthType, BorderStyle, UnderlineType, ImageRun } from 'docx'
 import { extractTypographyProfileFromArrayBuffer } from '../utils/docxTypography'
 import type { DocxTypographyProfile } from '../utils/docxTypography'
 import { toChineseDefaultFallbackStack } from '../fonts/fontManifest'
@@ -13,6 +23,54 @@ import type { DocDsl, DslBlock, DslRun, DslInline, DslBlockMeta, DslRunMeta } fr
 import { validateDocDsl, dslToHtml, normalizeContent, extractPlainText } from '../utils/docDsl'
 import { dslToDocxBlob } from '../utils/docDslToDocx'
 import { htmlToDsl } from '../utils/htmlToDsl'
+import { buildInlineDiffPairHtml, buildInlineDiffTokenHtml, INLINE_DIFF_PAIR_CLASS } from '../utils/diffMarkup'
+import { chartConfigToChartJs } from '../utils/chartParser'
+import { knowledgeSetActiveWorkspace } from '../knowledge/manager'
+import type {
+  DocumentAgentAdapter,
+  DocumentSelectionSnapshot,
+} from '../agent/adapters/document/DocumentAgentAdapter'
+import type { ChartConfig } from '../utils/chartParser'
+import {
+  ArcElement,
+  BarController,
+  BarElement,
+  CategoryScale,
+  Chart,
+  DoughnutController,
+  Filler,
+  Legend,
+  LineController,
+  LineElement,
+  LinearScale,
+  PieController,
+  PointElement,
+  RadarController,
+  RadialLinearScale,
+  ScatterController,
+  Title,
+  Tooltip,
+} from 'chart.js'
+
+Chart.register(
+  CategoryScale,
+  LinearScale,
+  BarController,
+  BarElement,
+  LineController,
+  LineElement,
+  PointElement,
+  ArcElement,
+  PieController,
+  DoughnutController,
+  RadarController,
+  RadialLinearScale,
+  ScatterController,
+  Filler,
+  Legend,
+  Title,
+  Tooltip,
+)
 
 // 将 ArrayBuffer 转换为 Base64（分块处理，避免大文件导致栈溢出）
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -46,6 +104,7 @@ interface ReplaceResult {
   success: boolean
   count: number
   message: string
+  diffId?: string
   searchText?: string
   replaceText?: string
   positions?: number[]  // match positions in plain-text projection
@@ -150,12 +209,15 @@ interface PendingReplacements {
 
 // 编辑器模式
 type EditorMode = 'tiptap' | 'onlyoffice'
+type SessionMode = 'workspace' | 'single-file'
 
 interface DocumentContextType {
   document: DocumentContent
   files: FileItem[]
   currentFile: FileItem | null
   workspacePath: string | null
+  effectiveWorkspacePath: string | null
+  sessionMode: SessionMode
   isElectron: boolean
   hasUnsavedChanges: boolean
   docxData: string | null
@@ -163,6 +225,11 @@ interface DocumentContextType {
   pptData: { pptxBase64: string } | null
   /** 当前打开 docx 的排版/字体配置（从 docx 解析得到；用于显示与导出保持一致） */
   typographyProfile: DocxTypographyProfile | null
+  docxInspectionReport: DocxInspectionReport | null
+  wordOracleArtifact: WordOracleArtifact | null
+  renderAlignmentReport: RenderAlignmentReport | null
+  oracleStatus: 'idle' | 'inspecting' | 'exporting' | 'diffing' | 'ready' | 'error' | 'unavailable'
+  oracleError: string | null
   refreshExcelData: () => Promise<boolean>  // 刷新 Excel 数据
   lastReplacement: ReplacementRecord | null  // 最近的替换记录
   pendingChanges: PendingChange[] // 待审阅修改（逐条）
@@ -237,11 +304,44 @@ interface DocumentContextType {
   // 动画控制
   docEntryAnimationKey: number
   triggerDocEntryAnimation: () => void
+  refreshWordOracleArtifacts: () => Promise<void>
+  compareCurrentRenderWithWordOracle: (pages: Array<{ pageIndex: number; dataUrl: string }>) => Promise<RenderAlignmentReport | null>
   // 获取最新文档内容（使用 ref，避免闭包问题）
   getLatestContent: () => string
+  documentAgentApi: Pick<
+    DocumentAgentAdapter,
+    | 'getFileName'
+    | 'getCurrentFile'
+    | 'getCurrentFilePath'
+    | 'getWorkspacePath'
+    | 'isElectron'
+    | 'ensureTiptapEditor'
+    | 'autoSave'
+    | 'resolveReferencePath'
+    | 'readOutline'
+    | 'readSelection'
+    | 'readDocumentDsl'
+    | 'listPendingChanges'
+    | 'acceptChange'
+    | 'rejectChange'
+    | 'acceptAllChanges'
+    | 'rejectAllChanges'
+    | 'replaceViaDsl'
+    | 'replaceInDocument'
+    | 'replaceWithFormat'
+    | 'insertViaDsl'
+    | 'insertInDocument'
+    | 'deleteViaDsl'
+    | 'deleteInDocument'
+    | 'previewOps'
+    | 'applyOps'
+    | 'prepareTemplateFillOutput'
+    | 'createDocument'
+    | 'createDocumentFromDsl'
+  >
   // 页面设置
   pageSetup: PageSetup
-  setPageSetup: (setup: Partial<PageSetup>) => void
+  setPageSetup: (setup: Partial<PageSetup>, options?: { markDirty?: boolean }) => void
   // 页眉页脚设置
   headerFooterSetup: HeaderFooterSetup
   setHeaderFooterSetup: (setup: Partial<HeaderFooterSetup>) => void
@@ -329,7 +429,7 @@ const defaultDocument: DocumentContent = {
 
 // Vite HMR: keep a stable context identity across hot updates.
 // Otherwise, provider/consumer can mismatch and throw "useDocument must be used within a DocumentProvider".
-const DocumentContext: React.Context<DocumentContextType | undefined> = (() => {
+export const DocumentContext: React.Context<DocumentContextType | undefined> = (() => {
   try {
     const hot = (import.meta as any)?.hot
     const existing = hot?.data?.DocumentContext as React.Context<DocumentContextType | undefined> | undefined
@@ -353,6 +453,32 @@ async function fetchArrayBufferFromLocalFile(filePath: string): Promise<ArrayBuf
   const resp = await fetch(url)
   if (!resp.ok) throw new Error(`读取文件失败（HTTP ${resp.status}）`)
   return await resp.arrayBuffer()
+}
+
+function deriveParentDirectory(filePath: string | null | undefined): string | null {
+  if (!filePath) return null
+  const lastForward = filePath.lastIndexOf('/')
+  const lastBackward = filePath.lastIndexOf('\\')
+  const lastSeparator = Math.max(lastForward, lastBackward)
+  if (lastSeparator < 0) return null
+  if (lastSeparator === 0) return filePath.slice(0, 1)
+  return filePath.slice(0, lastSeparator)
+}
+
+function joinPath(parentPath: string, fileName: string): string {
+  const separator = parentPath.includes('\\') && !parentPath.includes('/') ? '\\' : '/'
+  return parentPath.endsWith('/') || parentPath.endsWith('\\')
+    ? `${parentPath}${fileName}`
+    : `${parentPath}${separator}${fileName}`
+}
+
+function convertFolderItems(items: any[]): FileItem[] {
+  return items.map(item => ({
+    name: item.name,
+    path: item.path,
+    type: item.type,
+    children: item.children ? convertFolderItems(item.children) : undefined,
+  }))
 }
 
 function cssLengthToTwips(value: string | undefined, baseFontPt = 10.5): number | undefined {
@@ -650,6 +776,100 @@ function htmlToStructuredText(html: string): string {
   return result.replace(/\n{3,}/g, '\n\n').trim()
 }
 
+function dataUrlToUint8Array(dataUrl: string): Uint8Array | null {
+  const match = String(dataUrl || '').match(/^data:image\/[^;]+;base64,(.+)$/)
+  if (!match) return null
+  const binary = atob(match[1])
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+  return bytes
+}
+
+function renderChartConfigToDataUrlSync(
+  encodedConfig: string,
+  width: number,
+  height: number,
+): string | null {
+  if (typeof document === 'undefined' || !encodedConfig) return null
+
+  let chart: Chart | null = null
+  try {
+    const config = JSON.parse(decodeURIComponent(encodedConfig)) as ChartConfig
+    const safeWidth = Math.max(240, Math.min(width || 500, 1600))
+    const safeHeight = Math.max(160, Math.min(height || 300, 1200))
+    const canvas = document.createElement('canvas')
+    canvas.width = safeWidth
+    canvas.height = safeHeight
+
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+
+    ctx.fillStyle = '#FFFFFF'
+    ctx.fillRect(0, 0, safeWidth, safeHeight)
+
+    const chartJsConfig = chartConfigToChartJs(config)
+    const baseOptions = (chartJsConfig.options || {}) as Record<string, any>
+    chartJsConfig.options = {
+      ...baseOptions,
+      responsive: false,
+      maintainAspectRatio: false,
+      animation: false,
+      devicePixelRatio: 1,
+      plugins: {
+        ...(baseOptions.plugins || {}),
+        legend: {
+          ...((baseOptions.plugins as any)?.legend || {}),
+          labels: {
+            ...(((baseOptions.plugins as any)?.legend || {}).labels || {}),
+            color: '#333333',
+          },
+        },
+        title: {
+          ...((baseOptions.plugins as any)?.title || {}),
+          color: '#333333',
+        },
+      },
+      scales: {
+        ...(baseOptions.scales || {}),
+        x: baseOptions.scales?.x
+          ? {
+              ...baseOptions.scales.x,
+              ticks: { ...(baseOptions.scales.x.ticks || {}), color: '#333333' },
+              grid: { ...(baseOptions.scales.x.grid || {}), color: 'rgba(0,0,0,0.1)' },
+            }
+          : undefined,
+        y: baseOptions.scales?.y
+          ? {
+              ...baseOptions.scales.y,
+              ticks: { ...(baseOptions.scales.y.ticks || {}), color: '#333333' },
+              grid: { ...(baseOptions.scales.y.grid || {}), color: 'rgba(0,0,0,0.1)' },
+            }
+          : undefined,
+      },
+    }
+
+    chart = new Chart(canvas, chartJsConfig as any)
+    chart.update('none')
+    return canvas.toDataURL('image/png')
+  } catch (error) {
+    console.warn('[chart] sync render failed:', error)
+    return null
+  } finally {
+    chart?.destroy()
+  }
+}
+
+async function renderChartConfigToImageData(
+  encodedConfig: string,
+  width: number,
+  height: number,
+): Promise<Uint8Array | null> {
+  const dataUrl = renderChartConfigToDataUrlSync(encodedConfig, width, height)
+  return dataUrlToUint8Array(dataUrl || '')
+}
+
 // 创建 docx 文档
 async function createDocxBlob(content: string, title: string, typographyProfile?: DocxTypographyProfile | null): Promise<Blob> {
   // 判断是 HTML 还是 Markdown
@@ -732,7 +952,7 @@ async function createDocxBlob(content: string, title: string, typographyProfile?
     return AlignmentType.LEFT
   }
 
-  const htmlToDocxChildren = (html: string, profile?: DocxTypographyProfile): (Paragraph | Table)[] => {
+  const htmlToDocxChildren = async (html: string, profile?: DocxTypographyProfile): Promise<(Paragraph | Table)[]> => {
     const parser = new DOMParser()
     const doc = parser.parseFromString(html, 'text/html')
 
@@ -894,8 +1114,51 @@ async function createDocxBlob(content: string, title: string, typographyProfile?
       }
     }
 
-    const processBlock = (el: HTMLElement) => {
+    const processBlock = async (el: HTMLElement) => {
       const tag = el.tagName.toLowerCase()
+
+      if (tag === 'div' && el.getAttribute('data-type') === 'docx-chart') {
+        const chartConfig = el.getAttribute('data-chart-config') || ''
+        let titleText = el.getAttribute('data-chart-title') || ''
+        if (!titleText && chartConfig) {
+          try {
+            const parsed = JSON.parse(decodeURIComponent(chartConfig)) as ChartConfig
+            titleText = parsed.title || ''
+          } catch {
+            titleText = ''
+          }
+        }
+        const width = parseInt(el.style.width || '', 10) || 500
+        const height = parseInt(el.style.height || '', 10) || 300
+        const imageData = await renderChartConfigToImageData(chartConfig, width, height)
+
+        if (imageData) {
+          children.push(new Paragraph({
+            alignment: AlignmentType.CENTER,
+            children: [
+              new ImageRun({
+                data: imageData,
+                transformation: {
+                  width,
+                  height,
+                },
+              }),
+            ],
+          }))
+          if (titleText) {
+            children.push(new Paragraph({
+              alignment: AlignmentType.CENTER,
+              children: [new TextRun({ text: titleText, italics: true })],
+            }))
+          }
+        } else {
+          children.push(new Paragraph({
+            alignment: AlignmentType.CENTER,
+            children: [new TextRun({ text: titleText || '[图表]' })],
+          }))
+        }
+        return
+      }
 
       // 忽略 old 块（导出默认“接受”）
       if (el.getAttribute('data-diff-role') === 'old') return
@@ -1000,7 +1263,9 @@ async function createDocxBlob(content: string, title: string, typographyProfile?
       }
     }
 
-    Array.from(doc.body.children).forEach((child) => processBlock(child as HTMLElement))
+    for (const child of Array.from(doc.body.children)) {
+      await processBlock(child as HTMLElement)
+    }
 
     if (children.length === 0) {
       children.push(new Paragraph({ text: '' }))
@@ -1008,7 +1273,9 @@ async function createDocxBlob(content: string, title: string, typographyProfile?
     return children
   }
 
-  const paragraphsOrTables = isHtml ? htmlToDocxChildren(content, typographyProfile || undefined) : markdownToDocxParagraphs(content, typographyProfile || undefined)
+  const paragraphsOrTables = isHtml
+    ? await htmlToDocxChildren(content, typographyProfile || undefined)
+    : markdownToDocxParagraphs(content, typographyProfile || undefined)
   
   const margin = typographyProfile?.page?.margin
   const normalAscii = typographyProfile?.normal?.fontAscii || typographyProfile?.normal?.fontHAnsi
@@ -1034,9 +1301,9 @@ async function createDocxBlob(content: string, title: string, typographyProfile?
   }
 
   const doc = new Document({
-    creator: 'Word-Cursor',
+    creator: '智启文档',
     title: title,
-    description: 'Created by Word-Cursor',
+    description: 'Created by 智启文档',
     styles: {
       default: {
         document: {
@@ -1266,9 +1533,9 @@ async function createFormattedDocxBlob(elements: FormattedElement[], title: stri
   }
 
   const doc = new Document({
-    creator: 'Word-Cursor',
+    creator: '智启文档',
     title,
-    description: 'Created by Word-Cursor',
+    description: 'Created by 智启文档',
     // 关键：设置 Document 级默认样式，保证 Word 打开时字体/行距/缩进继承稳定
     styles: {
       default: {
@@ -1331,6 +1598,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
   const [document, setDocument] = useState<DocumentContent>(defaultDocument)
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false)
   const [workspacePath, setWorkspacePath] = useState<string | null>(null)
+  const [singleFileWorkspacePath, setSingleFileWorkspacePath] = useState<string | null>(null)
   const [files, setFiles] = useState<FileItem[]>([])
   const [docEntryAnimationKey, setDocEntryAnimationKey] = useState(0)
   
@@ -1342,6 +1610,22 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     documentContentRef.current = document.content
   }, [document.content])
   const [currentFile, setCurrentFileState] = useState<FileItem | null>(null)
+  const effectiveWorkspacePath = useMemo(() => {
+    if (singleFileWorkspacePath) return singleFileWorkspacePath
+    if (workspacePath) return workspacePath
+    if (!isElectron) return null
+    return deriveParentDirectory(currentFile?.path)
+  }, [currentFile?.path, singleFileWorkspacePath, workspacePath])
+  useEffect(() => {
+    if (!isElectron || !window.electronAPI?.knowledgeSetActiveWorkspace) return
+    knowledgeSetActiveWorkspace(effectiveWorkspacePath).catch((error) => {
+      console.warn('同步知识库工作区失败:', error)
+    })
+  }, [effectiveWorkspacePath])
+  const sessionMode = useMemo<SessionMode>(() => {
+    if (singleFileWorkspacePath) return 'single-file'
+    return 'workspace'
+  }, [singleFileWorkspacePath])
   const [docxData, setDocxData] = useState<string | null>(null)
   const [excelData, setExcelData] = useState<ExcelOpenResponse | null>(null)
   const [pptData, setPptData] = useState<{ pptxBase64: string } | null>(null)
@@ -1353,6 +1637,12 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
   const [headerFooterSetup, setHeaderFooterSetupState] = useState<HeaderFooterSetup>(defaultHeaderFooterSetup)
   const [customStyles, setCustomStyles] = useState<Record<string, CustomStyle>>(defaultCustomStyles)
   const [typographyProfile, setTypographyProfile] = useState<DocxTypographyProfile | null>(null)
+  const [docxInspectionReport, setDocxInspectionReport] = useState<DocxInspectionReport | null>(null)
+  const [wordOracleArtifact, setWordOracleArtifact] = useState<WordOracleArtifact | null>(null)
+  const [renderAlignmentReport, setRenderAlignmentReport] = useState<RenderAlignmentReport | null>(null)
+  const [oracleStatus, setOracleStatus] = useState<'idle' | 'inspecting' | 'exporting' | 'diffing' | 'ready' | 'error' | 'unavailable'>('idle')
+  const [oracleError, setOracleError] = useState<string | null>(null)
+  const oracleRequestRef = useRef(0)
 
   // 将 docx 提取的默认字体同步到 CSS 变量（让预览/编辑默认字体尽量贴近原文）
   useEffect(() => {
@@ -1423,6 +1713,31 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     return false
   }, [currentFile, isElectron])
 
+  const readFolderItems = useCallback(async (folderPath: string) => {
+    if (!isElectron || !window.electronAPI || !folderPath) return null
+    const result = await window.electronAPI.readFolder(folderPath)
+    if (!result.success || !result.data) {
+      return null
+    }
+
+    const nextFiles = convertFolderItems(result.data)
+    setFiles(nextFiles)
+    return nextFiles
+  }, [])
+
+  const startSingleFileWorkspace = useCallback(async (filePath: string) => {
+    const parentPath = deriveParentDirectory(filePath)
+    if (!parentPath) {
+      setSingleFileWorkspacePath(null)
+      setFiles([])
+      return false
+    }
+
+    setSingleFileWorkspacePath(parentPath)
+    const nextFiles = await readFolderItems(parentPath)
+    return !!nextFiles
+  }, [readFolderItems])
+
   const updateDocument = useCallback((updates: Partial<DocumentContent>) => {
     setDocument(prev => ({
       ...prev,
@@ -1460,6 +1775,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
   const createNewDocument = useCallback(async (title: string, content: string, elements?: FormattedElement[], styleRefPath?: string) => {
     console.log('createNewDocument 被调用:', { title, contentLength: content.length, elementsCount: elements?.length })
     setExcelData(null)
+    const targetWorkspacePath = effectiveWorkspacePath
     
     // 清理文件名中的非法字符，并移除已有的 .docx 后缀（避免双重后缀）
     let safeTitle = title.replace(/[<>:"/\\|?*]/g, '_').slice(0, 50)
@@ -1468,13 +1784,14 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     }
     
     // 如果在 Electron 环境且有工作区路径，创建真实文件
-    if (isElectron && window.electronAPI && workspacePath) {
+    if (isElectron && window.electronAPI && targetWorkspacePath) {
       try {
         const fileName = `${safeTitle}.docx`
-        const filePath = `${workspacePath}\\${fileName}`
+        const filePath = joinPath(targetWorkspacePath, fileName)
         console.log('准备创建文件:', filePath)
         
         let success = false
+        let createdDocxBase64: string | null = null
         let nextProfile: DocxTypographyProfile | null = null
 
         // 如果指定了“样式参考 docx”，抽取 TypographyProfile（用于导出时继承字体/缩进/行距/页边距）
@@ -1507,6 +1824,14 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
               if (builderResult.success) {
                 console.log('ONLYOFFICE Document Builder 创建成功', builderResult.fallback ? '(使用回退方案)' : '')
                 success = true
+                try {
+                  const readBack = await window.electronAPI.readFile(filePath)
+                  if (readBack.success && readBack.type === 'docx' && readBack.data) {
+                    createdDocxBase64 = readBack.data
+                  }
+                } catch (error) {
+                  console.warn('[createNewDocument] 读取新建文档失败:', error)
+                }
               } else {
                 console.log('ONLYOFFICE Document Builder 失败，回退到 docx 库:', builderResult.error)
               }
@@ -1524,6 +1849,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
             const arrayBuffer = await blob.arrayBuffer()
             // 使用分块方式将 ArrayBuffer 转换为 base64，避免大文件导致的栈溢出
             const base64 = arrayBufferToBase64(arrayBuffer)
+            createdDocxBase64 = base64
             const result = await window.electronAPI.writeBinaryFile(filePath, base64)
             success = result.success
           }
@@ -1534,6 +1860,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           const arrayBuffer = await blob.arrayBuffer()
           // 使用分块方式将 ArrayBuffer 转换为 base64，避免大文件导致的栈溢出
           const base64 = arrayBufferToBase64(arrayBuffer)
+          createdDocxBase64 = base64
           const result = await window.electronAPI.writeBinaryFile(filePath, base64)
           success = result.success
         }
@@ -1542,18 +1869,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           console.log('文件已创建:', filePath)
           
           // 刷新文件列表以显示新文件
-          const folderResult = await window.electronAPI.readFolder(workspacePath)
-          if (folderResult.success && folderResult.data) {
-            const convertFiles = (items: any[]): FileItem[] => {
-              return items.map(item => ({
-                name: item.name,
-                path: item.path,
-                type: item.type,
-                children: item.children ? convertFiles(item.children) : undefined,
-              }))
-            }
-            setFiles(convertFiles(folderResult.data))
-          }
+          await readFolderItems(targetWorkspacePath)
           
           // 创建文件项并设置为当前文件
           const newFile: FileItem = {
@@ -1570,7 +1886,8 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
             lastModified: new Date(),
           })
           triggerDocEntryAnimation()
-          setDocxData(null)
+          setDocxData(createdDocxBase64)
+          setPptData(null)
           setHasUnsavedChanges(false) // 已保存
         } else {
           console.error('创建文件失败')
@@ -1598,7 +1915,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       setDocxData(null)
       setHasUnsavedChanges(true)
     }
-  }, [workspacePath, triggerDocEntryAnimation])
+  }, [effectiveWorkspacePath, readFolderItems, triggerDocEntryAnimation])
 
   // DSL 方式创建文档
   const createDocumentFromDsl = useCallback(async (title: string, dsl: DocDsl): Promise<{ success: boolean; message: string; filePath?: string }> => {
@@ -1616,10 +1933,10 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     }
 
     // 在 Electron 环境创建真实文件
-    if (isElectron && window.electronAPI && workspacePath) {
+    if (isElectron && window.electronAPI && effectiveWorkspacePath) {
       try {
         const fileName = `${safeTitle}.docx`
-        const filePath = `${workspacePath}\\${fileName}`
+        const filePath = joinPath(effectiveWorkspacePath, fileName)
         console.log('DSL 创建文件:', filePath)
 
         // 使用 DSL 渲染器生成 DOCX
@@ -1633,18 +1950,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           console.log('DSL 文件已创建:', filePath)
           
           // 刷新文件列表
-          const folderResult = await window.electronAPI.readFolder(workspacePath)
-          if (folderResult.success && folderResult.data) {
-            const convertFiles = (items: any[]): FileItem[] => {
-              return items.map(item => ({
-                name: item.name,
-                path: item.path,
-                type: item.type,
-                children: item.children ? convertFiles(item.children) : undefined,
-              }))
-            }
-            setFiles(convertFiles(folderResult.data))
-          }
+          await readFolderItems(effectiveWorkspacePath)
 
           // 给所有块加 diff 标记（绿色高亮），让用户可以审查后确认
           const diffId = `diff-create-${Date.now()}`
@@ -1672,8 +1978,9 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
             lastModified: new Date(),
           })
           triggerDocEntryAnimation()
-          setDocxData(null)
+          setDocxData(base64)
           setExcelData(null)
+          setPptData(null)
           setHasUnsavedChanges(false)
 
           // 注册为待确认修改，让 accept/reject 按钮出现
@@ -1720,7 +2027,16 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
 
       return { success: true, message: `已创建文档: ${safeTitle}.docx` }
     }
-  }, [workspacePath, isElectron, triggerDocEntryAnimation])
+  }, [effectiveWorkspacePath, isElectron, readFolderItems, triggerDocEntryAnimation])
+
+  const openWorkspacePath = useCallback(async (folderPath: string) => {
+    if (!isElectron || !window.electronAPI || !folderPath) return false
+
+    setSingleFileWorkspacePath(null)
+    setWorkspacePath(folderPath)
+    const nextFiles = await readFolderItems(folderPath)
+    return !!nextFiles
+  }, [readFolderItems])
 
   // 打开本地文件夹 (Electron)
   const openFolder = useCallback(async () => {
@@ -1732,21 +2048,77 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     const folderPath = await window.electronAPI.selectFolder()
     if (!folderPath) return
 
-    setWorkspacePath(folderPath)
-    
-    const result = await window.electronAPI.readFolder(folderPath)
-    if (result.success && result.data) {
-      const convertFiles = (items: any[]): FileItem[] => {
-        return items.map(item => ({
-          name: item.name,
-          path: item.path,
-          type: item.type,
-          children: item.children ? convertFiles(item.children) : undefined,
-        }))
-      }
-      setFiles(convertFiles(result.data))
-    }
+    await openWorkspacePath(folderPath)
+  }, [isElectron, openWorkspacePath])
+
+  const clearOracleState = useCallback(() => {
+    setDocxInspectionReport(null)
+    setWordOracleArtifact(null)
+    setRenderAlignmentReport(null)
+    setOracleStatus('idle')
+    setOracleError(null)
   }, [])
+
+  const refreshWordOracleArtifacts = useCallback(async (targetFilePath?: string) => {
+    const filePath = targetFilePath || currentFile?.path
+    const fileName = targetFilePath
+      ? (targetFilePath.split(/[\\/]/).pop() || '')
+      : (currentFile?.name || '')
+
+    if (!isElectron || !window.electronAPI?.docxInspect || !window.electronAPI?.wordOracleExport || !filePath) {
+      clearOracleState()
+      return
+    }
+
+    if (!fileName.toLowerCase().endsWith('.docx')) {
+      clearOracleState()
+      return
+    }
+
+    const requestId = oracleRequestRef.current + 1
+    oracleRequestRef.current = requestId
+    setOracleError(null)
+    setOracleStatus('inspecting')
+
+    try {
+      const inspection = await window.electronAPI.docxInspect(filePath)
+      if (oracleRequestRef.current !== requestId) return
+
+      if (inspection.success && inspection.report) {
+        setDocxInspectionReport(inspection.report)
+      } else {
+        setDocxInspectionReport(null)
+      }
+
+      setOracleStatus('exporting')
+      const oracle = await window.electronAPI.wordOracleExport({
+        filePath,
+        refreshFields: true,
+        dpi: 144,
+      })
+
+      if (oracleRequestRef.current !== requestId) return
+
+      if (oracle.success && oracle.artifact) {
+        setWordOracleArtifact(oracle.artifact)
+        setRenderAlignmentReport(null)
+        setOracleStatus('ready')
+        setOracleError(null)
+        return
+      }
+
+      setWordOracleArtifact(null)
+      setRenderAlignmentReport(null)
+      setOracleStatus(oracle.unavailableReason ? 'unavailable' : 'error')
+      setOracleError(oracle.error || oracle.unavailableReason || 'Word Oracle 导出失败')
+    } catch (error) {
+      if (oracleRequestRef.current !== requestId) return
+      setWordOracleArtifact(null)
+      setRenderAlignmentReport(null)
+      setOracleStatus('error')
+      setOracleError((error as Error).message)
+    }
+  }, [clearOracleState, currentFile?.name, currentFile?.path, isElectron])
 
   // 将 xls 转换为 xlsx
   const convertXlsToXlsx = useCallback(async (xlsPath: string) => {
@@ -1785,6 +2157,24 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
   // 文件内容缓存 - Cursor 风格：切换文件时自动缓存，保存时才写入磁盘
   const fileContentCacheRef = useRef<Map<string, { content: string; title: string; hasChanges: boolean }>>(new Map())
 
+  useEffect(() => {
+    if (!currentFile?.path) return
+
+    if (hasUnsavedChanges) {
+      fileContentCacheRef.current.set(currentFile.path, {
+        content: documentContentRef.current,
+        title: document.title,
+        hasChanges: true,
+      })
+      return
+    }
+
+    const cached = fileContentCacheRef.current.get(currentFile.path)
+    if (cached?.hasChanges) {
+      fileContentCacheRef.current.delete(currentFile.path)
+    }
+  }, [currentFile?.path, document.content, document.title, hasUnsavedChanges])
+
   // 打开文件 (Electron)
   const openFile = useCallback(async (file: FileItem) => {
     if (file.type !== 'file') return
@@ -1804,12 +2194,16 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
 
     setCurrentFileState(file)
 
+    if (isElectron && !workspacePath && file.path) {
+      await startSingleFileWorkspace(file.path)
+    }
+
     // 如果有缓存的修改，优先使用缓存内容（Cursor 风格）
     if (cached && cached.hasChanges) {
       console.log(`[Cache] 恢复缓存内容: ${file.name}`)
       setExcelData(null)
-      setDocxData(null)
       setPptData(null)
+      setTypographyProfile(null)
       documentContentRef.current = cached.content
       setDocument({
         title: cached.title,
@@ -1818,6 +2212,24 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         lastModified: new Date(),
       })
       setHasUnsavedChanges(true)
+      if ((file.name.split('.').pop() || '').toLowerCase() === 'docx') {
+        void (async () => {
+          try {
+            const result = await window.electronAPI.readFile(file.path)
+            if (result.success && result.type === 'docx' && result.data) {
+              setDocxData(result.data)
+            }
+            const ab = await fetchArrayBufferFromLocalFile(file.path)
+            const { profile } = await extractTypographyProfileFromArrayBuffer(ab)
+            setTypographyProfile(profile)
+            void refreshWordOracleArtifacts(file.path)
+          } catch (error) {
+            console.warn('[Cache] 恢复 DOCX 预览元数据失败:', error)
+          }
+        })()
+      } else {
+        clearOracleState()
+      }
       return
     }
 
@@ -1882,6 +2294,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           setDocxData(null)
           setTypographyProfile(null)
           setPptData({ pptxBase64: result.data })
+          clearOracleState()
           setDocument({
             title: file.name.replace(/\.[^.]+$/, ''),
             content: '',
@@ -1912,12 +2325,14 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
               setTypographyProfile(null)
             }
           })()
+          void refreshWordOracleArtifacts(file.path)
         } else if (result.type === 'doc-html') {
           // .doc 文件 - 已经转换为 HTML
           setExcelData(null)
           setDocxData(null)
           setTypographyProfile(null)
           setPptData(null)
+          clearOracleState()
           setDocument({
             title: file.name.replace(/\.[^.]+$/, ''),
             content: result.data,
@@ -1930,6 +2345,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           setDocxData(null)
           setTypographyProfile(null)
           setPptData(null)
+          clearOracleState()
           setDocument({
             title: file.name.replace(/\.[^.]+$/, ''),
             content: result.data,
@@ -1942,6 +2358,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     } else if (file.content) {
       setDocxData(null)
       setPptData(null)
+      clearOracleState()
       setDocument({
         title: file.name.replace('.docx', ''),
         content: file.content,
@@ -1950,7 +2367,77 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       })
       setHasUnsavedChanges(false)
     }
-  }, [hasUnsavedChanges, currentFile, document.title])
+  }, [clearOracleState, currentFile, document.title, hasUnsavedChanges, isElectron, refreshWordOracleArtifacts, startSingleFileWorkspace, workspacePath])
+
+  const forceOpenDocxFilePathForDebug = useCallback(async (filePath: string) => {
+    if (!isElectron || !window.electronAPI || !filePath) return false
+
+    const fileName = filePath.split(/[/\\]/).pop() || filePath
+    const file: FileItem = {
+      name: fileName,
+      path: filePath,
+      type: 'file',
+    }
+
+    fileContentCacheRef.current.delete(filePath)
+    setCurrentFileState(file)
+    await startSingleFileWorkspace(filePath)
+
+    const result = await window.electronAPI.readFile(filePath)
+    if (!result.success || !result.data) {
+      return false
+    }
+
+    if (result.type === 'pptx') {
+      setExcelData(null)
+      setDocxData(null)
+      setTypographyProfile(null)
+      setPptData({ pptxBase64: result.data })
+      clearOracleState()
+      setDocument({
+        title: fileName.replace(/\.[^.]+$/, ''),
+        content: '',
+        styles: defaultStyles,
+        lastModified: new Date(),
+      })
+      setHasUnsavedChanges(false)
+      return true
+    }
+
+    if (result.type === 'docx') {
+      setExcelData(null)
+      setDocxData(result.data)
+      setTypographyProfile(null)
+      setPptData(null)
+      setDocument({
+        title: fileName.replace(/\.[^.]+$/, ''),
+        content: '',
+        styles: defaultStyles,
+        lastModified: new Date(),
+      })
+      setHasUnsavedChanges(false)
+      void refreshWordOracleArtifacts(filePath)
+      return true
+    }
+
+    if (result.type === 'text' || result.type === 'doc-html') {
+      setExcelData(null)
+      setDocxData(null)
+      setTypographyProfile(null)
+      setPptData(null)
+      clearOracleState()
+      setDocument({
+        title: fileName.replace(/\.[^.]+$/, ''),
+        content: result.data,
+        styles: defaultStyles,
+        lastModified: new Date(),
+      })
+      setHasUnsavedChanges(false)
+      return true
+    }
+
+    return true
+  }, [clearOracleState, isElectron, refreshWordOracleArtifacts, startSingleFileWorkspace])
 
   // 保存当前文件
   const saveCurrentFile = useCallback(async () => {
@@ -2023,6 +2510,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       // 保存成功后清除该文件的缓存
       fileContentCacheRef.current.delete(currentFile.path)
       setHasUnsavedChanges(false)
+      void refreshWordOracleArtifacts(currentFile.path)
     } else {
       const sourceHtmlRaw = documentContentRef.current || document.content
       const sourceHtml = stripDiffMarkupForExport(sourceHtmlRaw)
@@ -2058,31 +2546,81 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       }
       setHasUnsavedChanges(false)
     }
-  }, [currentFile, document, pendingReplacements.total, extraPendingChanges, typographyProfile, commentsForExport])
+  }, [commentsForExport, currentFile, document, extraPendingChanges, pendingReplacements.total, refreshWordOracleArtifacts, typographyProfile])
 
   // 刷新文件列表
   const refreshFiles = useCallback(async () => {
-    if (!workspacePath || !isElectron || !window.electronAPI) return
+    if (!effectiveWorkspacePath || !isElectron || !window.electronAPI) return
+    await readFolderItems(effectiveWorkspacePath)
+  }, [effectiveWorkspacePath, readFolderItems])
 
-    const result = await window.electronAPI.readFolder(workspacePath)
-    if (result.success && result.data) {
-      const convertFiles = (items: any[]): FileItem[] => {
-        return items.map(item => ({
-          name: item.name,
-          path: item.path,
-          type: item.type,
-          children: item.children ? convertFiles(item.children) : undefined,
-        }))
-      }
-      setFiles(convertFiles(result.data))
+  const compareCurrentRenderWithWordOracle = useCallback(async (
+    pages: Array<{ pageIndex: number; dataUrl: string }>
+  ): Promise<RenderAlignmentReport | null> => {
+    if (!isElectron || !window.electronAPI?.wordOracleDiff || !currentFile?.path || !wordOracleArtifact?.pages?.length) {
+      return null
     }
-  }, [workspacePath])
+
+    try {
+      setOracleStatus('diffing')
+      const result = await window.electronAPI.wordOracleDiff({
+        sourcePath: currentFile.path,
+        artifactId: wordOracleArtifact.exportId,
+        oraclePages: wordOracleArtifact.pages.map((page) => ({
+          pageIndex: page.pageIndex,
+          path: page.path,
+        })),
+        currentPages: pages,
+        thresholdRatio: 0.0025,
+      })
+
+      if (!result.success || !result.report) {
+        setOracleStatus('error')
+        setOracleError(result.error || 'Word Oracle 对比失败')
+        return null
+      }
+
+      setRenderAlignmentReport(result.report)
+      setOracleStatus('ready')
+      setOracleError(null)
+      return result.report
+    } catch (error) {
+      setOracleStatus('error')
+      setOracleError((error as Error).message)
+      return null
+    }
+  }, [currentFile?.path, isElectron, wordOracleArtifact])
+
+  useEffect(() => {
+    if (!isElectron || !window.electronAPI?.readFile || !currentFile?.path) return
+    const ext = (currentFile.name.split('.').pop() || '').toLowerCase()
+    if (ext !== 'docx' || docxData) return
+
+    let cancelled = false
+    void (async () => {
+      try {
+        const result = await window.electronAPI.readFile(currentFile.path)
+        if (cancelled) return
+        if (result.success && result.type === 'docx' && result.data) {
+          setDocxData(result.data)
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.warn('[DOCX Recovery] 恢复 docxData 失败:', error)
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [currentFile?.name, currentFile?.path, docxData, isElectron])
 
   // 上传 docx 文件 (Web 模式)
   const uploadDocxFile = useCallback(async (file: File) => {
     try {
       const arrayBuffer = await file.arrayBuffer()
-      const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)))
+      const base64 = arrayBufferToBase64(arrayBuffer)
       
       const title = file.name.replace(/\.docx?$/i, '')
       
@@ -2095,6 +2633,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       setFiles(prev => [...prev, newFile])
       setCurrentFileState(newFile)
       setDocxData(base64)
+      clearOracleState()
       setDocument({
         title,
         content: '',
@@ -2230,6 +2769,10 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         stripDiffStyles(el)
       })
 
+      doc.querySelectorAll<HTMLElement>(`.${INLINE_DIFF_PAIR_CLASS}`).forEach((el) => {
+        unwrapNode(el)
+      })
+
       doc.querySelectorAll<HTMLElement>('[data-diff-role="old"]').forEach((el) => el.remove())
 
       doc.querySelectorAll<HTMLElement>('[data-diff-role="new"]').forEach((el) => {
@@ -2282,13 +2825,14 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       const result = await window.electronAPI.writeBinaryFile(currentFile.path, base64)
       if (result.success) {
         setHasUnsavedChanges(false)
+        void refreshWordOracleArtifacts(currentFile.path)
         return { success: true }
       }
       return { success: false, error: result.error || '写入失败' }
     } catch (e) {
       return { success: false, error: (e as Error).message }
     }
-  }, [currentFile, document, isElectron, typographyProfile, stripDiffMarkupForExport])
+  }, [currentFile, document, isElectron, refreshWordOracleArtifacts, typographyProfile, stripDiffMarkupForExport])
 
   // AI 编辑应用
   const applyAIEdit = useCallback((newContent: string) => {
@@ -2297,7 +2841,6 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       content: newContent,
       lastModified: new Date(),
     }))
-    setDocxData(null)
     setHasUnsavedChanges(true)
   }, [])
 
@@ -2566,6 +3109,15 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
   // 生成唯一 ID
   const generateDiffId = () => `diff-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
 
+  const unwrapDiffWrapper = (node: Element) => {
+    const parent = node.parentNode
+    if (!parent) return
+    while (node.firstChild) {
+      parent.insertBefore(node.firstChild, node)
+    }
+    parent.removeChild(node)
+  }
+
   // 精准替换文档内容（支持格式保留，支持多个修改共存）
   // 使用 ref 来获取最新内容，解决连续调用时的闭包问题
   const replaceInDocument = useCallback((search: string, replace: string, reviewMeta?: { reason?: string; type?: string }): ReplaceResult => {
@@ -2739,11 +3291,12 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       // 构建细粒度 diff HTML
       const parts: string[] = []
       if (commonPrefix) parts.push(formatText(commonPrefix))
-      if (oldDiff) {
-        parts.push(`<span class="diff-old" data-diff-id="${diffId}" style="background-color: #fecaca; color: #b91c1c; text-decoration: line-through; padding: 1px 2px; border-radius: 2px;">${formatText(oldDiff)}</span>`)
-      }
-      if (newDiff) {
-        parts.push(`<span class="diff-new" data-diff-id="${diffId}" style="background-color: #bbf7d0; color: #15803d; padding: 1px 2px; border-radius: 2px;">${formatText(newDiff)}</span>`)
+      if (oldDiff && newDiff) {
+        parts.push(buildInlineDiffPairHtml(diffId, formatText(oldDiff), formatText(newDiff)))
+      } else if (oldDiff) {
+        parts.push(buildInlineDiffTokenHtml('old', diffId, formatText(oldDiff)))
+      } else if (newDiff) {
+        parts.push(buildInlineDiffTokenHtml('new', diffId, formatText(newDiff)))
       }
       if (commonSuffix) parts.push(formatText(commonSuffix))
 
@@ -2891,7 +3444,6 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       content: newContent,
       lastModified: new Date(),
     }))
-    setDocxData(null)
     setHasUnsavedChanges(true)
     
     // 添加到待确认列表（保留之前的记录）
@@ -2923,6 +3475,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       success: true, 
       count: appliedCount, 
       message: `成功替换 ${appliedCount} 处`,
+      diffId,
       searchText: effectiveSearch,
       replaceText: replace,
       positions
@@ -3008,15 +3561,6 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     return content
   }
 
-  const unwrapDiffSpan = (span: Element) => {
-    const parent = span.parentNode
-    if (!parent) return
-    while (span.firstChild) {
-      parent.insertBefore(span.firstChild, span)
-    }
-    parent.removeChild(span)
-  }
-
   const resolveDiffContent = (mode: 'accept' | 'reject', onlyDiffId?: string) => {
     const currentContent = documentContentRef.current
     if (!currentContent) return ''
@@ -3041,7 +3585,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           return
         }
         if (isNew) {
-          unwrapDiffSpan(span)
+          unwrapDiffWrapper(span)
         }
       } else {
         if (isNew) {
@@ -3049,9 +3593,15 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           return
         }
         if (isOld) {
-          unwrapDiffSpan(span)
+          unwrapDiffWrapper(span)
         }
       }
+    })
+
+    Array.from(doc.querySelectorAll<HTMLElement>(`.${INLINE_DIFF_PAIR_CLASS}`)).forEach((pair) => {
+      const diffId = pair.getAttribute('data-diff-id') || ''
+      if (onlyDiffId && diffId !== onlyDiffId) return
+      unwrapDiffWrapper(pair)
     })
 
     // 块级 diff（paragraph/heading old/new）
@@ -3238,6 +3788,131 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
   const rejectAllChanges = useCallback(() => {
     rejectReplacement()
   }, [rejectReplacement])
+
+  const createTemplateCopy = useCallback(async (outputName?: string) => {
+    if (!isElectron || !window.electronAPI?.readFile || !window.electronAPI?.writeBinaryFile) {
+      return { success: false, message: '当前环境不支持模板复制' }
+    }
+    if (!currentFile?.path) {
+      return { success: false, message: '没有当前文档可作为模板' }
+    }
+
+    const ext = (currentFile.name.split('.').pop() || '').toLowerCase()
+    if (ext !== 'docx') {
+      return { success: false, message: '仅支持 .docx 模板自动填充' }
+    }
+
+    const sep = currentFile.path.includes('\\') ? '\\' : '/'
+    const idx = currentFile.path.lastIndexOf(sep)
+    const dir = idx >= 0 ? currentFile.path.slice(0, idx) : ''
+    const base = idx >= 0 ? currentFile.path.slice(idx + 1) : currentFile.path
+    const baseName = base.replace(/\.[^.]+$/, '')
+    let fileName = (outputName || `${baseName}-已填充`).trim()
+    if (!fileName.toLowerCase().endsWith('.docx')) {
+      fileName = `${fileName}.docx`
+    }
+
+    let newPath = `${dir}${sep}${fileName}`
+    if (window.electronAPI.getFileInfo) {
+      try {
+        const info = await window.electronAPI.getFileInfo(newPath)
+        if (info?.success) {
+          fileName = `${baseName}-已填充-${Date.now()}.docx`
+          newPath = `${dir}${sep}${fileName}`
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    const readResult = await window.electronAPI.readFile(currentFile.path)
+    if (!readResult?.success || !readResult.data) {
+      return { success: false, message: '读取模板失败' }
+    }
+
+    const writeResult = await window.electronAPI.writeBinaryFile(newPath, readResult.data)
+    if (!writeResult?.success) {
+      return { success: false, message: '写入新文档失败' }
+    }
+
+    await refreshFiles()
+    return { success: true, file: { name: fileName, path: newPath, type: 'file' as const } }
+  }, [currentFile, isElectron, refreshFiles])
+
+  // 缂栬緫鍣ㄦā寮?- 榛樿浣跨敤 Tiptap锛堝唴缃紪杈戝櫒锛夛紝鏇寸ǔ瀹氬彲闈?
+  const [editorMode, setEditorMode] = useState<EditorMode>('tiptap')
+
+  const prepareTemplateFillOutput = useCallback(async (ops: any[]) => {
+    const templateOp = ops.find(
+      (op) => op?.type === 'template_fill' && String(op.params?.output || '').toLowerCase() === 'new_doc',
+    )
+    if (!templateOp) return { success: true }
+
+    if (editorMode === 'onlyoffice') {
+      setEditorMode('tiptap')
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+
+    const outputName =
+      templateOp.params?.outputName ||
+      templateOp.params?.fileName ||
+      templateOp.params?.title
+    const created = await createTemplateCopy(
+      typeof outputName === 'string' ? outputName : undefined,
+    )
+    if (!created.success || !created.file) {
+      return {
+        success: false,
+        message: created.message || '创建新文档失败',
+      }
+    }
+
+    await openFile(created.file)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    return { success: true, file: created.file }
+  }, [createTemplateCopy, editorMode, openFile, setEditorMode])
+
+  const pendingChangeSnapshot = useMemo<PendingChange[]>(() => [
+    ...pendingReplacements.items.map((item) => {
+      const stripHtml = (s: string) => (s || '').replace(/<[^>]+>/g, '').trim()
+      const isReview = !!(item.reviewReason || item.reviewType)
+      const typeLabels: Record<string, string> = {
+        grammar: '语法',
+        logic: '逻辑',
+        style: '措辞',
+        typo: '错别字',
+        format: '格式',
+      }
+      const summaryText = isReview
+        ? `[${typeLabels[item.reviewType || 'style'] || item.reviewType}] ${item.reviewReason || '审查修改'}`
+        : `替换 ${item.count} 处`
+      return {
+        id: item.id,
+        kind: 'replace_text' as const,
+        scope: 'document' as const,
+        summary: summaryText,
+        beforePreview: stripHtml(item.searchText),
+        afterPreview: stripHtml(item.replaceText),
+        stats: { matches: item.count },
+        timestamp: item.timestamp,
+        meta: {
+          searchText: item.searchText,
+          replaceText: item.replaceText,
+          count: item.count,
+        },
+        reviewReason: item.reviewReason,
+        reviewType: item.reviewType,
+      }
+    }),
+    ...extraPendingChanges,
+  ], [pendingReplacements, extraPendingChanges])
+
+  const pendingChangesTotal = useMemo(
+    () =>
+      pendingReplacements.total +
+      extraPendingChanges.reduce((sum, c) => sum + (c.stats?.matches ?? 1), 0),
+    [pendingReplacements.total, extraPendingChanges],
+  )
   
   // 插入内容到文档
   const insertInDocument = useCallback((position: string, content: string): { success: boolean; message: string } => {
@@ -3365,6 +4040,20 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       newContent = insertHtml + newContent
     } else if (position === 'end') {
       newContent = newContent + insertHtml
+    } else if (position.startsWith('blockIndex:')) {
+      const idx = parseInt(position.replace('blockIndex:', '').trim(), 10)
+      const parser = new DOMParser()
+      const doc = parser.parseFromString(newContent, 'text/html')
+      const blocks = Array.from(doc.body.children)
+
+      if (blocks.length === 0) {
+        newContent = insertHtml
+      } else if (!Number.isFinite(idx) || idx < 0 || idx >= blocks.length) {
+        return { success: false, message: `无效的 blockIndex: ${position}` }
+      } else {
+        blocks[idx].insertAdjacentHTML('afterend', insertHtml)
+        newContent = doc.body.innerHTML
+      }
     } else {
       const parsed = extractAnchor(position)
       if (!parsed) {
@@ -3430,7 +4119,6 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       content: newContent,
       lastModified: new Date(),
     }))
-    setDocxData(null)
     setHasUnsavedChanges(true)
 
     // 记录到待审阅修改（插入：仅 diff-new）
@@ -3515,7 +4203,6 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       content: newContent,
       lastModified: new Date(),
     }))
-    setDocxData(null)
     setHasUnsavedChanges(true)
 
     // 记录到待审阅修改（删除：仅 diff-old）
@@ -3542,7 +4229,40 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
   const getCachedDsl = useCallback((): DocDsl => {
     const html = documentContentRef.current
     if (dslCacheRef.current?.html === html) return dslCacheRef.current.dsl
-    const dsl = htmlToDsl(html)
+
+    let normalizedHtml = html
+    if (html.includes('data-type="docx-chart"')) {
+      try {
+        const parser = new DOMParser()
+        const doc = parser.parseFromString(html, 'text/html')
+        const chartBlocks = Array.from(
+          doc.querySelectorAll<HTMLElement>('div[data-type="docx-chart"]'),
+        )
+
+        chartBlocks.forEach((chartEl) => {
+          const encodedConfig = chartEl.getAttribute('data-chart-config') || ''
+          const width = parseInt(chartEl.style.width || '', 10) || 500
+          const height = parseInt(chartEl.style.height || '', 10) || 300
+          const dataUrl = renderChartConfigToDataUrlSync(encodedConfig, width, height)
+          if (!dataUrl) return
+
+          const img = doc.createElement('img')
+          img.setAttribute('src', dataUrl)
+          img.setAttribute('alt', chartEl.getAttribute('data-chart-title') || 'chart')
+          img.setAttribute('data-generated-from', 'docx-chart')
+          img.setAttribute('data-preserve-src', '1')
+          img.style.width = `${width}px`
+          img.style.height = `${height}px`
+          chartEl.replaceWith(img)
+        })
+
+        normalizedHtml = doc.body.innerHTML
+      } catch (error) {
+        console.warn('[getCachedDsl] chart normalization failed:', error)
+      }
+    }
+
+    const dsl = htmlToDsl(normalizedHtml)
     dslCacheRef.current = { html, dsl }
     return dsl
   }, [])
@@ -3671,7 +4391,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         pending: true,
       })
 
-      return { success: true, count: totalCount, message: `已替换 ${totalCount} 处` }
+      return { success: true, count: totalCount, message: `已替换 ${totalCount} 处`, diffId: unifiedDiffId }
     } catch (e) {
       console.error('[replaceViaDsl] error:', e)
       return { success: false, count: 0, message: `DSL 替换失败: ${e}` }
@@ -4187,13 +4907,13 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       }
 
       const buildDiffOld = (diffId: string, text: string) =>
-        `<span class="diff-old" data-diff-id="${diffId}">${escapeHtml(text)}</span>`
+        buildInlineDiffTokenHtml('old', diffId, escapeHtml(text))
 
       const buildDiffNew = (diffId: string, text: string) =>
-        `<span class="diff-new" data-diff-id="${diffId}">${escapeHtml(text)}</span>`
+        buildInlineDiffTokenHtml('new', diffId, escapeHtml(text))
 
       const buildDiffPair = (diffId: string, oldText: string, newText: string) =>
-        `${buildDiffOld(diffId, oldText)}${buildDiffNew(diffId, newText)}`
+        buildInlineDiffPairHtml(diffId, escapeHtml(oldText), escapeHtml(newText))
 
       const extractFormatTags = (htmlFragment: string): { openTags: string[]; closeTags: string[] } => {
         const openTags: string[] = []
@@ -4214,8 +4934,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         const formatText = (text: string) => escapeHtml(text).replace(/\n/g, '<br>')
         const { openTags, closeTags } = extractFormatTags(originalHtml)
         const formattedNew = `${openTags.join('')}${formatText(newText)}${closeTags.join('')}`
-        return `<span class="diff-old" data-diff-id="${diffId}">${originalHtml}</span>` +
-          `<span class="diff-new" data-diff-id="${diffId}">${formattedNew}</span>`
+        return buildInlineDiffPairHtml(diffId, originalHtml, formattedNew)
       }
 
       const replaceFirstTextInHtml = (
@@ -4546,9 +5265,11 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
               const htmlEnd = map[match.end - 1] + 1
               const originalHtmlFragment = result.slice(htmlStart, htmlEnd)
               const originalText = originalHtmlFragment.replace(/<[^>]+>/g, '')
-              const replacement =
-                `<span class="diff-old" data-diff-id="${diffId}">${escapeHtml(originalText)}</span>` +
-                `<span class="diff-new" data-diff-id="${diffId}">${makeStyled(originalText)}</span>`
+              const replacement = buildInlineDiffPairHtml(
+                diffId,
+                escapeHtml(originalText),
+                makeStyled(originalText),
+              )
               result = result.slice(0, htmlStart) + replacement + result.slice(htmlEnd)
             }
             return { out: result, count: matches.length }
@@ -6524,7 +7245,6 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           content: newHtml,
           lastModified: new Date(),
         }))
-        setDocxData(null)
         setHasUnsavedChanges(true)
       }
 
@@ -6554,9 +7274,6 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       return { success: false, message: `应用失败: ${(e as Error).message || String(e)}` }
     }
   }, [])
-
-  // 编辑器模式 - 默认使用 Tiptap（内置编辑器），更稳定可靠
-  const [editorMode, setEditorMode] = useState<EditorMode>('tiptap')
 
   // ONLYOFFICE 专用操作 - 搜索替换
   const onlyOfficeReplace = useCallback(async (search: string, replace: string): Promise<ReplaceResult> => {
@@ -6690,6 +7407,117 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  useEffect(() => {
+    if (typeof window === 'undefined' || !isElectron) return
+
+    const debugApi = {
+      openWorkspacePath,
+      openFilePath: async (filePath: string) => {
+        return forceOpenDocxFilePathForDebug(filePath)
+      },
+      getWorkspacePath: () => effectiveWorkspacePath,
+      getSessionMode: () => sessionMode,
+      getCurrentFilePath: () => currentFile?.path || null,
+      getFiles: () => files,
+      getDocumentContent: () => document.content,
+      getDocxInspectionReport: () => docxInspectionReport,
+      getWordOracleArtifact: () => wordOracleArtifact,
+      getRenderAlignmentReport: () => renderAlignmentReport,
+      refreshWordOracleArtifacts: () => refreshWordOracleArtifacts(),
+    }
+
+    ;(window as any).__wordCursorDebug = debugApi
+    return () => {
+      if ((window as any).__wordCursorDebug === debugApi) {
+        delete (window as any).__wordCursorDebug
+      }
+    }
+  }, [currentFile?.path, docxInspectionReport, document.content, effectiveWorkspacePath, files, forceOpenDocxFilePathForDebug, isElectron, openWorkspacePath, refreshWordOracleArtifacts, renderAlignmentReport, sessionMode, wordOracleArtifact])
+
+  const documentAgentApi = {
+    getFileName: () => currentFile?.name || '当前文档',
+    getCurrentFile: () => currentFile,
+    getCurrentFilePath: () => currentFile?.path || null,
+    getWorkspacePath: () => effectiveWorkspacePath,
+    isElectron: () => isElectron,
+    ensureTiptapEditor: async () => {
+      if (editorMode !== 'onlyoffice') return
+      setEditorMode('tiptap')
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    },
+    autoSave: async () => {
+      if (!isElectron || !currentFile?.path) return null
+      return silentSaveToFile().catch(() => null)
+    },
+    resolveReferencePath: (maybePathOrName: string) => {
+      if (!maybePathOrName) return ''
+      if (/[A-Za-z]:\\/.test(maybePathOrName) || maybePathOrName.startsWith('\\\\')) {
+        return maybePathOrName
+      }
+      if (currentFile?.name === maybePathOrName) return currentFile.path
+      return ''
+    },
+    readOutline: () => getTiptapDocumentStructure(),
+    readSelection: (): DocumentSelectionSnapshot => {
+      if (typeof window === 'undefined' || !window.getSelection) {
+        return { text: '' }
+      }
+      const selection = window.getSelection()
+      if (!selection || selection.rangeCount === 0) {
+        return { text: '' }
+      }
+      const text = selection.toString().trim()
+      if (!text) return { text: '' }
+
+      try {
+        const fragment = selection.getRangeAt(0).cloneContents()
+        const container = document.createElement('div')
+        container.appendChild(fragment)
+        return {
+          text,
+          html: container.innerHTML || undefined,
+        }
+      } catch {
+        return { text }
+      }
+    },
+    readDocumentDsl: () => {
+      try {
+        const dsl = getCachedDsl()
+        return JSON.parse(JSON.stringify(dsl)) as DocDsl
+      } catch {
+        return null
+      }
+    },
+    listPendingChanges: () =>
+      pendingChangeSnapshot.map((change) => ({
+        id: change.id,
+        summary: change.summary,
+        scope: change.scope,
+        beforePreview: change.beforePreview,
+        afterPreview: change.afterPreview,
+        reviewReason: change.reviewReason,
+        reviewType: change.reviewType,
+        stats: change.stats,
+      })),
+    acceptChange,
+    rejectChange,
+    acceptAllChanges,
+    rejectAllChanges,
+    replaceViaDsl,
+    replaceInDocument,
+    replaceWithFormat,
+    insertViaDsl,
+    insertInDocument,
+    deleteViaDsl,
+    deleteInDocument,
+    previewOps: previewWordOps,
+    applyOps: applyWordOps,
+    prepareTemplateFillOutput,
+    createDocument: createNewDocument,
+    createDocumentFromDsl,
+  } satisfies DocumentContextType['documentAgentApi']
+
   return (
     <DocumentContext.Provider
       value={{
@@ -6697,45 +7525,23 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         files,
         currentFile,
         workspacePath,
+        effectiveWorkspacePath,
+        sessionMode,
         isElectron,
         hasUnsavedChanges,
         docxData,
         excelData,
         pptData,
         typographyProfile,
+        docxInspectionReport,
+        wordOracleArtifact,
+        renderAlignmentReport,
+        oracleStatus,
+        oracleError,
         refreshExcelData,
         lastReplacement,
-        pendingChanges: [
-          ...pendingReplacements.items.map((item) => {
-            const stripHtml = (s: string) => (s || '').replace(/<[^>]+>/g, '').trim()
-            const isReview = !!(item.reviewReason || item.reviewType)
-            const typeLabels: Record<string, string> = { grammar: '语法', logic: '逻辑', style: '措辞', typo: '错别字', format: '格式' }
-            const summaryText = isReview
-              ? `[${typeLabels[item.reviewType || 'style'] || item.reviewType}] ${item.reviewReason || '审查修改'}`
-              : `替换 ${item.count} 处`
-            return ({
-            id: item.id,
-            kind: 'replace_text' as const,
-            scope: 'document' as const,
-            summary: summaryText,
-            beforePreview: stripHtml(item.searchText),
-            afterPreview: stripHtml(item.replaceText),
-            stats: { matches: item.count },
-            timestamp: item.timestamp,
-            meta: {
-              searchText: item.searchText,
-              replaceText: item.replaceText,
-              count: item.count,
-            },
-            reviewReason: item.reviewReason,
-            reviewType: item.reviewType,
-            })
-          }),
-          ...extraPendingChanges,
-        ],
-        pendingChangesTotal:
-          pendingReplacements.total +
-          extraPendingChanges.reduce((sum, c) => sum + (c.stats?.matches ?? 1), 0),
+        pendingChanges: pendingChangeSnapshot,
+        pendingChangesTotal,
         editorMode,
         setEditorMode,
         setDocument,
@@ -6781,11 +7587,16 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         replaceWithFormat,
         docEntryAnimationKey,
         triggerDocEntryAnimation,
+        refreshWordOracleArtifacts: () => refreshWordOracleArtifacts(),
+        compareCurrentRenderWithWordOracle,
         getLatestContent: () => documentContentRef.current,
+        documentAgentApi,
         pageSetup,
-        setPageSetup: (setup: Partial<PageSetup>) => {
+        setPageSetup: (setup: Partial<PageSetup>, options?: { markDirty?: boolean }) => {
           setPageSetupState(prev => ({ ...prev, ...setup }))
-          setHasUnsavedChanges(true)
+          if (options?.markDirty !== false) {
+            setHasUnsavedChanges(true)
+          }
         },
         headerFooterSetup,
         setHeaderFooterSetup: (setup: Partial<HeaderFooterSetup>) => {
@@ -6843,12 +7654,4 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       {children}
     </DocumentContext.Provider>
   )
-}
-
-export function useDocument() {
-  const context = useContext(DocumentContext)
-  if (!context) {
-    throw new Error('useDocument must be used within a DocumentProvider')
-  }
-  return context
 }

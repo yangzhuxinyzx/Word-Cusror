@@ -1,20 +1,23 @@
 {
-  "name": "word-cursor",
+  "name": "zhiqi-docs",
   "version": "1.0.1",
-  "description": "AI驱动的Word文档编辑器 - Cursor的Word版本",
+  "description": "智启文档 - AI驱动的智能文档编辑器",
   "main": "electron/main.cjs",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "dev:electron": "concurrently \"vite --port 3000 --strictPort\" \"wait-on http://localhost:3000 && electron .\"",
-    "build": "tsc && vite build",
+    "build": "vite build",
     "build:electron": "npm run build && electron-builder",
+    "build:electron:locked": "cross-env VITE_LOCKED_MODEL=true npm run build && electron-builder",
     "preview": "vite preview",
-    "electron": "electron ."
+    "electron": "electron .",
+    "render:lab:capture": "node scripts/render-lab/capture.mjs",
+    "render:lab:install": "playwright install chromium"
   },
   "build": {
-    "appId": "com.wordcursor.app",
-    "productName": "Word-Cursor",
+    "appId": "com.zhiqidocs.app",
+    "productName": "智启文档",
     "directories": {
       "output": "release"
     },
@@ -24,15 +27,19 @@
     ],
     "win": {
       "target": "nsis",
-      "icon": "public/favicon.svg"
+      "icon": "public/icon.ico",
+      "signAndEditExecutable": false,
+      "sign": "./electron/fakesign.cjs"
     },
     "mac": {
       "target": "dmg",
-      "icon": "public/favicon.svg"
+      "icon": "public/icon.icns"
     }
   },
   "dependencies": {
     "@brave/brave-search-mcp-server": "^2.0.62",
+    "@lancedb/lancedb": "^0.27.2",
+    "@langchain/textsplitters": "^1.0.1",
     "@modelcontextprotocol/sdk": "^1.24.0",
     "@tiptap/extension-color": "^3.11.1",
     "@tiptap/extension-font-family": "^3.11.1",
@@ -60,6 +67,7 @@
     "docxtemplater": "^3.67.5",
     "dotenv": "^17.2.3",
     "exceljs": "^4.4.0",
+    "fast-xml-parser": "^5.6.0",
     "file-saver": "^2.0.5",
     "framer-motion": "^12.23.25",
     "highlight.js": "^11.9.0",
@@ -68,6 +76,7 @@
     "lucide-react": "^0.294.0",
     "mammoth": "^1.11.0",
     "p-limit": "^6.2.0",
+    "pdf-parse": "^2.4.5",
     "pizzip": "^3.2.0",
     "pptx-preview": "^1.0.7",
     "pptx2html": "^0.3.4",
@@ -90,8 +99,10 @@
     "@vitejs/plugin-react": "^4.2.1",
     "autoprefixer": "^10.4.16",
     "concurrently": "^9.1.2",
+    "cross-env": "^10.1.0",
     "electron": "^33.4.0",
     "electron-builder": "^25.1.8",
+    "playwright": "^1.59.1",
     "postcss": "^8.4.32",
     "tailwindcss": "^3.3.6",
     "typescript": "^5.3.3",

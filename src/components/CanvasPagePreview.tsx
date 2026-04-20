@@ -26,6 +26,8 @@ import {
 import { A4_WIDTH_MM, A4_HEIGHT_MM, MM_TO_PX } from '../utils/textMeasurer'
 import type { DocxParseResult, PageSettings } from '../utils/docxParser'
 import { ensureFontsReady } from '../utils/textMeasurer'
+import { prewarmNativeTextMeasurementsFromHtml } from '../utils/nativeTextMeasurement'
+import type { DocxInspectionReport } from '../types'
 
 // ONLYOFFICE 精确参数 @ 96 DPI
 const ONLYOFFICE_PARAMS = {
@@ -56,6 +58,9 @@ interface CanvasPagePreviewProps {
   showPageNumbers?: boolean
   // 页面设置（可选，否则使用默认 A4）
   pageSettings?: PageSettings
+  // 布局完成后回传当前页和总页数
+  onPageChange?: (currentPage: number, totalPages: number) => void
+  docxInspectionReport?: DocxInspectionReport | null
 }
 
 /**
@@ -68,13 +73,18 @@ export const CanvasPagePreview: React.FC<CanvasPagePreviewProps> = ({
   footerHtml,
   scale = 0.8,
   showPageNumbers = true,
-  pageSettings
+  pageSettings,
+  onPageChange,
+  docxInspectionReport,
 }) => {
   const [layoutResult, setLayoutResult] = useState<LayoutResult | null>(null)
   const [pageConfig, setPageConfig] = useState<PageConfig>(getDefaultPageConfig(scale))
   const [isLoading, setIsLoading] = useState(true)
   const containerRef = useRef<HTMLDivElement>(null)
   const imageCache = useRef<Map<string, HTMLImageElement>>(new Map())
+  const resolvedContentHtml = docxData?.bodyHtml || html || ''
+  const resolvedHeaderHtml = headerHtml || docxData?.headerHtml || ''
+  const resolvedFooterHtml = footerHtml || docxData?.footerHtml || ''
   
   // 从 DocxParseResult 或 pageSettings 更新页面配置
   useEffect(() => {
@@ -101,17 +111,11 @@ export const CanvasPagePreview: React.FC<CanvasPagePreviewProps> = ({
       
       try {
         await ensureFontsReady()
-        // 获取要布局的 HTML 内容
-        let contentHtml = html
-        let header = headerHtml
-        let footer = footerHtml
-        
-        if (docxData) {
-          contentHtml = docxData.bodyHtml
-          header = header || docxData.headerHtml
-          footer = footer || docxData.footerHtml
-        }
-        
+        await prewarmNativeTextMeasurementsFromHtml(resolvedContentHtml, scale, docxInspectionReport)
+        const contentHtml = resolvedContentHtml
+        const header = resolvedHeaderHtml
+        const footer = resolvedFooterHtml
+
         if (!contentHtml) {
           setLayoutResult({ pages: [], totalHeight: 0 })
           setIsLoading(false)
@@ -139,18 +143,18 @@ export const CanvasPagePreview: React.FC<CanvasPagePreviewProps> = ({
     }
     
     performLayout()
-  }, [html, docxData, headerHtml, footerHtml, pageConfig, scale])
+  }, [docxInspectionReport, pageConfig, resolvedContentHtml, resolvedFooterHtml, resolvedHeaderHtml, scale])
   
   // 预加载图片
   useEffect(() => {
-    if (!docxData?.bodyHtml) return
+    if (!resolvedContentHtml) return
     
     // 从 HTML 中提取所有图片 src
     const imgRegex = /<img[^>]+src=["']([^"']+)["']/gi
     let match
     const srcs: string[] = []
     
-    while ((match = imgRegex.exec(docxData.bodyHtml)) !== null) {
+    while ((match = imgRegex.exec(resolvedContentHtml)) !== null) {
       srcs.push(match[1])
     }
     
@@ -163,7 +167,33 @@ export const CanvasPagePreview: React.FC<CanvasPagePreviewProps> = ({
         imageCache.current.set(src, img)
       }
     }
-  }, [docxData?.bodyHtml])
+  }, [resolvedContentHtml])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+
+    const pageCount = layoutResult?.pages?.length || 0
+    const debugPayload = {
+      status: isLoading ? 'loading' : 'ready',
+      layoutResult,
+      pageConfig,
+      scale,
+      pageCount,
+    }
+
+    ;(window as any).__wordCursorLayoutDebug = debugPayload
+    return () => {
+      if ((window as any).__wordCursorLayoutDebug === debugPayload) {
+        delete (window as any).__wordCursorLayoutDebug
+      }
+    }
+  }, [isLoading, layoutResult, pageConfig, scale])
+
+  useEffect(() => {
+    if (!onPageChange || isLoading) return
+    const totalPages = layoutResult?.pages?.length || 0
+    onPageChange(totalPages > 0 ? 1 : 0, totalPages)
+  }, [isLoading, layoutResult, onPageChange])
   
   // 渲染页面列表
   const renderPages = useMemo(() => {
@@ -191,6 +221,8 @@ export const CanvasPagePreview: React.FC<CanvasPagePreviewProps> = ({
     return layoutResult.pages.map((page, index) => (
       <div 
         key={index}
+        data-word-page-index={index + 1}
+        data-testid={`word-render-page-${index + 1}`}
         style={{
           marginBottom: ONLYOFFICE_PARAMS.PAGE_GAP_PX,
           position: 'relative'
@@ -198,6 +230,7 @@ export const CanvasPagePreview: React.FC<CanvasPagePreviewProps> = ({
       >
         <CanvasPageRenderer
           page={page}
+          pageIndex={index + 1}
           pageConfig={pageConfig}
           scale={scale}
           showPageNumber={showPageNumbers}
@@ -230,6 +263,9 @@ export const CanvasPagePreview: React.FC<CanvasPagePreviewProps> = ({
     <div
       ref={containerRef}
       className="canvas-page-preview"
+      data-testid="word-render-canvas-preview"
+      data-render-status={isLoading ? 'loading' : 'ready'}
+      data-page-count={layoutResult?.pages?.length || 0}
       style={{
         display: 'flex',
         flexDirection: 'column',

@@ -4,6 +4,12 @@
  * 参考 ONLYOFFICE 的 CGraphics 设计
  */
 
+import {
+  getDocxCompatSettings,
+  getNativeStyleMetrics,
+  getNativeTextMetrics,
+} from './nativeTextMeasurement'
+
 // A4 尺寸常量 (mm)
 export const A4_WIDTH_MM = 210
 export const A4_HEIGHT_MM = 297
@@ -20,8 +26,9 @@ export interface TextStyle {
   fontWeight?: 'normal' | 'bold' | number
   fontStyle?: 'normal' | 'italic'
   color?: string
-  lineHeight?: number  // 行高倍数，默认 1.0
+  lineHeight?: number  // 行高倍数
   letterSpacing?: number  // 字间距 pt
+  scaleFactor?: number
 }
 
 export interface MeasuredText {
@@ -71,10 +78,16 @@ export class TextMeasurer {
   private buildFontString(style: TextStyle): string {
     const fontStyle = style.fontStyle || 'normal'
     const fontWeight = style.fontWeight || 'normal'
-    const fontSize = style.fontSize * PT_TO_PX  // 转换为 px
+    const scaleFactor = style.scaleFactor || 1
+    const fontSize = style.fontSize * PT_TO_PX * scaleFactor  // 转换为 px
     const fontFamily = style.fontFamily || 'DengXian, "等线", "Microsoft YaHei", "SimSun", serif'
     
     return `${fontStyle} ${fontWeight} ${fontSize}px ${fontFamily}`
+  }
+
+  private getLetterSpacingPx(style: TextStyle): number {
+    const scaleFactor = style.scaleFactor || 1
+    return (style.letterSpacing || 0) * PT_TO_PX * scaleFactor
   }
   
   /**
@@ -82,16 +95,40 @@ export class TextMeasurer {
    */
   measureText(text: string, style: TextStyle): number {
     const fontString = this.buildFontString(style)
-    const cacheKey = `${text}|${fontString}`
+    const scaleFactor = style.scaleFactor || 1
+    const letterSpacingPx = this.getLetterSpacingPx(style)
+    const cacheKey = `${text}|${fontString}|${letterSpacingPx}`
     
     // 检查缓存
     if (this.cache.has(cacheKey)) {
       return this.cache.get(cacheKey)!
     }
+
+    const nativeMetrics = getNativeTextMetrics(text, style)
+    if (nativeMetrics) {
+      this.cache.set(cacheKey, nativeMetrics.width)
+      return nativeMetrics.width
+    }
+
+    let canComposeFromNativeChars = true
+    let composedWidth = 0
+    for (const char of Array.from(text)) {
+      const charMetrics = getNativeTextMetrics(char, style)
+      if (!charMetrics) {
+        canComposeFromNativeChars = false
+        break
+      }
+      composedWidth += charMetrics.width
+    }
+    if (canComposeFromNativeChars && text.length > 0) {
+      composedWidth += Math.max(0, text.length - 1) * letterSpacingPx
+      this.cache.set(cacheKey, composedWidth)
+      return composedWidth
+    }
     
     this.ctx.font = fontString
     const metrics = this.ctx.measureText(text)
-    const width = metrics.width
+    const width = metrics.width + Math.max(0, text.length - 1) * letterSpacingPx
     
     // 缓存结果
     this.cache.set(cacheKey, width)
@@ -110,8 +147,15 @@ export class TextMeasurer {
    * 获取行高（px）
    */
   getLineHeight(style: TextStyle): number {
-    const fontSize = style.fontSize * PT_TO_PX
-    const lineHeight = style.lineHeight || 1
+    const scaleFactor = style.scaleFactor || 1
+    const fontSize = style.fontSize * PT_TO_PX * scaleFactor
+    if (style.lineHeight == null) {
+      const nativeStyleMetrics = getNativeStyleMetrics(style)
+      if (nativeStyleMetrics?.lineHeight) {
+        return nativeStyleMetrics.lineHeight
+      }
+    }
+    const lineHeight = style.lineHeight || 1.15
     return fontSize * lineHeight
   }
   
@@ -129,6 +173,10 @@ export class TextMeasurer {
    * 判断字符是否可以作为行尾
    */
   private canBreakAfter(char: string): boolean {
+    const compat = getDocxCompatSettings()
+    if (compat.doNotUseEastAsianBreakRules) {
+      return char === ' ' || char === '\t' || ',.!?;:'.includes(char)
+    }
     // 中文字符后可以断行
     if (this.isChinese(char)) return true
     // 空格后可以断行
@@ -142,6 +190,8 @@ export class TextMeasurer {
    * 判断字符是否不能作为行首
    */
   private cannotStartLine(char: string): boolean {
+    const compat = getDocxCompatSettings()
+    if (compat.doNotUseEastAsianBreakRules) return false
     return ',.!?;:。，！？；：、）】》"\''.includes(char)
   }
   
@@ -149,6 +199,8 @@ export class TextMeasurer {
    * 判断字符是否不能作为行尾
    */
   private cannotEndLine(char: string): boolean {
+    const compat = getDocxCompatSettings()
+    if (compat.doNotUseEastAsianBreakRules) return false
     return '（【《"\''.includes(char)
   }
   
@@ -159,6 +211,7 @@ export class TextMeasurer {
   measureParagraph(text: string, maxWidth: number, style: TextStyle): MeasuredText {
     const lines: MeasuredLine[] = []
     const lineHeight = this.getLineHeight(style)
+    const letterSpacingPx = this.getLetterSpacingPx(style)
     
     // 处理空文本
     if (!text || text.trim() === '') {
@@ -201,9 +254,10 @@ export class TextMeasurer {
       }
       
       const charWidth = this.measureChar(char, style)
+      const nextWidth = currentWidth + charWidth + (currentLine.length > 0 ? letterSpacingPx : 0)
       
       // 检查是否需要换行
-      if (currentWidth + charWidth > maxWidth && currentLine.length > 0) {
+      if (nextWidth > maxWidth && currentLine.length > 0) {
         // 检查换行规则
         let breakPoint = currentLine.length
         
@@ -234,7 +288,7 @@ export class TextMeasurer {
         currentWidth = this.measureText(currentLine, style)
       } else {
         currentLine += char
-        currentWidth += charWidth
+        currentWidth = nextWidth
       }
     }
     

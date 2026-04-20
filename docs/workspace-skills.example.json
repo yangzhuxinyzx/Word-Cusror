@@ -1,0 +1,56 @@
+{
+  "skills": [
+    {
+      "id": "bid-summary",
+      "displayName": "Bid Summary",
+      "description": "Rewrite bid and tender materials into a concise executive summary.",
+      "executionKind": "prompt_transform",
+      "safety": "planning",
+      "prompt": "Summarize the attached bid materials into an executive brief with project scope, budget, timeline, risks, and recommended next actions.",
+      "toolIds": [
+        "workspace_profile",
+        "workspace_read",
+        "word.read_outline",
+        "create"
+      ],
+      "tags": [
+        "workspace",
+        "bid",
+        "summary"
+      ],
+      "invocation": {
+        "slashCommands": [
+          "bid-summary",
+          "投标总结"
+        ],
+        "aliases": [
+          "tender-summary"
+        ]
+      }
+    },
+    {
+      "id": "policy-proofread",
+      "displayName": "Policy Proofread",
+      "description": "Proofread policy documents and normalize official wording.",
+      "executionKind": "prompt_transform",
+      "safety": "verification",
+      "prompt": "Proofread the current policy document, preserve meaning, normalize official language, and flag ambiguous or non-compliant wording.",
+      "toolIds": [
+        "word.read_selection",
+        "word.read_outline",
+        "review",
+        "replace"
+      ],
+      "tags": [
+        "policy",
+        "proofread"
+      ],
+      "invocation": {
+        "slashCommands": [
+          "policy-proofread",
+          "政策校对"
+        ]
+      }
+    }
+  ]
+}

@@ -1,116 +1,53 @@
-import { createContext, useContext, useState, useCallback, ReactNode, useRef, useEffect } from 'react'
-import { ChatMessage, AISettings } from '../types'
+import { createContext, useContext, useState, useCallback, useMemo, ReactNode, useRef, useEffect } from 'react'
+import { ChatMessage, AISettings, KnowledgeSearchResult } from '../types'
 import { DOC_EDIT_START, DOC_EDIT_END, DOC_SUMMARY_START, DOC_SUMMARY_END } from '../utils/aiMarkers'
 import { memoryAppend, memoryAppendSession, memorySearch } from '../memory/manager'
 import { formatMemoryResults } from '../memory/hybrid'
+import { formatKnowledgeResults, knowledgeConfigure, knowledgeQueueProfileCandidates, knowledgeRetrieve } from '../knowledge/manager'
 import { toolCallLogger } from '../utils/toolCallLogger'
+import {
+  parseLegacyAssistantOutput as parseAssistantOutput,
+} from '../agent/compat/legacyProtocol'
+import {
+  cleanLegacyModelOutput as cleanModelOutput,
+} from '../agent/compat/legacyModelOutput'
+import {
+  buildLegacyMemoryFlushText as buildMemoryFlushText,
+  buildLegacyToolFailureHint as buildToolFailureHint,
+  cleanLegacyMessageForSend as cleanMessageForSend,
+} from '../agent/compat/legacyTextHelpers'
+import { AttachmentManager } from '../agent/attachments/AttachmentManager'
+import { AgentSessionEngine } from '../agent/core/AgentSessionEngine'
+import type { AgentSessionSnapshot } from '../agent/core/AgentSessionEngine'
+import { callLegacyModelGateway } from '../agent/core/ModelGateway'
+import {
+  createAgentTurnId,
+  runLegacyAgentLoop,
+  sanitizeConversationMessagesForApi,
+} from '../agent/core/AgentLoop'
+import { buildNativeToolingConfig } from '../agent/core/NativeToolSchemaBuilder'
+import {
+  buildNativeAssistantConversationMessageFromResponse,
+  buildNativeToolResultConversationMessages,
+  hasToolCallInResponse,
+  parseToolCallsToIRFromResponse,
+} from '../agent/core/ToolCallProtocolRouter'
+import { ContextAssembler } from '../agent/prompt/ContextAssembler'
+import { SystemPromptComposer } from '../agent/prompt/SystemPromptComposer'
+import type {
+  AgentCallbacks,
+  AgentDebugEvent,
+  MessageContent,
+  ToolResult,
+} from '../agent/core/runtimeTypes'
 
 // 多模态消息 content 类型
-export type MessageContent = string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }>
-
-// 工具调用结果类型
-export interface ToolResult {
-  tool: string
-  success: boolean
-  message: string
-  data?: Record<string, unknown>
-}
-
-export type AgentDebugEvent =
-  | {
-      type: 'turn_start'
-      turnId: string
-      timestamp: string
-      model: string
-      baseUrl: string
-      userInput: string
-      hasDocumentContext: boolean
-      hasFilesContext: boolean
-      imageCount: number
-      recentMessagesCount: number
-    }
-  | {
-      type: 'api_response_raw'
-      turnId: string
-      timestamp: string
-      iteration: number
-      stage: 'loop' | 'forced_summary'
-      response: string
-      rawResponse?: string
-      hasToolCall: boolean
-    }
-  | {
-      type: 'tool_calls_parsed'
-      turnId: string
-      timestamp: string
-      iteration: number
-      calls: Array<{ tool: string; args: Record<string, string> }>
-    }
-  | {
-      type: 'tool_call_skipped'
-      turnId: string
-      timestamp: string
-      iteration: number
-      tool: string
-      args: Record<string, string>
-      reason: string
-    }
-  | {
-      type: 'tool_result'
-      turnId: string
-      timestamp: string
-      iteration: number
-      index: number
-      total: number
-      tool: string
-      args: Record<string, string>
-      result: ToolResult
-    }
-  | {
-      type: 'final_summary'
-      turnId: string
-      timestamp: string
-      iteration: number
-      source: 'normal' | 'forced_stop' | 'max_iterations'
-      content: string
-    }
-  | {
-      type: 'turn_complete'
-      turnId: string
-      timestamp: string
-      totalIterations: number
-      finalContent: string
-      toolResults: ToolResult[]
-    }
-  | {
-      type: 'turn_error'
-      turnId: string
-      timestamp: string
-      iteration: number
-      aborted: boolean
-      name?: string
-      message: string
-      stack?: string
-    }
-
-// Agent 回调类型
-export interface AgentCallbacks {
-  onToolCall?: (tool: string, args: Record<string, string>) => Promise<ToolResult>
-  /** Fired when a tool call header is detected during streaming. */
-  onToolCallStart?: (tool: string) => void
-  /** Fired when a complete tool call is parsed from streaming output. */
-  onToolCallPreview?: (tool: string, args: Record<string, string>) => void
-  /** Fired when a tool call is skipped by in-turn dedup logic. */
-  onToolCallSkipped?: (tool: string, args: Record<string, string>, reason: string) => void
-  /** Assistant text chunk per loop iteration for interleaved chat rendering. */
-  onTextChunk?: (text: string) => void
-  onDebugEvent?: (event: AgentDebugEvent) => void | Promise<void>
-  onContent?: (content: string) => void
-  onComplete?: (content: string, toolResults: ToolResult[]) => void
-  onThinking?: (thinking: string) => void
-  /** Return latest document snapshot so the model can recover from failed edits. */
-  getLatestDocument?: () => string
-}
+export type {
+  AgentCallbacks,
+  AgentDebugEvent,
+  MessageContent,
+  ToolResult,
+} from '../agent/core/runtimeTypes'
 
 interface AIContextType {
   messages: ChatMessage[]
@@ -132,7 +69,14 @@ interface AIContextType {
     documentContext?: string, 
     filesContext?: string,
     callbacks?: AgentCallbacks,
-    memoryContext?: { workspaceKey?: string; workspaceSummary?: string },
+    memoryContext?: {
+      workspaceKey?: string
+      workspaceSummary?: string
+      workspaceProfile?: string
+      skillDescriptions?: string
+      activeSkill?: Record<string, unknown>
+      availableToolsDelta?: Record<string, unknown>
+    },
     images?: string[]
   ) => Promise<void>
   // Tab 补全功能 - 使用本地模型
@@ -144,16 +88,91 @@ interface AIContextType {
   cancelCompletion: () => void
   // 停止当前生成
   stopGeneration: () => void
+  getAgentRuntimeSnapshot: () => AgentSessionSnapshot
+  recordRuntimeToolExecution: (state: import('../agent/tools/ir').ToolExecutionPipelineState) => void
+  syncRuntimeTools: (tools: import('../agent/tools/contracts').AgentToolDefinition[]) => void
+  syncRuntimeSkills: (skills: import('../agent/skills/SkillRegistry').AgentSkillDefinition[]) => void
+  spawnRuntimeSubagent: (params: {
+    profileId: string
+    label?: string
+    mode?: 'sync' | 'background'
+    parentTurnId?: string | null
+  }) => import('../agent/subagents/SubagentManager').SubagentRecord
+  startRuntimeSubagent: (subagentId: string) => import('../agent/subagents/SubagentManager').SubagentRecord | null
+  completeRuntimeSubagent: (params: {
+    subagentId: string
+    summary?: string
+    outputPath?: string
+  }) => import('../agent/subagents/SubagentManager').SubagentRecord | null
+  failRuntimeSubagent: (params: {
+    subagentId: string
+    error: string
+  }) => import('../agent/subagents/SubagentManager').SubagentRecord | null
+  cancelRuntimeSubagent: (subagentId: string) => import('../agent/subagents/SubagentManager').SubagentRecord | null
+  appendRuntimeSubagentTranscript: (params: {
+    subagentId: string
+    messages?: import('../agent/core/messageTypes').AgentRuntimeMessage[]
+    toolCalls?: import('../agent/tools/ir').ToolCallIR[]
+    toolProgress?: import('../agent/tools/ir').ToolProgressIR[]
+    toolResults?: import('../agent/tools/ir').ToolResultIR[]
+  }) => void
+  loadRuntimeSubagentTranscript: (subagentId: string) => import('../agent/storage/SessionTranscriptStore').SessionTranscriptRecord | null
+  runRuntimeSubagentSession: (params: {
+    content: string
+    systemPrompt?: string
+    documentContext?: string
+    filesContext?: string
+    callbacks?: AgentCallbacks
+    memoryContext?: {
+      workspaceKey?: string
+      workspaceSummary?: string
+      workspaceProfile?: string
+      skillDescriptions?: string
+      activeSkill?: Record<string, unknown>
+      availableToolsDelta?: Record<string, unknown>
+    }
+    images?: string[]
+    includeRecentMessages?: boolean
+  }) => Promise<{
+    finalContent: string
+    toolResults: ToolResult[]
+    reasoning?: string
+    iteration: number
+  }>
+}
+
+import { PRESET_MODELS, BUILTIN_KEYS, LOCKED_MODEL } from '../config/models'
+
+const _defaultPreset = PRESET_MODELS[0]
+const DEFAULT_EMBEDDING_BASE_URL = 'https://api.siliconflow.cn/v1'
+const DEFAULT_EMBEDDING_MODEL = 'BAAI/bge-m3'
+
+function applyUnifiedTextPreset(base: AISettings): AISettings {
+  return {
+    ...base,
+    apiKey: _defaultPreset.apiKey,
+    baseUrl: _defaultPreset.baseUrl,
+    model: _defaultPreset.model,
+    localModel: {
+      ...(base.localModel || {}),
+      enabled: true,
+      baseUrl: _defaultPreset.baseUrl,
+      model: _defaultPreset.model,
+      apiKey: _defaultPreset.apiKey,
+    },
+  }
 }
 
 const defaultSettings: AISettings = {
-  apiKey: '',
-  model: 'kimi-k2.5',
-  baseUrl: 'https://api.linapi.net/v1',
-  temperature: 1,  // kimi-k2.5 模型只支持 temperature=1
-  maxTokens: 16384,
-  // PPT 图像生成模型（默认使用 Gemini 生图）
-  pptImageModel: 'gemini-image',
+  apiKey: _defaultPreset.apiKey,
+  model: _defaultPreset.model,
+  baseUrl: _defaultPreset.baseUrl,
+  temperature: 1,
+  maxTokens: 131072,
+  // PPT 图像生成模型（默认使用 DashScope z-image-turbo）
+  pptImageModel: 'z-image-turbo',
+  // 内嵌 API Keys
+  braveApiKey: BUILTIN_KEYS.braveApiKey,
   // 记忆系统默认配置
   memoryEnabled: true,
   memoryTopK: 5,
@@ -161,12 +180,20 @@ const defaultSettings: AISettings = {
   memoryTextWeight: 0.6,
   memoryVectorWeight: 0.4,
   memoryFlushThresholdChars: 12000,
-  // 本地模型配置 - 用于快速 Tab 补全
+  knowledgeEnabled: true,
+  workspaceKnowledgeEnabled: true,
+  globalKnowledgePath: '',
+  profileMemoryEnabled: true,
+  embeddingBaseUrl: DEFAULT_EMBEDDING_BASE_URL,
+  embeddingApiKey: '',
+  embeddingModel: DEFAULT_EMBEDDING_MODEL,
+  knowledgeTopK: 8,
+  // 本地模型 Tab 补全 — 跟随主模型
   localModel: {
     enabled: true,
-    baseUrl: 'http://127.0.0.1:8080/v1',
-    model: 'gpt-oss-20b',
-    apiKey: '',
+    baseUrl: _defaultPreset.baseUrl,
+    model: _defaultPreset.model,
+    apiKey: _defaultPreset.apiKey,
   }
 }
 
@@ -195,723 +222,131 @@ function loadSettingsFromStorage(): AISettings {
     const saved = localStorage.getItem('word-cursor-settings')
     if (saved) {
       const parsed = JSON.parse(saved)
-      // 设置迁移：如果是旧模型，更新为新默认值
-      if (parsed.model === 'GLM-4.7' || parsed.model === 'GLM-4') {
-        parsed.model = 'kimi-k2.5'
+      // 设置迁移：如果是旧模型或旧文本 API，统一回收到当前默认文本模型
+      if (parsed.model === 'GLM-4.7' || parsed.model === 'GLM-4' || parsed.model === 'kimi-k2.5' || parsed.model === 'ernie-5.0-thinking-preview') {
+        parsed.model = _defaultPreset.model
+        parsed.baseUrl = _defaultPreset.baseUrl
+        parsed.apiKey = _defaultPreset.apiKey
         parsed.temperature = 1
       }
-      return mergeSettings(defaultSettings, parsed)
+      const result = applyUnifiedTextPreset(mergeSettings(defaultSettings, parsed))
+      // 锁定模型时仍沿用统一文本模型，只是禁止切换
+      if (LOCKED_MODEL) {
+        return applyUnifiedTextPreset(result)
+      }
+      return result
     }
   } catch (e) {
     console.warn('Failed to load settings from localStorage:', e)
   }
-  return defaultSettings
+  return applyUnifiedTextPreset(defaultSettings)
 }
 
 const AIContext = createContext<AIContextType | undefined>(undefined)
 
+function sanitizeAgentPromptForNativeTooling(prompt: string): string {
+  let next = prompt
+
+  next = next.replace(
+    /<task_completion_rules>[\s\S]*?<\/task_completion_rules>/g,
+    `<task_completion_rules>
+**Native Tooling Completion Rules**
+
+1. Prefer provider-native tool calling over any textual tool protocol.
+2. Use at most 3 native tool calls in each round.
+3. After receiving tool results, decide whether another tool call is needed or the task is done.
+4. Do not repeat completed edits once a tool has succeeded.
+5. When all edits are complete, return one short final summary sentence.
+</task_completion_rules>`,
+  )
+
+  next = next.replace(
+    /<output_markers>[\s\S]*?<\/output_markers>/g,
+    `<output_markers>
+Keep document lifecycle markers such as ${DOC_EDIT_START}, ${DOC_EDIT_END}, ${DOC_SUMMARY_START}, and ${DOC_SUMMARY_END} when the task involves document creation or editing.
+Do not emit textual [TOOL_CALL]/[TOOL_RESULT] blocks in native-tool sessions.
+</output_markers>`,
+  )
+
+  next = next.replace(/<available_tools>[\s\S]*?<\/available_tools>/g, '<available_tools>\nNative tool schemas are injected separately for this session.\n</available_tools>')
+  next = next.replace(/\[TOOL_CALL\][\s\S]*?\[\/TOOL_CALL\]/g, '[native tool example omitted]')
+  next = next.replace(/\[TOOL_RESULT\]/g, 'tool result')
+  next = next.replace(/\[\/TOOL_RESULT\]/g, '')
+  next = next.replace(/\[TOOL_CALL\]/g, 'native tool call')
+  next = next.replace(/\[\/TOOL_CALL\]/g, '')
+  next = next.replace(/\bword_edit_ops\b/g, 'word.format')
+  next = next.replace(/\bword\.preview_ops\b/g, 'word.format')
+  next = next.replace(/\bword\.apply_ops\b/g, 'word.format')
+  next = next.replace(/\bword\.read_selection\b/g, 'word.read')
+  next = next.replace(/\bword\.read_outline\b/g, 'word.read')
+  next = next.replace(/\bcreate_from_template\b/g, 'word.create')
+  next = next.replace(/\bword_chart\b/g, 'word.chart')
+  next = next.replace(/replace\s*\/\s*insert\s*\/\s*delete/g, 'word.edit')
+  next = next.replace(/replace\s*\/\s*delete\s*\/\s*insert/g, 'word.edit')
+  next = next.replace(/create\s*\/\s*word\.create/g, 'word.create')
+  next = next.replace(/create\s*\/\s*create_from_template/g, 'word.create')
+
+  next = next
+    .replace(
+      /Output at most 3 native tool call blocks in each round/g,
+      'Use at most 3 native tool calls in each round',
+    )
+    .replace(
+      /Output at most 3 native tool calls in each round/g,
+      'Use at most 3 native tool calls in each round',
+    )
+    .replace(
+      /After receiving tool result, decide the next step; each new round can output 1-3 tool calls, never more than 3/g,
+      'After receiving tool results, decide the next step; each new round can execute 1-3 native tool calls, never more than 3',
+    )
+    .replace(
+      /After receiving tool results, decide the next step; each new round can output 1-3 tool calls, never more than 3/g,
+      'After receiving tool results, decide the next step; each new round can execute 1-3 native tool calls, never more than 3',
+    )
+    .replace(
+      /then output the tool call/g,
+      'then invoke the native tool call',
+    )
+    .replace(
+      /must invoke the native tool call create tool/g,
+      'must invoke the native `word.create` tool',
+    )
+    .replace(
+      /必须调用 native tool call create 工具/g,
+      '必须调用原生 `create` 工具',
+    )
+
+  next = next
+    .split('\n')
+    .filter((line) => {
+      const trimmed = line.trim()
+      if (!trimmed) return true
+      if (trimmed === '[native tool example omitted]') return false
+      if (trimmed.includes('<tool_use>') || trimmed.includes('</tool_use>')) return false
+      return true
+    })
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+
+  next +=
+    '\n\n<native_tooling_override>\n' +
+    '- Any legacy [TOOL_CALL], [TOOL_RESULT], or XML examples in this prompt are compatibility references only.\n' +
+    '- In native-tool sessions, you must use the provider-native tool calling interface instead of emitting textual tool blocks.\n' +
+    '- Canonical Word tools in native sessions are `word.read`, `word.create`, `word.edit`, `word.format`, `word.resolve_change`, and `word.chart`; older names are compatibility aliases only.\n' +
+    '- Use `word.edit` for replace/review/insert/delete operations instead of legacy Word mutation tool ids.\n' +
+    '- Use `word.format` for structured formatting/layout ops instead of `word_edit_ops`.\n' +
+    '- If a new document must be created, call the native `word.create` tool with structured arguments; do not print the document body as plain chat text.\n' +
+    '</native_tooling_override>'
+
+  return next
+}
+
 // 从内容中提取思考内容（<think> 标签）
-function extractThinking(content: string): { thinking: string; cleaned: string } {
-  const thinkMatch = content.match(/<think>([\s\S]*?)<\/think>/g)
-  let thinking = ''
-  if (thinkMatch) {
-    thinking = thinkMatch.map(m => m.replace(/<\/?think>/g, '')).join('\n')
-  }
-  const cleaned = content.replace(/<think>[\s\S]*?<\/think>/g, '')
-  return { thinking, cleaned }
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-const EDIT_START_REGEX = new RegExp(escapeRegExp(DOC_EDIT_START), 'g')
-const EDIT_END_REGEX = new RegExp(escapeRegExp(DOC_EDIT_END), 'g')
-const SUMMARY_BLOCK_REGEX = new RegExp(
-  `${escapeRegExp(DOC_SUMMARY_START)}[\s\S]*?(?:${escapeRegExp(DOC_SUMMARY_END)})?`,
-  'g'
-)
-
-const LEGACY_XML_TOOL_NAMES = [
-  'replace',
-  'review',
-  'insert',
-  'delete',
-  'word_edit_ops',
-  'word_chart',
-  'create',
-  'copy_template',
-  'create_from_template',
-  'ppt_create',
-  'ppt_edit',
-  'workspace_list',
-  'workspace_open',
-  'workspace_summarize',
-  'workspace_read',
-  'web_search',
-  'excel_read',
-  'excel_search',
-  'excel_write',
-  'excel_insert_rows',
-  'excel_insert_columns',
-  'excel_delete_rows',
-  'excel_delete_columns',
-  'excel_add_sheet',
-  'excel_delete_sheet',
-  'excel_merge',
-  'excel_unmerge',
-  'excel_create',
-  'excel_formula',
-  'excel_sort',
-  'excel_autofill',
-  'excel_dimensions',
-  'excel_conditional_format',
-  'excel_calculate',
-  'excel_filter',
-  'excel_validation',
-  'excel_hyperlink',
-  'excel_find_replace',
-  'excel_chart',
-] as const
-
-const LEGACY_XML_TOOL_NAME_PATTERN = LEGACY_XML_TOOL_NAMES
-  .map((tool) => escapeRegExp(tool))
-  .join('|')
-
-const LEGACY_XML_TOOL_BLOCK_REGEX = new RegExp(
-  '<(' + LEGACY_XML_TOOL_NAME_PATTERN + ')>([\s\S]*?)<\/\\1>',
-  'gi'
-)
-
-const LEGACY_XML_TOOL_OPEN_TAG_REGEX = new RegExp(`<(${LEGACY_XML_TOOL_NAME_PATTERN})>`, 'gi')
-
-const LEGACY_XML_TOOL_ARG_REGEX = /<([a-zA-Z][\w-]*)>([\s\S]*?)<\/\1>/g
-
-const TOOL_USE_BLOCK_REGEX = /<tool_use>[\s\S]*?<\/tool_use>/gi
-const TOOL_USE_START_WITH_NAME_REGEX = /<tool_use>[\s\S]*?<tool_name>\s*([a-zA-Z0-9_]+)\s*<\/tool_name>/gi
-const TOOL_USE_NAME_REGEX = /<tool_name>\s*([\s\S]*?)\s*<\/tool_name>/i
-const TOOL_USE_PARAM_PAIR_REGEX = /<parameter_name>\s*([\s\S]*?)\s*<\/parameter_name>\s*<parameter_value>\s*([\s\S]*?)\s*<\/parameter_value>/gi
-const TOOL_USE_INPUT_JSON_REGEX = /<tool_input>\s*([\s\S]*?)\s*<\/tool_input>/i
-
-function cleanXmlTagText(value: string): string {
-  return (value || '').replace(/<[^>]+>/g, '').trim()
-}
-
-function decodeXmlEntities(value: string): string {
-  return (value || '')
-    .replace(/&quot;/g, '"')
-    .replace(/&#34;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-}
-
-function normalizeToolUseArgValue(value: unknown): string {
-  if (value === null || value === undefined) return ''
-  if (typeof value === 'string') return value.trim()
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
-  try {
-    return JSON.stringify(value)
-  } catch {
-    return String(value)
-  }
-}
-
-function extractToolUseInputArgs(block: string): Record<string, string> {
-  const args: Record<string, string> = {}
-  const inputMatch = block.match(TOOL_USE_INPUT_JSON_REGEX)
-  if (!inputMatch) return args
-
-  const rawInput = decodeXmlEntities((inputMatch[1] || '').trim())
-  if (!rawInput) return args
-
-  const candidate = rawInput
-    .replace(/^```json\s*/i, '')
-    .replace(/^```\s*/i, '')
-    .replace(/\s*```$/i, '')
-    .trim()
-
-  if (!candidate) return args
-
-  try {
-    const parsed = JSON.parse(candidate)
-    if (Array.isArray(parsed)) {
-      args.ops = JSON.stringify(parsed)
-      return args
-    }
-    if (parsed && typeof parsed === 'object') {
-      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-        const normalized = normalizeToolUseArgValue(value)
-        if (!key || !normalized) continue
-        args[key] = normalized
-      }
-    }
-  } catch {
-    // Ignore malformed JSON and fallback to other parameter extraction paths.
-  }
-
-  return args
-}
-
-function normalizeToolUseTagCalls(content: string): string {
-  if (!content || content.indexOf('<tool_use>') === -1) return content
-
-  return content.replace(TOOL_USE_BLOCK_REGEX, (block) => {
-    const toolNameMatch = block.match(TOOL_USE_NAME_REGEX)
-    let toolName = cleanXmlTagText(toolNameMatch?.[1] || '')
-    if (!toolName) return ''
-
-    const argsMap: Record<string, string> = {
-      ...extractToolUseInputArgs(block),
-    }
-
-    const pairRegex = new RegExp(TOOL_USE_PARAM_PAIR_REGEX.source, 'gi')
-    let pairMatch: RegExpExecArray | null
-    while ((pairMatch = pairRegex.exec(block)) !== null) {
-      const key = cleanXmlTagText(pairMatch[1] || '')
-      const value = cleanXmlTagText(pairMatch[2] || '')
-      if (!key || !value) continue
-      argsMap[key] = value
-    }
-
-    // Common key alias normalization across providers.
-    if (!argsMap.action && argsMap.operation) argsMap.action = argsMap.operation
-    if (!argsMap.search && argsMap.search_text) argsMap.search = argsMap.search_text
-    if (!argsMap.replace && argsMap.replace_text) argsMap.replace = argsMap.replace_text
-
-    if (toolName === 'word_edit_ops') {
-      const operation = (argsMap.operation || argsMap.action || '').toLowerCase()
-      const searchText = argsMap.search || argsMap.search_text || ''
-      const replaceText = argsMap.replace || argsMap.replace_text || ''
-      if (searchText && replaceText && (operation === 'search_replace' || operation === 'replace' || operation === 'find_replace' || !operation)) {
-        toolName = 'replace'
-        argsMap.search = searchText
-        argsMap.replace = replaceText
-      }
-    }
-
-    const argLines = Object.entries(argsMap)
-      .filter(([key, value]) => key && value)
-      .map(([key, value]) => `${key}: ${value}`)
-
-    if (argLines.length === 0) {
-      return `[TOOL_CALL] ${toolName}\n[/TOOL_CALL]`
-    }
-
-    return `[TOOL_CALL] ${toolName}\n${argLines.join('\n')}\n[/TOOL_CALL]`
-  })
-}
-
-function normalizeLegacyXmlToolCalls(content: string): string {
-  if (!content || content.indexOf('<') === -1) return content
-
-  return content.replace(LEGACY_XML_TOOL_BLOCK_REGEX, (_full, rawTool: string, rawBody: string) => {
-    let toolName = (rawTool || '').trim()
-    const body = rawBody || ''
-    const args: string[] = []
-    const argRegex = new RegExp(LEGACY_XML_TOOL_ARG_REGEX.source, 'g')
-    let argMatch: RegExpExecArray | null
-
-    while ((argMatch = argRegex.exec(body)) !== null) {
-      const key = (argMatch[1] || '').trim()
-      const value = (argMatch[2] || '').trim()
-      if (!key || !value) continue
-      args.push(`${key}: ${value}`)
-    }
-
-    // Compatibility: some models emit <word_edit_ops><search>...</search><replace>...</replace></word_edit_ops>.
-    if (toolName === 'word_edit_ops') {
-      const hasSearch = args.some((line) => line.startsWith('search:'))
-      const hasReplace = args.some((line) => line.startsWith('replace:'))
-      const hasAction = args.some((line) => line.startsWith('action:'))
-      if (hasSearch && hasReplace && !hasAction) {
-        toolName = 'replace'
-      }
-    }
-
-    if (args.length === 0) {
-      const compactBody = body.trim()
-      if (!compactBody) return ''
-      args.push(`content: ${compactBody}`)
-    }
-
-    return `[TOOL_CALL] ${toolName}\n${args.join('\n')}\n[/TOOL_CALL]`
-  })
-}
-
-function trimTrailingOpenToolCallBlock(displayText: string): string {
-  let cleaned = displayText || ''
-
-  const lastOpenIdx = cleaned.lastIndexOf('[TOOL_CALL]')
-  if (lastOpenIdx !== -1 && cleaned.indexOf('[/TOOL_CALL]', lastOpenIdx) === -1) {
-    cleaned = cleaned.substring(0, lastOpenIdx).trim()
-  }
-
-  const lowered = cleaned.toLowerCase()
-  const toolUseOpenIdx = lowered.lastIndexOf('<tool_use>')
-  if (toolUseOpenIdx !== -1 && lowered.indexOf('</tool_use>', toolUseOpenIdx) === -1) {
-    cleaned = cleaned.substring(0, toolUseOpenIdx).trim()
-  }
-
-  for (const tool of LEGACY_XML_TOOL_NAMES) {
-    const openTag = `<${tool}>`
-    const closeTag = `</${tool}>`
-    const openIdx = cleaned.lastIndexOf(openTag)
-    if (openIdx === -1) continue
-    if (cleaned.indexOf(closeTag, openIdx + openTag.length) === -1) {
-      cleaned = cleaned.substring(0, openIdx).trim()
-    }
-  }
-
-  return cleaned
-}
-
-function stripToolBlocks(content: string): string {
-  let cleaned = content
-  cleaned = cleaned.replace(/\[TOOL_CALL\][\s\S]*?\[\/TOOL_CALL\]/g, '')
-  cleaned = cleaned.replace(/\[TOOL_RESULT\][\s\S]*?\[\/TOOL_RESULT\]/g, '')
-  cleaned = cleaned.replace(LEGACY_XML_TOOL_BLOCK_REGEX, '')
-  cleaned = cleaned.replace(TOOL_USE_BLOCK_REGEX, '')
-  return cleaned
-}
-
-function extractSummaryBlock(content: string): string {
-  const startIndex = content.indexOf(DOC_SUMMARY_START)
-  if (startIndex === -1) return ''
-  const start = startIndex + DOC_SUMMARY_START.length
-  const endIndex = content.indexOf(DOC_SUMMARY_END, start)
-  const summary = endIndex === -1 ? content.slice(start) : content.slice(start, endIndex)
-  return summary.trim()
-}
-
-function parseAssistantOutput(content: string): { displayText: string; summary: string; phase: 'idle' | 'editing' | 'done' } {
-  let phase: 'idle' | 'editing' | 'done' = 'idle'
-  if (content.includes(DOC_EDIT_START)) phase = 'editing'
-  if (content.includes(DOC_EDIT_END)) phase = 'done'
-
-  const summary = extractSummaryBlock(content)
-  let displayText = content
-  displayText = displayText.replace(SUMMARY_BLOCK_REGEX, '')
-  displayText = displayText.replace(EDIT_START_REGEX, '').replace(EDIT_END_REGEX, '')
-  displayText = stripToolBlocks(displayText)
-  displayText = trimTrailingOpenToolCallBlock(displayText)
-  displayText = displayText.replace(/\n{3,}/g, '\n\n').trim()
-  return { displayText, summary, phase }
-}
-
-function extractStreamText(value: unknown): string {
-  if (!value) return ''
-  if (typeof value === 'string') return value
-  if (Array.isArray(value)) {
-    return value.map(part => {
-      if (!part) return ''
-      if (typeof part === 'string') return part
-      if (typeof (part as { text?: unknown }).text === 'string') return (part as { text: string }).text
-      if (typeof (part as { content?: unknown }).content === 'string') return (part as { content: string }).content
-      return ''
-    }).join('')
-  }
-  if (typeof value === 'object') {
-    const obj = value as { text?: unknown; content?: unknown }
-    if (typeof obj.text === 'string') return obj.text
-    if (typeof obj.content === 'string') return obj.content
-  }
-  return ''
-}
-
-// 清理模型返回的特殊标签
-function cleanModelOutput(content: string): string {
-  let cleaned = content
-  cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/g, '')
-  cleaned = cleaned.replace(/<\|.*?\|>/g, '')
-  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim()
-  return cleaned || content
-}
-
-// 清理要发送的消息内容
-function cleanMessageForSend(content: string): string {
-  let cleaned = content
-  cleaned = cleaned.replace(/<\|.*?\|>/g, '')
-  cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/g, '')
-  // 移除工具调用标记
-  cleaned = cleaned.replace(/\[TOOL_CALL\][\s\S]*?\[\/TOOL_CALL\]/g, '')
-  cleaned = cleaned.replace(/\[TOOL_RESULT\][\s\S]*?\[\/TOOL_RESULT\]/g, '')
-  cleaned = cleaned.replace(LEGACY_XML_TOOL_BLOCK_REGEX, '')
-  cleaned = cleaned.replace(TOOL_USE_BLOCK_REGEX, '')
-  return cleaned.trim()
-}
-
-function truncateTextForMemory(text: string, maxLen: number): string {
-  const normalized = (text || '').replace(/\s+/g, ' ').trim()
-  if (normalized.length <= maxLen) return normalized
-  return normalized.slice(0, maxLen) + '...'
-}
-
-function buildMemoryFlushText(
-  recentMessages: Array<{ role: string; content: string }>,
-  currentUserContent: string,
-  maxChars = 1500
-): string {
-  const lines: string[] = []
-  const tail = recentMessages.slice(-6)
-  tail.forEach((msg) => {
-    const label = msg.role === 'user' ? '用户' : msg.role === 'assistant' ? '助手' : msg.role
-    lines.push(`${label}: ${truncateTextForMemory(msg.content, 200)}`)
-  })
-  if (currentUserContent) {
-    lines.push(`用户当前请求: ${truncateTextForMemory(currentUserContent, 300)}`)
-  }
-  const summary = lines.join('\n')
-  if (summary.length <= maxChars) return summary
-  return summary.slice(0, maxChars) + '\n...(内容已截断)'
-}
-
-// 提取工具调用之外的文本内容
-function extractTextContent(content: string): string {
-  // 移除所有工具调用块
-  let text = content.replace(/\[TOOL_CALL\][\s\S]*?\[\/TOOL_CALL\]/g, '')
-  text = text.replace(LEGACY_XML_TOOL_BLOCK_REGEX, '')
-  text = text.replace(TOOL_USE_BLOCK_REGEX, '')
-  // 移除工具结果块
-  text = text.replace(/\[TOOL_RESULT\][\s\S]*?\[\/TOOL_RESULT\]/g, '')
-  // 清理多余空行
-  text = text.replace(/\n{3,}/g, '\n\n').trim()
-  return text
-}
-
-// 从指定 key 后提取 JSON 对象（支持多行、嵌套）
-function extractJsonObjectAfterKey(argsText: string, key: string): string | null {
-  const keyRegex = new RegExp(`^\\s*${key}\\s*[:=]\\s*`, 'm')
-  const match = keyRegex.exec(argsText)
-  if (!match) return null
-
-  const startIndex = match.index + match[0].length
-  const openIndex = argsText.indexOf('{', startIndex)
-  if (openIndex === -1) return null
-
-  let depth = 0
-  let inString = false
-  let escaped = false
-
-  for (let i = openIndex; i < argsText.length; i++) {
-    const ch = argsText[i]
-    if (inString) {
-      if (escaped) {
-        escaped = false
-      } else if (ch === '\\') {
-        escaped = true
-      } else if (ch === '"') {
-        inString = false
-      }
-      continue
-    }
-
-    if (ch === '"') {
-      inString = true
-      continue
-    }
-
-    if (ch === '{') depth++
-    if (ch === '}') {
-      depth--
-      if (depth === 0) {
-        return argsText.slice(openIndex, i + 1).trim()
-      }
-    }
-  }
-
-  return null
-}
-
-// 解析工具调用
-function parseToolCalls(content: string): Array<{ tool: string; args: Record<string, string> }> {
-  const toolCalls: Array<{ tool: string; args: Record<string, string> }> = []
-  const normalizedContent = normalizeToolUseTagCalls(normalizeLegacyXmlToolCalls(content))
-  
-  // 匹配 [TOOL_CALL] ... [/TOOL_CALL] 格式
-  const toolCallRegex = /\[TOOL_CALL\]\s*(\w+)\s*\n([\s\S]*?)\[\/TOOL_CALL\]/g
-  let match
-  
-  while ((match = toolCallRegex.exec(normalizedContent)) !== null) {
-    const toolName = match[1]
-    const argsText = match[2]
-    const args: Record<string, string> = {}
-    
-    // 对于 create 工具，特殊处理多行参数
-    if (toolName === 'create') {
-      // 提取 title
-      const titleMatch = argsText.match(/^\s*title\s*[:=]\s*(.+?)(?:\n|$)/m)
-      if (titleMatch) {
-        args['title'] = titleMatch[1].trim()
-      }
-      
-      // 提取 dsl（JSON 对象）- 最高优先级
-      const dslJson = extractJsonObjectAfterKey(argsText, 'dsl')
-      if (dslJson) {
-        args['dsl'] = dslJson
-        console.log('解析到 dsl:', args['dsl'].substring(0, 100))
-      }
-
-      // 提取 elements（JSON 数组）- 优先处理
-      const elementsMatch = argsText.match(/^\s*elements\s*[:=]\s*(\[[\s\S]*?\])(?:\n|$)/m)
-      if (elementsMatch) {
-        args['elements'] = elementsMatch[1].trim()
-        console.log('解析到 elements:', args['elements'])
-      }
-
-      // 可选：指定样式参考（从 DocxCatalog 选择）
-      const styleRefPathMatch = argsText.match(/^\s*styleRefPath\s*[:=]\s*(.+?)(?:\n|$)/m)
-      if (styleRefPathMatch) {
-        args['styleRefPath'] = styleRefPathMatch[1].trim()
-      }
-      const styleRefFileNameMatch = argsText.match(/^\s*styleRefFileName\s*[:=]\s*(.+?)(?:\n|$)/m)
-      if (styleRefFileNameMatch) {
-        args['styleRefFileName'] = styleRefFileNameMatch[1].trim()
-      }
-
-      // 可选：指定内容参考（用于“格式参考 + 内容参考 → 生成新文档”）
-      const contentRefPathMatch = argsText.match(/^\s*contentRefPath\s*[:=]\s*(.+?)(?:\n|$)/m)
-      if (contentRefPathMatch) {
-        args['contentRefPath'] = contentRefPathMatch[1].trim()
-      }
-      const contentRefFileNameMatch = argsText.match(/^\s*contentRefFileName\s*[:=]\s*(.+?)(?:\n|$)/m)
-      if (contentRefFileNameMatch) {
-        args['contentRefFileName'] = contentRefFileNameMatch[1].trim()
-      }
-      
-      // 提取 content - 从 "content:" 开始到结尾的所有内容
-      const contentMatch = argsText.match(/^\s*content\s*[:=]\s*([\s\S]*)$/m)
-      if (contentMatch && !args['elements'] && !args['dsl']) {
-        // 获取 content: 之后的所有内容
-        let contentValue = contentMatch[1]
-        // 如果 content 在 title 之前，需要截取到 title 之前
-        const titleIndex = contentValue.indexOf('\ntitle:')
-        if (titleIndex > -1) {
-          contentValue = contentValue.substring(0, titleIndex)
-        }
-        args['content'] = contentValue.trim()
-      }
-    } else if (toolName === 'copy_template' || toolName === 'create_from_template') {
-      // copy_template / create_from_template 需要特殊处理 JSON 参数
-      const titleMatch = argsText.match(/^\s*newTitle\s*[:=]\s*(.+?)(?:\n|$)/m)
-      if (titleMatch) {
-        args['newTitle'] = titleMatch[1].trim()
-      }
-      
-      const replacementsMatch = argsText.match(/^\s*replacements\s*[:=]\s*(\[[\s\S]*?\])(?:\n|$)/m)
-      if (replacementsMatch) {
-        args['replacements'] = replacementsMatch[1].trim()
-        console.log('解析到 replacements:', args['replacements'])
-      }
-
-      // 可选：指定模板来源（从 DocxCatalog 选择）
-      const templatePathMatch = argsText.match(/^\s*templatePath\s*[:=]\s*(.+?)(?:\n|$)/m)
-      if (templatePathMatch) {
-        args['templatePath'] = templatePathMatch[1].trim()
-      }
-      const templateFileNameMatch = argsText.match(/^\s*templateFileName\s*[:=]\s*(.+?)(?:\n|$)/m)
-      if (templateFileNameMatch) {
-        args['templateFileName'] = templateFileNameMatch[1].trim()
-      }
-    } else if (toolName === 'word_edit_ops') {
-      // word_edit_ops：ops(JSON数组) + 可选 dryRun
-      const dryRunMatch = argsText.match(/^\s*dryRun\s*[:=]\s*(true|false)\s*(?:\n|$)/mi)
-      if (dryRunMatch) {
-        args['dryRun'] = dryRunMatch[1].toLowerCase()
-      }
-
-      const opsMatch = argsText.match(/^\s*ops\s*[:=]\s*(\[[\s\S]*?\])(?:\n|$)/m)
-      if (opsMatch) {
-        args['ops'] = opsMatch[1].trim()
-        console.log('解析到 ops:', args['ops']?.slice(0, 120) + '...')
-      }
-    } else {
-      // 其他工具使用简单的行解析
-      const argLines = argsText.split('\n')
-      for (const line of argLines) {
-        const colonMatch = line.match(/^\s*(\w+)\s*[:=]\s*(.+?)\s*$/)
-        if (colonMatch) {
-          args[colonMatch[1]] = colonMatch[2]
-        }
-      }
-    }
-    if (toolName === 'word_edit_ops' && !args['action'] && args['search'] && args['replace']) {
-      toolCalls.push({
-        tool: 'replace',
-        args: {
-          search: args['search'],
-          replace: args['replace'],
-        },
-      })
-      continue
-    }
-
-    toolCalls.push({ tool: toolName, args })
-  }
-  
-  return toolCalls
-}
-
-// 检查是否包含工具调用
-function buildToolCallSignature(tool: string, args: Record<string, string>): string {
-  const normalizedArgs = Object.keys(args || {})
-    .sort()
-    .map((key) => {
-      const value = String(args[key] ?? '')
-        .replace(/\s+/g, ' ')
-        .trim()
-      return `${key}=${value}`
-    })
-  return `${tool}::${normalizedArgs.join('||')}`
-}
-
-function emitToolCallStartFromRaw(
-  rawContent: string,
-  state: { startedSignatures: Set<string> },
-  onStart?: (tool: string) => void,
-  maxStarts = Number.POSITIVE_INFINITY
-): void {
-  if (!onStart) return
-
-  const startCandidates: Array<{ index: number; tool: string; signature: string }> = []
-
-  const bracketStartRegex = /\[TOOL_CALL\]\s*(\w+)?/g
-  let bracketMatch: RegExpExecArray | null
-  while ((bracketMatch = bracketStartRegex.exec(rawContent)) !== null) {
-    const tool = (bracketMatch[1] || '').trim()
-    if (!tool) continue
-    startCandidates.push({
-      index: bracketMatch.index,
-      tool,
-      signature: `bracket:${bracketMatch.index}:${tool}`,
-    })
-  }
-
-  const xmlStartRegex = new RegExp(LEGACY_XML_TOOL_OPEN_TAG_REGEX.source, 'gi')
-  let xmlMatch: RegExpExecArray | null
-  while ((xmlMatch = xmlStartRegex.exec(rawContent)) !== null) {
-    const tool = (xmlMatch[1] || '').trim()
-    if (!tool) continue
-    startCandidates.push({
-      index: xmlMatch.index,
-      tool,
-      signature: `xml:${xmlMatch.index}:${tool}`,
-    })
-  }
-
-  const toolUseStartRegex = new RegExp(TOOL_USE_START_WITH_NAME_REGEX.source, 'gi')
-  let toolUseMatch: RegExpExecArray | null
-  while ((toolUseMatch = toolUseStartRegex.exec(rawContent)) !== null) {
-    const tool = (toolUseMatch[1] || '').trim()
-    if (!tool) continue
-
-    let normalizedTool = tool
-    if (tool === 'word_edit_ops') {
-      const toolUseSnippet = rawContent.slice(toolUseMatch.index, toolUseMatch.index + 600).toLowerCase()
-      const looksLikeSearchReplace =
-        toolUseSnippet.includes('search_replace') ||
-        toolUseSnippet.includes('<parameter_name>search_text</parameter_name>') ||
-        toolUseSnippet.includes('<parameter_name>replace_text</parameter_name>') ||
-        toolUseSnippet.includes('"search_text"') ||
-        toolUseSnippet.includes('"replace_text"')
-      if (looksLikeSearchReplace) {
-        normalizedTool = 'replace'
-      }
-    }
-
-    startCandidates.push({
-      index: toolUseMatch.index,
-      tool: normalizedTool,
-      signature: `tool_use:${toolUseMatch.index}:${normalizedTool}`,
-    })
-  }
-
-  if (startCandidates.length === 0) return
-
-  startCandidates.sort((a, b) => a.index - b.index)
-
-  for (const candidate of startCandidates) {
-    if (state.startedSignatures.size >= maxStarts) break
-    if (state.startedSignatures.has(candidate.signature)) continue
-
-    state.startedSignatures.add(candidate.signature)
-    try {
-      onStart(candidate.tool)
-    } catch (error) {
-      console.warn('[Agent] tool start callback failed:', error)
-    }
-  }
-}
-
-function emitToolCallPreviewFromRaw(
-  rawContent: string,
-  state: { emitted: Set<string> },
-  onPreview?: (tool: string, args: Record<string, string>) => void,
-  maxPreviews = Number.POSITIVE_INFINITY
-): void {
-  if (!onPreview) return
-
-  const calls = parseToolCalls(cleanModelOutput(rawContent))
-  if (calls.length === 0) return
-
-  for (const call of calls) {
-    if (state.emitted.size >= maxPreviews) break
-
-    const signature = buildToolCallSignature(call.tool, call.args)
-    if (state.emitted.has(signature)) continue
-    state.emitted.add(signature)
-
-    try {
-      onPreview(call.tool, { ...call.args })
-    } catch (error) {
-      console.warn('[Agent] tool preview callback failed:', error)
-    }
-  }
-}
-
-// Detect whether response contains at least one tool call block.
-function hasToolCall(content: string): boolean {
-  if (!content) return false
-  if (content.includes('[TOOL_CALL]')) return true
-  return parseToolCalls(content).length > 0
-}
-
-function buildToolFailureHint(latestDoc: string, search: string): string {
-  const normalizedSearch = (search || '').trim().replace(/^['"]|['"]$/g, '')
-  if (!normalizedSearch) return ''
-
-  const lines = latestDoc
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-
-  const keywordCandidates = Array.from(new Set([
-    normalizedSearch,
-    normalizedSearch.replace(/\s+/g, ''),
-    normalizedSearch.slice(0, Math.min(8, normalizedSearch.length)),
-    normalizedSearch.slice(Math.max(0, normalizedSearch.length - 8)),
-  ])).filter((item) => item.length >= 2)
-
-  const matched = lines
-    .filter((line) => keywordCandidates.some((keyword) => line.includes(keyword)))
-    .slice(0, 3)
-    .map((line, index) => `${index + 1}. ${line.slice(0, 120)}`)
-
-  if (matched.length === 0) {
-    return 'Supplement: text not found in latest document snapshot. Try a shorter and exact source snippet as search.'
-  }
-
-  return `Supplement: related lines from current document
-${matched.join('\n')}`
-}
-
 const getInitialMessages = (): ChatMessage[] => {
   const welcomeMessage: ChatMessage = {
     id: 'welcome',
     role: 'assistant',
-    content: `你好！我是 Word-Cursor AI 助手 👋
+    content: `你好！我是智启文档 AI 助手 👋
 
 **快捷命令**（输入 / 查看）：
 \`/润色\` \`/精简\` \`/翻译\` \`/格式化\` \`/编号\` \`/公文\` \`/会议纪要\`
@@ -950,18 +385,34 @@ export function AIProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(false)
   const [isCompleting, setIsCompleting] = useState(false)
   const [streamingContent, setStreamingContent] = useState('')
-  const [streamingReasoning, setStreamingReasoning] = useState('')  // AI 思考过程
+  const [streamingReasoning, setStreamingReasoningState] = useState('')  // AI 思考过程
   const [editPhase, setEditPhase] = useState<'idle' | 'editing' | 'done'>('idle')
   const [streamingSummary, setStreamingSummary] = useState('')
   const [settings, setSettings] = useState<AISettings>(loadSettingsFromStorage)
+  const [runtimeToolVersion, setRuntimeToolVersion] = useState(0)
   const abortControllerRef = useRef<AbortController | null>(null)
   const completionAbortRef = useRef<AbortController | null>(null)
   const streamPrefixRef = useRef('')  // Agent 流式累积前缀（Cursor 风格连续输出）
+  const streamingReasoningRef = useRef('')
   const lastMemoryFlushAtRef = useRef(0)
   const sessionIdRef = useRef(
     typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
       ? crypto.randomUUID()
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  )
+  const sessionEngineRef = useRef(new AgentSessionEngine())
+  const attachmentManager = useRef(new AttachmentManager()).current
+  const contextAssembler = useRef(new ContextAssembler(attachmentManager)).current
+  const systemPromptComposer = useRef(new SystemPromptComposer()).current
+  const nativeTooling = useMemo(() => {
+    return buildNativeToolingConfig({
+      settings,
+      tools: sessionEngineRef.current.listTools(),
+    })
+  }, [settings, runtimeToolVersion])
+  const shouldUseNativeTooling = useMemo(
+    () => Boolean(window.electronAPI?.isElectron) && nativeTooling.enabled,
+    [nativeTooling.enabled],
   )
 
   const addMessage = useCallback((message: Omit<ChatMessage, 'id' | 'timestamp'>) => {
@@ -972,6 +423,34 @@ export function AIProvider({ children }: { children: ReactNode }) {
     }
     setMessages(prev => [...prev, newMessage])
     return newMessage
+  }, [])
+
+  const setStreamingReasoning = useCallback((value: string) => {
+    streamingReasoningRef.current = value
+    setStreamingReasoningState(value)
+  }, [])
+
+  const yieldAfterToolCallFrame = useCallback(async () => {
+    await new Promise<void>((resolve) => {
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        resolve()
+      }
+
+      const timeoutId = window.setTimeout(finish, 80)
+
+      if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+        window.requestAnimationFrame(() => {
+          window.clearTimeout(timeoutId)
+          finish()
+        })
+        return
+      }
+
+      finish()
+    })
   }, [])
 
   const updateLastMessage = useCallback((content: string) => {
@@ -1019,6 +498,7 @@ export function AIProvider({ children }: { children: ReactNode }) {
           id: `${Date.now()}-stopped`,
           role: 'assistant' as const,
           content: prev + '\n\n*(已停止生成)*',
+          reasoning: streamingReasoningRef.current.trim() || undefined,
           timestamp: Date.now(),
         }])
       }
@@ -1041,15 +521,78 @@ export function AIProvider({ children }: { children: ReactNode }) {
     }
   }, [messages])
 
+  useEffect(() => {
+    sessionEngineRef.current.syncLegacyMessages(messages)
+  }, [messages])
+
+  useEffect(() => {
+    const engine = sessionEngineRef.current
+
+    if (isLoading) {
+      engine.setPhase('streaming')
+      return
+    }
+
+    if (editPhase === 'done') {
+      engine.setPhase('completed')
+      return
+    }
+
+    if (editPhase === 'editing') {
+      engine.setPhase('executing_tools')
+      return
+    }
+
+    engine.setPhase('idle')
+  }, [editPhase, isLoading])
+
+  useEffect(() => {
+    if (!window.electronAPI?.knowledgeConfigure) return
+    knowledgeConfigure({
+      knowledgeEnabled: settings.knowledgeEnabled !== false,
+      workspaceKnowledgeEnabled: settings.workspaceKnowledgeEnabled !== false,
+      globalKnowledgePath: settings.globalKnowledgePath || '',
+      profileMemoryEnabled: settings.profileMemoryEnabled !== false,
+      embeddingBaseUrl: settings.embeddingBaseUrl || DEFAULT_EMBEDDING_BASE_URL,
+      embeddingApiKey: settings.embeddingApiKey || '',
+      embeddingModel: settings.embeddingModel || DEFAULT_EMBEDDING_MODEL,
+      knowledgeTopK: settings.knowledgeTopK || 8,
+    }).catch((error) => {
+      console.warn('同步知识库配置失败:', error)
+    })
+  }, [
+    settings.embeddingApiKey,
+    settings.embeddingBaseUrl,
+    settings.embeddingModel,
+    settings.globalKnowledgePath,
+    settings.knowledgeEnabled,
+    settings.knowledgeTopK,
+    settings.profileMemoryEnabled,
+    settings.workspaceKnowledgeEnabled,
+  ])
+
   // 启动时从 .env 加载设置（Electron 桌面端），优先级最高
   useEffect(() => {
     if (window.electronAPI?.getEnvSettings) {
       window.electronAPI.getEnvSettings().then(envSettings => {
         if (envSettings && Object.keys(envSettings).length > 0) {
           setSettings(prev => {
-            const merged = mergeSettings(prev, envSettings)
+            const merged = applyUnifiedTextPreset(mergeSettings(prev, envSettings))
             // 同步回写 localStorage，保持一致
             localStorage.setItem('word-cursor-settings', JSON.stringify(merged))
+            // 统一文本模型后，启动时顺手修正磁盘上的 .env 配置，避免后续再被旧值覆盖
+            const textApiChanged =
+              envSettings.apiKey !== merged.apiKey ||
+              envSettings.baseUrl !== merged.baseUrl ||
+              envSettings.model !== merged.model ||
+              envSettings.localModel?.apiKey !== merged.localModel?.apiKey ||
+              envSettings.localModel?.baseUrl !== merged.localModel?.baseUrl ||
+              envSettings.localModel?.model !== merged.localModel?.model
+            if (textApiChanged && window.electronAPI?.saveEnvSettings) {
+              window.electronAPI.saveEnvSettings(merged).catch(e =>
+                console.warn('回写统一文本模型到 .env 失败:', e)
+              )
+            }
             return merged
           })
         }
@@ -1059,7 +602,7 @@ export function AIProvider({ children }: { children: ReactNode }) {
 
   const updateSettings = useCallback((newSettings: Partial<AISettings>) => {
     setSettings(prev => {
-      const updated = { ...prev, ...newSettings }
+      const updated = applyUnifiedTextPreset({ ...prev, ...newSettings })
       // 同时写入 localStorage（备份）和 .env（主存储）
       localStorage.setItem('word-cursor-settings', JSON.stringify(updated))
       // 异步写入 .env 文件（Electron 桌面端）
@@ -1091,10 +634,118 @@ export function AIProvider({ children }: { children: ReactNode }) {
     return lines.join('\n')
   }, [])
 
-  // Agent 系统提示词 - Word-Cursor 专用
+  const extractProfileCandidates = useCallback(async (params: {
+    userText: string
+    assistantText: string
+    knowledgeHits: KnowledgeSearchResult[]
+  }) => {
+    if (settings.profileMemoryEnabled === false) return
+    if (!window.electronAPI?.aiChatCompletions || !window.electronAPI?.knowledgeQueueProfileCandidates) return
+
+    const evidenceLines = params.knowledgeHits
+      .slice(0, 6)
+      .map((item, index) => {
+        const sourcePath = item.relativePath || item.sourcePath || ''
+        return [
+          `#${index + 1} [${item.sourceScope}] ${item.title || sourcePath || '命中片段'}`,
+          sourcePath,
+          item.snippet,
+        ].filter(Boolean).join('\n')
+      })
+      .join('\n\n')
+
+    const requestId = `profile-extract-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    const response = await window.electronAPI.aiChatCompletions({
+      requestId,
+      baseUrl: settings.baseUrl,
+      apiKey: settings.apiKey,
+      model: settings.model,
+      temperature: 0.1,
+      maxTokens: 1200,
+      messages: [
+        {
+          role: 'system',
+          content: [
+            '你是用户画像抽取器，只抽取对未来协作有长期价值、且可验证的用户事实。',
+            '仅允许以下分类：identity, preferences, organization, ongoing_projects, writing_style, workflow_rules。',
+            '如果证据不足，返回空数组。',
+            '输出必须是 JSON 数组，不要使用 markdown 代码块，不要输出解释。',
+            '每项结构：{"category":"...","statement":"...","evidenceText":"...","sourceScope":"chat|workspace|global","sourcePath":"..."}',
+            'statement 必须是简洁中文事实句，避免推测。',
+          ].join('\n'),
+        },
+        {
+          role: 'user',
+          content: [
+            `【用户消息】\n${params.userText}`,
+            `【助手回答】\n${params.assistantText}`,
+            `【实际命中的知识片段】\n${evidenceLines || '（无）'}`,
+          ].join('\n\n'),
+        },
+      ],
+    })
+
+    if (!response.success || !response.content) return
+
+    const normalized = response.content
+      .trim()
+      .replace(/^```json\s*/i, '')
+      .replace(/^```\s*/i, '')
+      .replace(/```$/i, '')
+      .trim()
+
+    let parsed = []
+    try {
+      parsed = JSON.parse(normalized)
+    } catch {
+      return
+    }
+
+    if (!Array.isArray(parsed) || parsed.length === 0) return
+
+    const allowedCategories = new Set([
+      'identity',
+      'preferences',
+      'organization',
+      'ongoing_projects',
+      'writing_style',
+      'workflow_rules',
+    ])
+
+    const items = parsed
+      .map((item) => {
+        const category = String(item?.category || '').trim()
+        const statement = String(item?.statement || '').replace(/\s+/g, ' ').trim()
+        const evidenceText = String(item?.evidenceText || '').replace(/\s+/g, ' ').trim()
+        const sourceScope = String(item?.sourceScope || 'chat').trim()
+        const sourcePath = String(item?.sourcePath || '').trim()
+        if (!allowedCategories.has(category) || !statement || !evidenceText) return null
+        return {
+          category,
+          statement: statement.slice(0, 180),
+          evidenceText: evidenceText.slice(0, 400),
+          sourceScope,
+          sourcePath,
+          metadata: {
+            title: params.knowledgeHits.find((hit) => (hit.relativePath || hit.sourcePath || '') === sourcePath)?.title || '',
+          },
+        }
+      })
+      .filter(Boolean)
+
+    if (!items.length) return
+    await knowledgeQueueProfileCandidates({ items })
+  }, [
+    settings.apiKey,
+    settings.baseUrl,
+    settings.model,
+    settings.profileMemoryEnabled,
+  ])
+
+  // Agent 系统提示词 - 智启文档 专用
   const now = new Date()
   const currentTimeStr = `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日 ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`
-  const agentSystemPrompt = `你是 Word-Cursor AI 助手，一个专业的智能文档编辑代理。你运行在 Word-Cursor 编辑器中。
+  const agentSystemPrompt = `你是智启文档 AI 助手，一个专业的智能文档编辑代理。你运行在智启文档编辑器中。
 
 当前时间：${currentTimeStr}
 
@@ -1209,6 +860,7 @@ ${DOC_SUMMARY_END}
 | 查看工作夹文件摘要 | **workspace_summarize** |
 | 读取工作夹文件内容（受限，谨慎） | **workspace_read** |
 | 读取工作夹 docx 文件的格式信息 | **workspace_read**（format: dsl） |
+| 检索当前工作区 / 长期知识库 / 用户画像 | **knowledge_search** |
 | 在当前文档插入新内容 | **insert** |
 | 在 Word 文档中插入图表（柱状图/饼图/折线图等） | **word_chart** |
 | 删除当前文档的某些内容 | **delete** |
@@ -1372,6 +1024,19 @@ num: 5
 [/TOOL_CALL]
 - 获得结果后请**汇总关键信息并引用来源（标题或链接）**，然后再执行写作/修改。
 - 每个话题优先合并为一次搜索，避免连续多次调用。
+
+## 0.5 knowledge_search - 本地知识库检索
+- 当你需要从**当前工作区、长期知识库或用户画像记忆**中查找相关资料时调用。
+- 参数：
+  - \`query\`（必填）：检索问题或关键词。
+  - \`topK\`（可选）：返回条数，默认使用系统配置。
+- 示例：
+[TOOL_CALL] knowledge_search
+query: 用户之前偏好的公文语气和格式要求
+topK: 6
+[/TOOL_CALL]
+- 结果会同时包含来源范围（workspace/global/profile/daily/sessions）与路径摘要。
+- **不要**用 knowledge_search 代替 workspace_read：knowledge_search 适合语义检索，workspace_read 适合确定性读取具体文件。
 
 ## 1. replace - 精准替换（Word 文档专用）
 当用户要求修改、替换、更正 **Word 文档** 中的特定内容时使用。
@@ -2887,6 +2552,35 @@ pptxPath: PPTX 文件路径（从上下文获取）
 用户框选某区域并说"把这里的颜色改成蓝色"
 → mode="partial_edit", feedback="把这里的颜色改成蓝色"
 
+## 9. ppt_text_edit - 图片页文字框识别与定点改字
+
+当当前文件是 image-only PPT，且用户的意图是“把图上的某几个字改掉”，优先使用此工具，而不是整页重做。
+
+### 适用场景
+- 改标题中的某个词
+- 改页脚日期、名字、数字
+- 改表格单元格里的文案
+- 改图片页中的单处或多处文字，但不希望重生成整页
+
+### 调用参数
+[TOOL_CALL] ppt_text_edit
+pptxPath: PPTX 文件路径
+pageNumber: 页码（从1开始）
+edits: [
+  {
+    "boxId": "识别出的文字框ID",
+    "fromText": "原文",
+    "toText": "新文案",
+    "styleMode": "preserve"
+  }
+]
+[/TOOL_CALL]
+
+### 规则
+- 优先保留原位置、字号、颜色和对齐
+- 如果是整页视觉风格重做，仍然使用 \`ppt_edit\`
+- 如果目标区域不是文字而是背景/图形，也仍然使用 \`ppt_edit\`
+
 </available_tools>
 
 <workflow>
@@ -3000,20 +2694,47 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
 - 用户要求“返回修改后的完整文档内容”时：直接返回最终内容（Markdown）
 - 其它情况：给出简洁、可直接复制使用的答案`
 
-  const streamFallbackContent = async (content: string, signal: AbortSignal) => {
-    if (!content) return
-    const total = content.length
-    const chunkSize = total > 4000 ? 120 : total > 1500 ? 60 : total > 400 ? 30 : 12
-    const delay = 24
-    for (let i = 0; i < total; i += chunkSize) {
-      if (signal.aborted) break
-      setStreamingContent(content.slice(0, i + chunkSize))
-      await new Promise(resolve => setTimeout(resolve, delay))
-    }
-  }
+  const composedAgentSystemPrompt = useMemo(() => {
+    const shouldPreferNativeTooling =
+      shouldUseNativeTooling
 
-  // 单次 API 调用
-  const callAPI = async (
+    return systemPromptComposer.compose({
+      basePrompt: shouldPreferNativeTooling
+        ? sanitizeAgentPromptForNativeTooling(agentSystemPrompt)
+        : agentSystemPrompt,
+    })
+  }, [agentSystemPrompt, shouldUseNativeTooling, systemPromptComposer])
+
+  const composedEditorSystemPrompt = useMemo(() => {
+    return systemPromptComposer.compose({
+      basePrompt: editorSystemPrompt,
+      includeAttachmentProtocol: true,
+    })
+  }, [editorSystemPrompt, systemPromptComposer])
+
+  const assembleTurnContext = useCallback((params: {
+    userInput: string
+    skillDescriptions?: string
+    activeSkill?: Record<string, unknown>
+    availableToolsDelta?: Record<string, unknown>
+    documentContext?: string
+    filesContext?: string
+    relevantMemories?: string
+    workspaceProfile?: string
+  }) => {
+    return contextAssembler.assembleAgentContext({
+      userInput: params.userInput,
+      skillDescriptions: params.skillDescriptions,
+      activeSkill: params.activeSkill,
+      availableToolsDelta: params.availableToolsDelta,
+      documentContext: params.documentContext,
+      filesContext: params.filesContext,
+      relevantMemories: params.relevantMemories,
+      workspaceProfile: params.workspaceProfile,
+    })
+  }, [contextAssembler])
+
+  const callAPI = useCallback(async (
     allMessages: Array<{ role: string; content: MessageContent }>,
     signal: AbortSignal,
     options?: {
@@ -3022,260 +2743,29 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
       onToolCallPreview?: (tool: string, args: Record<string, string>) => void
       maxToolCallPreviews?: number
       onResponseFinal?: (payload: { raw: string; cleaned: string }) => void
+      nativeTools?: unknown[]
     }
-  ): Promise<string> => {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    }
-    if (settings.apiKey) {
-      headers['Authorization'] = `Bearer ${settings.apiKey}`
-    }
-
-    // Electron 环境：优先走主进程代理（Node fetch/HTTP1.1），避免渲染进程 HTTP/2 的 ERR_HTTP2_PING_FAILED
-    const toolPreviewState = {
-      emitted: new Set<string>(),
-      startedSignatures: new Set<string>(),
-    }
-
-    if (window.electronAPI?.isElectron && window.electronAPI.aiChatCompletions && window.electronAPI.onAIStreamDelta) {
-      const requestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
-      let fullContent = ''
-      let fullReasoning = ''  // 思考内容（kimi-k2.5 等思考模型）
-      let contentDeltaCount = 0
-      
-      // 清空之前的思考内容
-      setStreamingReasoning('')
-
-      const unsubscribe = window.electronAPI.onAIStreamDelta((payload) => {
-        if (!payload || payload.requestId !== requestId) return
-        
-        // 处理内容增量
-        const delta = payload.delta || ''
-        if (delta) {
-          contentDeltaCount += 1
-          fullContent += delta
-          emitToolCallStartFromRaw(fullContent, toolPreviewState, options?.onToolCallStart, options?.maxToolCallPreviews)
-          emitToolCallPreviewFromRaw(fullContent, toolPreviewState, options?.onToolCallPreview, options?.maxToolCallPreviews)
-          // ?????? <think> ????????
-          const { thinking, cleaned } = extractThinking(fullContent)
-          if (thinking && thinking !== fullReasoning) {
-            fullReasoning = thinking
-            setStreamingReasoning(fullReasoning)
-          }
-          const parsed = parseAssistantOutput(cleaned)
-          if (parsed.summary) setStreamingSummary(parsed.summary)
-          if (parsed.phase === 'editing') setEditPhase('editing')
-          if (parsed.phase === 'done') setEditPhase('done')
-          const safeDisplay = trimTrailingOpenToolCallBlock(parsed.displayText)
-          setStreamingContent(streamPrefixRef.current + safeDisplay)
-        }
-        
-        // 处理思考增量（kimi-k2.5 等思考模型 - 通过单独字段返回）
-        const reasoningDelta = (payload as { reasoningDelta?: string }).reasoningDelta || ''
-        if (reasoningDelta) {
-          fullReasoning += reasoningDelta
-          setStreamingReasoning(fullReasoning)
-        }
-
-      })
-
-      const abortHandler = () => {
-        try {
-          window.electronAPI?.aiCancel?.(requestId)
-        } catch {
-          // ignore
-        }
-      }
-
-      signal.addEventListener('abort', abortHandler, { once: true })
-
-      try {
-        // kimi-k2.5 模型只支持 temperature=1，自动修正
-        const effectiveTemperature = settings.model.toLowerCase().includes('kimi-k2') ? 1 : settings.temperature
-        
-        const result = await window.electronAPI.aiChatCompletions({
-          requestId,
-          baseUrl: settings.baseUrl,
-          apiKey: settings.apiKey,
-          model: settings.model,
-          messages: allMessages,
-          temperature: effectiveTemperature,
-          maxTokens: settings.maxTokens,
-        })
-
-        if (!result?.success) {
-          throw new Error(result?.error || '请求失败')
-        }
-
-        const content = result.content || fullContent
-        emitToolCallStartFromRaw(content, toolPreviewState, options?.onToolCallStart, options?.maxToolCallPreviews)
-        emitToolCallPreviewFromRaw(content, toolPreviewState, options?.onToolCallPreview, options?.maxToolCallPreviews)
-        const cleaned = cleanModelOutput(content)
-        try {
-          options?.onResponseFinal?.({ raw: content, cleaned })
-        } catch {
-          // ignore callback errors
-        }
-        const parsed = parseAssistantOutput(cleaned)
-        const displayText = parsed.displayText || parsed.summary || cleaned
-        if (parsed.summary) setStreamingSummary(parsed.summary)
-        if (parsed.phase === 'editing') setEditPhase('editing')
-        if (parsed.phase === 'done') setEditPhase('done')
-        if (contentDeltaCount === 0 && displayText) {
-          await streamFallbackContent(displayText, signal)
-        }
-        return options?.returnRaw ? cleaned : displayText
-      } finally {
-        try {
-          unsubscribe?.()
-        } catch {
-          // ignore
-        }
-      }
-    }
-
-    // kimi-k2.5 模型只支持 temperature=1，自动修正
-    const effectiveTemperature = settings.model.toLowerCase().includes('kimi-k2') ? 1 : settings.temperature
-
-    const response = await fetch(`${settings.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers,
+  ) => {
+    return callLegacyModelGateway({
+      settings,
+      allMessages,
       signal,
-      body: JSON.stringify({
-        model: settings.model,
-        messages: allMessages,
-        temperature: effectiveTemperature,
-        max_tokens: settings.maxTokens,
-        stream: true,
-      }),
+      streamPrefixRef,
+      setStreamingContent,
+      setStreamingReasoning,
+      setStreamingSummary,
+      setEditPhase,
+      options,
     })
+  }, [settings])
 
-    if (!response.ok) {
-      const errorText = await response.text()
-      throw new Error(errorText || '请求失败')
-    }
-
-    const reader = response.body?.getReader()
-    if (!reader) throw new Error('无法读取响应')
-
-    const decoder = new TextDecoder()
-    let fullContent = ''
-    let fullReasoning = ''  // 存储完整的思考过程
-    let buffer = ''
-    
-    // 清空之前的思考内容
-    setStreamingReasoning('')
-    
-    // 读取超时包装函数
-    const readWithTimeout = async (timeoutMs: number) => {
-      const timeoutPromise = new Promise<{ done: true; value: undefined }>((_, reject) => {
-        setTimeout(() => reject(new Error('读取超时')), timeoutMs)
-      })
-      return Promise.race([reader.read(), timeoutPromise])
-    }
-
-    const READ_TIMEOUT = 60000 // 60秒读取超时
-
-    while (true) {
-      let result
-      try {
-        result = await readWithTimeout(READ_TIMEOUT)
-      } catch (e) {
-        console.warn('[API] 流响应读取超时，返回已有内容')
-        break
-      }
-      
-      const { done, value } = result
-      if (done) break
-
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || ''
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6).trim()
-          if (data === '[DONE]') continue
-
-          try {
-            const json = JSON.parse(data)
-            const choice = json.choices?.[0] || {}
-            const delta = choice?.delta || {}
-            const message = choice?.message || {}
-            
-            // 调试：首次收到 delta 时打印结构，便于确认 kimi-k2.5 等模型的字段名
-            if (delta && !fullContent && !fullReasoning) {
-              console.log('[AI stream] delta keys:', Object.keys(delta || {}), 'sample:', JSON.stringify(delta).slice(0, 300))
-            }
-            
-            // 处理思考内容（kimi-k2.5 等思考模型）- 尝试多种字段名
-            const reasoningDelta = delta?.reasoning_content || delta?.thinking_content || delta?.reasoning || delta?.thinking || delta?.thought || message?.reasoning_content || json?.reasoning_content || ''
-            if (reasoningDelta) {
-              fullReasoning += reasoningDelta
-              setStreamingReasoning(fullReasoning)
-            }
-            
-            // 处理正常内容
-            let contentDelta = delta?.content || delta?.text || ''
-            if (!contentDelta) {
-              const messageContent = extractStreamText(message?.content ?? message?.text)
-              if (messageContent) {
-                contentDelta = messageContent
-              } else if (choice?.text) {
-                contentDelta = choice.text
-              }
-            }
-            if (contentDelta && fullContent && contentDelta.startsWith(fullContent)) {
-              contentDelta = contentDelta.slice(fullContent.length)
-            }
-            if (contentDelta) {
-              fullContent += contentDelta
-              emitToolCallStartFromRaw(fullContent, toolPreviewState, options?.onToolCallStart, options?.maxToolCallPreviews)
-              emitToolCallPreviewFromRaw(fullContent, toolPreviewState, options?.onToolCallPreview, options?.maxToolCallPreviews)
-              // ?????? <think> ????????
-              const { thinking, cleaned } = extractThinking(fullContent)
-              if (thinking && thinking !== fullReasoning) {
-                fullReasoning = thinking
-                setStreamingReasoning(fullReasoning)
-              }
-              const parsed = parseAssistantOutput(cleaned)
-              if (parsed.summary) setStreamingSummary(parsed.summary)
-              if (parsed.phase === 'editing') setEditPhase('editing')
-              if (parsed.phase === 'done') setEditPhase('done')
-              const safeDisplay2 = trimTrailingOpenToolCallBlock(parsed.displayText)
-              setStreamingContent(streamPrefixRef.current + safeDisplay2)
-            }
-          } catch {
-            // 忽略解析错误
-          }
-        }
-      }
-    }
-
-    emitToolCallStartFromRaw(fullContent, toolPreviewState, options?.onToolCallStart, options?.maxToolCallPreviews)
-    emitToolCallPreviewFromRaw(fullContent, toolPreviewState, options?.onToolCallPreview, options?.maxToolCallPreviews)
-    const cleaned = cleanModelOutput(fullContent)
-    try {
-      options?.onResponseFinal?.({ raw: fullContent, cleaned })
-    } catch {
-      // ignore callback errors
-    }
-    const parsed = parseAssistantOutput(cleaned)
-    if (parsed.summary) setStreamingSummary(parsed.summary)
-    if (parsed.phase === 'editing') setEditPhase('editing')
-    if (parsed.phase === 'done') setEditPhase('done')
-    const displayText = parsed.displayText || parsed.summary || cleaned
-    return options?.returnRaw ? cleaned : displayText
-  }
-
-  // 传统单轮消息（不走 Agent 工具循环）
   const sendMessage = useCallback(async (
     content: string,
     documentContext?: string
   ): Promise<string> => {
     setIsLoading(true)
     setStreamingContent('')
-    setStreamingReasoning('')  // 清空思考内容
+    setStreamingReasoning('')
     setEditPhase('idle')
     setStreamingSummary('')
 
@@ -3285,30 +2775,41 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
     abortControllerRef.current = new AbortController()
 
     try {
-      let userContent = content
-      if (documentContext) {
-        userContent += `\n\n[当前文档内容]\n${documentContext}`
-      }
+      const assembled = assembleTurnContext({
+        userInput: content,
+        documentContext,
+      })
+      sessionEngineRef.current.setPendingAttachmentTypes(
+        assembled.attachments.map((attachment) => attachment.type),
+      )
+
       const resp = await callAPI(
         [
-          { role: 'system', content: editorSystemPrompt },
-          { role: 'user', content: userContent },
+          { role: 'system', content: composedEditorSystemPrompt },
+          { role: 'user', content: assembled.userContent },
         ],
-        abortControllerRef.current.signal
+        abortControllerRef.current.signal,
       )
-      return resp
+      return resp.displayText
     } finally {
+      sessionEngineRef.current.setPendingAttachmentTypes([])
       setIsLoading(false)
     }
-  }, [callAPI, editorSystemPrompt])
+  }, [assembleTurnContext, callAPI, composedEditorSystemPrompt])
 
-  // Agent 消息发送 - 支持工具调用循环
   const sendAgentMessage = useCallback(async (
     content: string,
     documentContext?: string,
     filesContext?: string,
     callbacks?: AgentCallbacks,
-    memoryContext?: { workspaceKey?: string; workspaceSummary?: string },
+    memoryContext?: {
+      workspaceKey?: string
+      workspaceSummary?: string
+      workspaceProfile?: string
+      skillDescriptions?: string
+      activeSkill?: Record<string, unknown>
+      availableToolsDelta?: Record<string, unknown>
+    },
     images?: string[]
   ): Promise<void> => {
     setIsLoading(true)
@@ -3322,10 +2823,15 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
     }
     abortControllerRef.current = new AbortController()
 
-    const allToolResults: ToolResult[] = []
+    let allToolResults: ToolResult[] = []
     const conversationMessages: Array<{ role: string; content: MessageContent }> = []
-    const turnId = `turn-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    const turnId = createAgentTurnId()
     let iteration = 0
+    let accumulatedReasoningForTurn = ''
+    let finalContentForMemory = ''
+    let retrievedKnowledgeResults: KnowledgeSearchResult[] = []
+
+    sessionEngineRef.current.setCurrentTurnId(turnId)
 
     // ─── 工具调用日志：启动会话 ───
     toolCallLogger.startSession()
@@ -3340,25 +2846,39 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
     }
 
     try {
-      // 构建初始用户消息
-      let userContent = content
-      if (documentContext) {
-        userContent += `\n\n[当前文档内容]\n${documentContext}`
-      }
-      if (filesContext) {
-        userContent += `\n\n[附加文件内容]\n${filesContext}`
-      }
+      let relevantMemoryText = ''
 
       const memoryEnabled = settings.memoryEnabled !== false
       const memoryTopK = Math.max(1, settings.memoryTopK || 5)
       const memoryMaxChars = Math.max(500, settings.memoryMaxChars || 2000)
       const memoryTextWeight = typeof settings.memoryTextWeight === 'number' ? settings.memoryTextWeight : 0.6
       const memoryVectorWeight = typeof settings.memoryVectorWeight === 'number' ? settings.memoryVectorWeight : 0.4
+      const knowledgeEnabled = settings.knowledgeEnabled !== false
+      const knowledgeTopK = Math.max(4, settings.knowledgeTopK || 8)
       const workspaceKey = memoryContext?.workspaceKey || ''
 
-      if (memoryEnabled && window.electronAPI?.memorySearch && content.trim().length >= 6) {
+      if (knowledgeEnabled && window.electronAPI?.knowledgeRetrieve && content.trim().length >= 6) {
         try {
-              const memoryResp = await memorySearch({
+          const knowledgeResp = await knowledgeRetrieve({
+            query: content,
+            topK: knowledgeTopK,
+          })
+          if (knowledgeResp.success && knowledgeResp.results.length > 0) {
+            retrievedKnowledgeResults = knowledgeResp.results
+            const memoryBlock = formatKnowledgeResults(
+              knowledgeResp.results,
+              memoryMaxChars
+            )
+            if (memoryBlock) {
+              relevantMemoryText = memoryBlock
+            }
+          }
+        } catch {
+          // ignore knowledge failures
+        }
+      } else if (memoryEnabled && window.electronAPI?.memorySearch && content.trim().length >= 6) {
+        try {
+          const memoryResp = await memorySearch({
             query: content,
             topK: memoryTopK,
             textWeight: memoryTextWeight,
@@ -3366,12 +2886,9 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
             workspaceKey,
           })
           if (memoryResp.success && memoryResp.results.length > 0) {
-            const memoryBlock = formatMemoryResults(
-              memoryResp.results,
-              memoryMaxChars
-            )
+            const memoryBlock = formatMemoryResults(memoryResp.results, memoryMaxChars)
             if (memoryBlock) {
-              userContent += `\n\n[记忆检索]\n${memoryBlock}`
+              relevantMemoryText = memoryBlock
             }
           }
         } catch {
@@ -3407,7 +2924,11 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
         const flushThreshold = Math.max(2000, settings.memoryFlushThresholdChars || 12000)
         const now = Date.now()
         if (now - lastMemoryFlushAtRef.current > 60_000) {
-          const approxChars = recentMessages.reduce((sum, m) => sum + m.content.length, 0) + userContent.length
+          const approxChars = recentMessages.reduce((sum, m) => sum + m.content.length, 0)
+            + content.length
+            + (documentContext?.length || 0)
+            + (filesContext?.length || 0)
+            + relevantMemoryText.length
           if (approxChars > flushThreshold) {
             const summary = buildMemoryFlushText(recentMessages, content)
             if (summary) {
@@ -3427,15 +2948,28 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
                 // ignore memory failures
               }
             }
+            }
           }
         }
-      }
 
-      // 初始化对话 — 如果有图片则使用 OpenAI 多模态 content 数组格式
-      let userMessageContent: MessageContent = userContent
+      const assembled = assembleTurnContext({
+        userInput: content,
+        skillDescriptions: memoryContext?.skillDescriptions,
+        activeSkill: memoryContext?.activeSkill,
+        availableToolsDelta: memoryContext?.availableToolsDelta,
+        documentContext,
+        filesContext,
+        relevantMemories: relevantMemoryText || undefined,
+        workspaceProfile: memoryContext?.workspaceProfile,
+      })
+      sessionEngineRef.current.setPendingAttachmentTypes(
+        assembled.attachments.map((attachment) => attachment.type),
+      )
+
+      let userMessageContent: MessageContent = assembled.userContent
       if (images && images.length > 0) {
         const contentParts: Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }> = [
-          { type: 'text', text: userContent }
+          { type: 'text', text: assembled.userContent }
         ]
         for (const imgUrl of images) {
           contentParts.push({ type: 'image_url', image_url: { url: imgUrl } })
@@ -3443,8 +2977,16 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
         userMessageContent = contentParts
       }
 
+      const nativeToolsForTurn =
+        callbacks?.onToolCall && shouldUseNativeTooling
+          ? nativeTooling.tools
+          : undefined
+
       conversationMessages.push(
-        { role: 'system', content: agentSystemPrompt },
+        { role: 'system', content: composedAgentSystemPrompt },
+        ...(nativeToolsForTurn
+          ? [{ role: 'system', content: nativeTooling.systemPrompt as MessageContent }]
+          : []),
         ...recentMessages,
         { role: 'user', content: userMessageContent }
       )
@@ -3460,488 +3002,62 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
       toolCallLogger.logApiRequest({
         model: settings.model,
         messageCount: conversationMessages.length,
-        systemPromptLength: agentSystemPrompt.length,
+        systemPromptLength: composedAgentSystemPrompt.length,
         temperature: settings.temperature,
         maxTokens: settings.maxTokens,
+        nativeToolsCount: nativeToolsForTurn?.length || 0,
+        nativeToolProvider: nativeToolsForTurn ? nativeTooling.provider : undefined,
       })
 
-      let maxIterations = 20 // 防止无限循环，增加到20次以支持复杂任务
-      let accumulatedContent = '' // 累积所有响应中的文本内容
-      let latestSummary = '' // 解析到的最新总结
-      let lastResponse = ''
-      let finalContentForMemory = ''
-
-      // Track successful edit snippets for in-turn deduplication.
-      const normalizeToolText = (value: string) => (value || '').replace(/\s+/g, ' ').trim()
-      const buildEditKey = (searchText: string, replaceText: string) => `${normalizeToolText(searchText)}=>${normalizeToolText(replaceText)}`
-      const modifiedSearchTexts = new Set<string>() // normalized source snippets processed by replace/review
-      const modifiedReplaceTexts = new Set<string>() // normalized output snippets produced by replace/review
-      const successfulEditPairs = new Set<string>() // normalized search=>replace pairs already succeeded
-
-      let totalReplaceCount = 0 // 总 replace 次数
-      let consecutiveReplaceCount = 0 // 连续 replace 次数
-      const MAX_CONSECUTIVE_REPLACE = 10 // 连续 replace 上限
-      const MAX_TOOL_CALLS_PER_ITERATION = 3 // controlled batching: execute at most three tool calls per round
-      let shouldForceStop = false // force stop flag
-
-      // Cursor 风格：初始化流式累积前缀
-      streamPrefixRef.current = ''
-
-      while (iteration < maxIterations && !shouldForceStop) {
-        iteration++
-        toolCallLogger.setIteration(iteration)
-        
-        // 每轮清空：思考内容 + 流式前缀（文本由 streamItems 管理，前缀只用于当前轮实时显示）
-        setStreamingReasoning('')
-        streamPrefixRef.current = ''
-        setStreamingContent('')
-
-        // 安全过滤：确保没有空 content 的消息（API 会拒绝空消息）
-        for (let i = conversationMessages.length - 1; i >= 0; i--) {
-          const c = conversationMessages[i].content
-          if (Array.isArray(c)) {
-            // 多模态数组格式：只要有元素就算非空
-            if (c.length === 0) conversationMessages[i].content = '[空]'
-          } else if (!c || !c.trim()) {
-            conversationMessages[i].content = '[空]'
+      const loopResult = await runLegacyAgentLoop({
+        conversationMessages,
+        signal: abortControllerRef.current.signal,
+        turnId,
+        callbacks,
+        callModel: (allMessages, signal, options) =>
+          callAPI(allMessages, signal, {
+            ...options,
+            nativeTools: nativeToolsForTurn,
+          }),
+        emitDebugEvent,
+        streamPrefixRef,
+        setStreamingContent,
+        getStreamingReasoning: () => streamingReasoningRef.current,
+        parseAssistantOutput: (responseText) => {
+          const parsed = parseAssistantOutput(responseText)
+          if (parsed.summary) {
+            setStreamingSummary(parsed.summary)
           }
-        }
-
-        // 调用 API（streaming 会通过 streamPrefixRef 累积输出，实时更新 UI）
-        let rawResponse = ''
-        const response = await callAPI(
-          conversationMessages,
-          abortControllerRef.current.signal,
-          {
-            returnRaw: true,
-            onToolCallStart: callbacks?.onToolCallStart,
-            onToolCallPreview: callbacks?.onToolCallPreview,
-            maxToolCallPreviews: MAX_TOOL_CALLS_PER_ITERATION,
-            onResponseFinal: ({ raw }) => {
-              rawResponse = raw
-            },
+          if (parsed.phase === 'editing') {
+            setEditPhase('editing')
           }
-        )
-        lastResponse = response
-        const responseForDebug = rawResponse || response
-        const responseForToolParsing = responseForDebug || response
-
-        await emitDebugEvent({
-          type: 'api_response_raw',
-          turnId,
-          timestamp: new Date().toISOString(),
-          iteration,
-          stage: 'loop',
-          response,
-          rawResponse: responseForDebug,
-          hasToolCall: hasToolCall(responseForToolParsing),
-        })
-
-        // ?????????
-        if (hasToolCall(responseForToolParsing)) {
-          const parsedToolCalls = parseToolCalls(responseForToolParsing)
-          const toolCalls = parsedToolCalls.slice(0, MAX_TOOL_CALLS_PER_ITERATION)
-          const deferredToolCalls = parsedToolCalls.slice(MAX_TOOL_CALLS_PER_ITERATION)
-
-          // ─── 工具调用日志：解析出的工具调用 ───
-          toolCallLogger.logToolCallsParsed(
-            parsedToolCalls.map(c => ({ tool: c.tool, args: { ...c.args } }))
-          )
-
-          await emitDebugEvent({
-            type: 'tool_calls_parsed',
-            turnId,
-            timestamp: new Date().toISOString(),
-            iteration,
-            calls: parsedToolCalls.map((call) => ({ tool: call.tool, args: { ...call.args } })),
-          })
-
-          if (deferredToolCalls.length > 0) {
-            const deferReason = `deferred by controlled batching policy: max ${MAX_TOOL_CALLS_PER_ITERATION} tool call(s) per iteration`
-            for (const deferredCall of deferredToolCalls) {
-              await emitDebugEvent({
-                type: 'tool_call_skipped',
-                turnId,
-                timestamp: new Date().toISOString(),
-                iteration,
-                tool: deferredCall.tool,
-                args: { ...deferredCall.args },
-                reason: deferReason,
-              })
-              callbacks?.onToolCallSkipped?.(deferredCall.tool, { ...deferredCall.args }, deferReason)
-            }
+          if (parsed.phase === 'done') {
+            setEditPhase('done')
           }
+          return parsed
+        },
+        cleanModelOutput,
+        hasToolCall,
+        parseToolCallsToIR,
+        buildNativeAssistantMessage: (response) =>
+          buildNativeAssistantConversationMessageFromResponse({
+            settings,
+            response,
+          }),
+        buildNativeToolResultMessages: (bindings) =>
+          buildNativeToolResultConversationMessages({
+            settings,
+            bindings,
+          }),
+        buildToolFailureHint,
+        toolLogger: toolCallLogger,
+        yieldAfterToolCall: yieldAfterToolCallFrame,
+      })
 
-          // 提取工具调用之外的文本内容并累积
-          const parsedOutput = parseAssistantOutput(cleanModelOutput(responseForToolParsing))
-          console.log('[Agent] 提取的文本内容:', parsedOutput.displayText?.substring(0, 200))
-          if (parsedOutput.summary) {
-            latestSummary = parsedOutput.summary
-            setStreamingSummary(parsedOutput.summary)
-          }
-          
-          // 将本轮 AI 的文本推送给 ChatPanel（交替渲染用）并累积到前缀
-          const thisRoundText = parsedOutput.displayText || ''
-          if (thisRoundText) {
-            callbacks?.onTextChunk?.(thisRoundText)
-            accumulatedContent = thisRoundText
-            // 文本已推送到 streamItems，清空前缀让流式框只显示正在生成的新内容
-            streamPrefixRef.current = ''
-            setStreamingContent('')
-          }
-          
-          // 将 AI 响应添加到对话
-          conversationMessages.push({ role: 'assistant', content: responseForToolParsing })
-
-          // 执行每个工具调用
-          const results: string[] = []
-          let allSuccessful = true
-          let hasReplaceInThisBatch = false
-          let skippedCount = 0
-          
-          for (let ti = 0; ti < toolCalls.length; ti++) {
-            const call = toolCalls[ti]
-            
-            const isEditTool = call.tool === 'replace' || call.tool === 'review'
-            if (call.tool === 'replace') {
-              hasReplaceInThisBatch = true
-            }
-
-            if (isEditTool) {
-              const rawSearchText = call.args.search || ''
-              const rawReplaceText = call.args.replace || ''
-              const searchText = normalizeToolText(rawSearchText)
-              const pairKey = buildEditKey(rawSearchText, rawReplaceText)
-
-              // 1) Skip exact duplicate search+replace pairs in the same turn.
-              if (successfulEditPairs.has(pairKey)) {
-                console.warn(`[Agent] skip duplicate ${call.tool}: same search/replace already succeeded`)
-                toolCallLogger.logToolCallSkipped(call.tool, 'duplicate search/replace pair', { ...call.args })
-                results.push(`[TOOL_RESULT]\ntool: ${call.tool}\nstatus: skipped - duplicate search/replace pair in this turn\n[/TOOL_RESULT]`)
-                skippedCount++
-                await emitDebugEvent({
-                  type: 'tool_call_skipped',
-                  turnId,
-                  timestamp: new Date().toISOString(),
-                  iteration,
-                  tool: call.tool,
-                  args: { ...call.args },
-                  reason: 'duplicate search/replace pair in this turn',
-                })
-                callbacks?.onToolCallSkipped?.(call.tool, { ...call.args }, 'duplicate search/replace pair in this turn')
-                continue
-              }
-
-              // 2) Skip attempts to edit text that was produced by previous edits.
-              if (searchText && modifiedReplaceTexts.has(searchText)) {
-                console.warn(`[Agent] skip duplicate ${call.tool}: search hits text already produced earlier in this turn`)
-                toolCallLogger.logToolCallSkipped(call.tool, 'search hits text already produced', { ...call.args })
-                results.push(`[TOOL_RESULT]\ntool: ${call.tool}\nstatus: skipped - search text has already been produced by an earlier edit\n[/TOOL_RESULT]`)
-                skippedCount++
-                await emitDebugEvent({
-                  type: 'tool_call_skipped',
-                  turnId,
-                  timestamp: new Date().toISOString(),
-                  iteration,
-                  tool: call.tool,
-                  args: { ...call.args },
-                  reason: 'search text has already been produced by an earlier edit in this turn',
-                })
-                callbacks?.onToolCallSkipped?.(call.tool, { ...call.args }, 'search text has already been produced by an earlier edit in this turn')
-                continue
-              }
-
-              // 3) Skip repeated processing of the same source text in one turn.
-              if (searchText && modifiedSearchTexts.has(searchText)) {
-                console.warn(`[Agent] skip duplicate ${call.tool}: original search text already processed`)
-                toolCallLogger.logToolCallSkipped(call.tool, 'original search text already processed', { ...call.args })
-                results.push(`[TOOL_RESULT]\ntool: ${call.tool}\nstatus: skipped - original search text has already been processed in this turn\n[/TOOL_RESULT]`)
-                skippedCount++
-                await emitDebugEvent({
-                  type: 'tool_call_skipped',
-                  turnId,
-                  timestamp: new Date().toISOString(),
-                  iteration,
-                  tool: call.tool,
-                  args: { ...call.args },
-                  reason: 'original search text has already been processed in this turn',
-                })
-                callbacks?.onToolCallSkipped?.(call.tool, { ...call.args }, 'original search text has already been processed in this turn')
-                continue
-              }
-            }
-
-            if (callbacks?.onToolCall) {
-              // 工具卡片由 ChatPanel 的 toolActivity 状态驱动，不再写入 streamPrefixRef
-              // ─── 工具调用日志：执行开始 ───
-              toolCallLogger.logToolExecStart(call.tool, { ...call.args })
-              const execStartTime = Date.now()
-
-              const result = await callbacks.onToolCall(call.tool, call.args)
-              allToolResults.push(result)
-              if (!result.success) allSuccessful = false
-
-              // 每个工具执行后让出一帧，确保 React 渲染中间状态（create 后能看到文档，insert 后能看到新内容）
-              await new Promise(resolve => requestAnimationFrame(resolve))
-
-              // ─── 工具调用日志：执行结果 ───
-              toolCallLogger.logToolExecResult(call.tool, result, Date.now() - execStartTime)
-
-              await emitDebugEvent({
-                type: 'tool_result',
-                turnId,
-                timestamp: new Date().toISOString(),
-                iteration,
-                index: ti + 1,
-                total: toolCalls.length,
-                tool: call.tool,
-                args: { ...call.args },
-                result,
-              })
-              
-              // Track successful replace/review edits for in-turn dedup.
-              if ((call.tool === 'replace' || call.tool === 'review') && result.success) {
-                const rawSearchText = call.args.search || ''
-                const rawReplaceText = call.args.replace || ''
-                const searchText = normalizeToolText(rawSearchText)
-                const replaceText = normalizeToolText(rawReplaceText)
-
-                if (searchText) modifiedSearchTexts.add(searchText)
-                if (replaceText) modifiedReplaceTexts.add(replaceText)
-                successfulEditPairs.add(buildEditKey(rawSearchText, rawReplaceText))
-
-                if (call.tool === 'replace') {
-                  totalReplaceCount++
-                  console.log(`[Agent] edit recorded #${totalReplaceCount}: "${searchText.substring(0, 30)}..." -> "${replaceText.substring(0, 30)}..."`)
-                }
-              }
-
-              // Build clearer tool feedback, including contextual failure hints.
-              let failureHint = ''
-              if (!result.success && callbacks?.getLatestDocument && (call.tool === 'replace' || call.tool === 'review')) {
-                try {
-                  const latestDoc = callbacks.getLatestDocument()
-                  failureHint = buildToolFailureHint(latestDoc || '', call.args.search || '')
-                } catch (hintErr) {
-                  console.warn('[Agent] failed to build tool hint:', hintErr)
-                }
-              }
-
-              const statusText = result.success
-                ? 'success'
-                : `failed: ${result.message}${failureHint ? `\n${failureHint}` : ''}`
-
-              const progressInfo = call.tool === 'replace' && result.success
-                ? `\ncompleted replacements: ${totalReplaceCount}`
-                : ''
-
-              results.push(`[TOOL_RESULT]\ntool: ${call.tool}\nstatus: ${statusText}${progressInfo}\n[/TOOL_RESULT]`)
-            }
-          }
-          
-          // 【连续计数】检测连续 replace 调用
-          if (hasReplaceInThisBatch) {
-            consecutiveReplaceCount++
-            console.log(`[Agent] 连续 replace 次数: ${consecutiveReplaceCount}/${MAX_CONSECUTIVE_REPLACE}`)
-            
-            if (consecutiveReplaceCount >= MAX_CONSECUTIVE_REPLACE) {
-              console.warn(`[Agent] 检测到连续 ${MAX_CONSECUTIVE_REPLACE} 次 replace，强制结束循环`)
-              shouldForceStop = true
-              
-              // 添加强制停止的提示
-              results.push(`\n[系统警告] 已达到连续修改上限 (${MAX_CONSECUTIVE_REPLACE} 次)，请立即停止工具调用并总结已完成的修改。`)
-            }
-          } else {
-            consecutiveReplaceCount = 0 // 重置连续计数
-          }
-          
-          // 如果所有调用都被跳过，提示 AI 任务已完成
-          if (skippedCount > 0 && skippedCount === toolCalls.length) {
-            results.push(`\n[系统提示] 所有修改请求都已被跳过（内容已修改过）。任务应该已经完成，请直接回复总结。`)
-            shouldForceStop = true
-          }
-
-          if (deferredToolCalls.length > 0) {
-            results.push(`
-[SYSTEM] This round executed ${toolCalls.length} tool call(s) under controlled batching. ${deferredToolCalls.length} deferred call(s) should be reconsidered in the next round based on latest results.`)
-          }
-
-          // Add tool results into conversation, then let model choose: continue tooling or finish.
-          let completionHint = ''
-          if (allSuccessful && toolCalls.length > 0 && !shouldForceStop) {
-            completionHint = `
-
-[SYSTEM] Tool calls finished for this round. If further edits are required, emit next [TOOL_CALL]. If done, provide a brief final summary.`
-          }
-
-          const toolResultContent = (results.join('\n\n') + completionHint).trim()
-          conversationMessages.push({
-            role: 'user',
-            content: toolResultContent || '[Tool calls completed with no extra output]'
-          })
-
-          // ─── 工具调用日志：发回模型的工具结果 ───
-          toolCallLogger.logToolResultsSent(results, totalReplaceCount)
-
-          if (shouldForceStop) {
-            const forcedStopContent = parsedOutput.summary || parsedOutput.displayText || 'Tool loop stopped by safety guard.'
-            finalContentForMemory = forcedStopContent
-
-            await emitDebugEvent({
-              type: 'final_summary',
-              turnId,
-              timestamp: new Date().toISOString(),
-              iteration,
-              source: 'forced_stop',
-              content: forcedStopContent,
-            })
-
-            await emitDebugEvent({
-              type: 'turn_complete',
-              turnId,
-              timestamp: new Date().toISOString(),
-              totalIterations: iteration,
-              finalContent: forcedStopContent,
-              toolResults: allToolResults.map((item) => ({ ...item })),
-            })
-
-            // ─── 工具调用日志：强制停止 ───
-            toolCallLogger.logTurnComplete({
-              totalIterations: iteration,
-              totalToolCalls: allToolResults.length,
-              totalSkipped: skippedCount,
-              stopReason: 'forced_stop',
-              finalResponseLength: forcedStopContent.length,
-            })
-
-            callbacks?.onContent?.(forcedStopContent)
-            callbacks?.onComplete?.(forcedStopContent, allToolResults)
-            break
-          }
-
-          // Continue loop: model can emit more tool calls or decide to finish.
-          continue
-        }
-
-        // 截断检测：[TOOL_CALL] 数量 > [/TOOL_CALL] 数量，说明最后一个被 max_tokens 截断了
-        const openCount = (responseForToolParsing.match(/\[TOOL_CALL\]/g) || []).length
-        const closeCount = (responseForToolParsing.match(/\[\/TOOL_CALL\]/g) || []).length
-        const hasOpenToolCall = openCount > 0 && openCount > closeCount
-        const hasOpenLegacyTag = (() => {
-          if (!responseForToolParsing.includes('<')) return false
-          const lowered = responseForToolParsing.toLowerCase()
-          if (lowered.includes('<tool_use>') && !lowered.includes('</tool_use>')) return true
-          for (const tool of LEGACY_XML_TOOL_NAMES) {
-            if (lowered.includes(`<${tool}>`) && !lowered.includes(`</${tool}>`)) return true
-          }
-          return false
-        })()
-
-        if (hasOpenToolCall || hasOpenLegacyTag) {
-          console.warn('[Agent] 检测到工具调用被截断（max_tokens），请求 AI 继续输出')
-          // 把截断的响应加入对话，让 AI 从断点继续
-          conversationMessages.push({ role: 'assistant', content: responseForToolParsing })
-          conversationMessages.push({
-            role: 'user',
-            content: '[SYSTEM] Your previous response was truncated mid-tool-call. Please continue from where you left off — complete the [TOOL_CALL]...[/TOOL_CALL] block.'
-          })
-          continue
-        }
-
-        // 无工具调用的最终响应
-        console.log('[Agent] 最终响应:', responseForToolParsing?.substring(0, 200))
-        console.log('[Agent] 累积内容:', accumulatedContent?.substring(0, 200))
-        const parsedFinal = parseAssistantOutput(cleanModelOutput(responseForToolParsing))
-        if (parsedFinal.summary) {
-          latestSummary = parsedFinal.summary
-          setStreamingSummary(parsedFinal.summary)
-        }
-
-        const finalText = parsedFinal.summary || parsedFinal.displayText || ''
-
-        // Finalize when assistant stops emitting tool calls.
-        // Push final cleaned text to ChatPanel
-        if (finalText) {
-          callbacks?.onTextChunk?.(finalText)
-        }
-        console.log('[Agent] final response:', finalText?.substring(0, 200))
-        finalContentForMemory = finalText // summary saved to memory
-
-        await emitDebugEvent({
-          type: 'final_summary',
-          turnId,
-          timestamp: new Date().toISOString(),
-          iteration,
-          source: 'normal',
-          content: finalText,
-        })
-
-        await emitDebugEvent({
-          type: 'turn_complete',
-          turnId,
-          timestamp: new Date().toISOString(),
-          totalIterations: iteration,
-          finalContent: finalText,
-          toolResults: allToolResults.map((item) => ({ ...item })),
-        })
-
-        // ─── 工具调用日志：正常结束 ───
-        toolCallLogger.logTurnComplete({
-          totalIterations: iteration,
-          totalToolCalls: allToolResults.length,
-          totalSkipped: 0,
-          stopReason: 'normal',
-          finalResponseLength: finalText.length,
-        })
-
-        callbacks?.onContent?.(finalText)
-        callbacks?.onComplete?.(finalText, allToolResults)
-        break
-      }
-
-      // Ensure onComplete is still called when max iterations is reached
-      if (iteration >= maxIterations) {
-        console.warn(`[Agent] reached max iterations ${maxIterations}, forcing stop`)
-        console.log('[Agent] accumulated content:', accumulatedContent?.substring(0, 200))
-        console.log('[Agent] last response:', lastResponse?.substring(0, 200))
-        // Keep accumulated steps in the final fallback content
-        const maxIterSummary = latestSummary || accumulatedContent || lastResponse || 'Task completed (max iterations reached)'
-        const maxIterSteps = streamPrefixRef.current.trim()
-        const finalContent = maxIterSteps && maxIterSummary
-          ? maxIterSteps + '\n\n---\n\n' + maxIterSummary
-          : maxIterSummary || maxIterSteps
-        console.log('[Agent] final content:', finalContent?.substring(0, 200))
-        finalContentForMemory = maxIterSummary
-
-        await emitDebugEvent({
-          type: 'final_summary',
-          turnId,
-          timestamp: new Date().toISOString(),
-          iteration,
-          source: 'max_iterations',
-          content: finalContent,
-        })
-
-        await emitDebugEvent({
-          type: 'turn_complete',
-          turnId,
-          timestamp: new Date().toISOString(),
-          totalIterations: iteration,
-          finalContent,
-          toolResults: allToolResults.map((item) => ({ ...item })),
-        })
-
-        // ─── 工具调用日志：max iterations 结束 ───
-        toolCallLogger.logTurnComplete({
-          totalIterations: iteration,
-          totalToolCalls: allToolResults.length,
-          totalSkipped: 0,
-          stopReason: 'max_iterations',
-          finalResponseLength: finalContent?.length || 0,
-        })
-
-        callbacks?.onComplete?.(finalContent, allToolResults)
-      }
+      iteration = loopResult.iteration
+      allToolResults = loopResult.toolResults
+      accumulatedReasoningForTurn = loopResult.accumulatedReasoningForTurn
+      finalContentForMemory = loopResult.finalContentForMemory
 
       if (finalContentForMemory && memoryEnabled && window.electronAPI?.memoryAppend) {
         try {
@@ -3968,6 +3084,18 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
         }
       }
 
+      if (finalContentForMemory) {
+        try {
+          await extractProfileCandidates({
+            userText: cleanMessageForSend(content),
+            assistantText: cleanMessageForSend(finalContentForMemory),
+            knowledgeHits: retrievedKnowledgeResults,
+          })
+        } catch {
+          // ignore profile extraction failures
+        }
+      }
+
     } catch (error) {
       const err = error as Error
       const aborted = err?.name === 'AbortError'
@@ -3989,14 +3117,16 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
       } else {
         console.error('AI request failed:', error)
         toolCallLogger.logError((error as Error).message, { iteration })
-        callbacks?.onComplete?.(`Request failed: ${(error as Error).message}`, allToolResults)
+        callbacks?.onComplete?.(`Request failed: ${(error as Error).message}`, allToolResults, accumulatedReasoningForTurn.trim() || undefined)
       }
     } finally {
+      sessionEngineRef.current.setCurrentTurnId(null)
+      sessionEngineRef.current.setPendingAttachmentTypes([])
       setIsLoading(false)
       setStreamingContent('')
-      streamPrefixRef.current = ''  // 清理流式累积前缀
+      streamPrefixRef.current = ''  // ????????
     }
-  }, [settings, messages])
+  }, [assembleTurnContext, callAPI, composedAgentSystemPrompt, messages, nativeTooling, settings, shouldUseNativeTooling, yieldAfterToolCallFrame])
 
   // Tab 补全功能 - 仅使用本地模型
   const getCompletion = useCallback(async (
@@ -4093,6 +3223,275 @@ ${recentText}
     setIsCompleting(false)
   }, [])
 
+  const getAgentRuntimeSnapshot = useCallback(() => {
+    return sessionEngineRef.current.snapshot()
+  }, [])
+
+  const hasToolCall = useCallback((response: unknown) => {
+    return hasToolCallInResponse({
+      settings,
+      response,
+    })
+  }, [settings])
+
+  const parseToolCallsToIR = useCallback((
+    response: unknown,
+    context?: {
+      turnId?: string
+      metadata?: Record<string, unknown>
+    },
+  ) => {
+    return parseToolCallsToIRFromResponse({
+      settings,
+      response,
+      turnId: context?.turnId,
+      metadata: context?.metadata,
+    })
+  }, [settings])
+
+  const recordRuntimeToolExecution = useCallback((state: import('../agent/tools/ir').ToolExecutionPipelineState) => {
+    sessionEngineRef.current.recordToolExecution(state)
+  }, [])
+
+  const syncRuntimeTools = useCallback((tools: import('../agent/tools/contracts').AgentToolDefinition[]) => {
+    sessionEngineRef.current.syncToolDefinitions(tools)
+    setRuntimeToolVersion((version) => version + 1)
+  }, [])
+
+  const syncRuntimeSkills = useCallback((skills: import('../agent/skills/SkillRegistry').AgentSkillDefinition[]) => {
+    sessionEngineRef.current.syncWorkspaceSkills(skills)
+  }, [])
+
+  const spawnRuntimeSubagent = useCallback((params: {
+    profileId: string
+    label?: string
+    mode?: 'sync' | 'background'
+    parentTurnId?: string | null
+  }) => {
+    return sessionEngineRef.current.spawnSubagent(params)
+  }, [])
+
+  const startRuntimeSubagent = useCallback((subagentId: string) => {
+    return sessionEngineRef.current.startSubagent(subagentId)
+  }, [])
+
+  const completeRuntimeSubagent = useCallback((params: {
+    subagentId: string
+    summary?: string
+    outputPath?: string
+  }) => {
+    return sessionEngineRef.current.completeSubagent(params)
+  }, [])
+
+  const failRuntimeSubagent = useCallback((params: {
+    subagentId: string
+    error: string
+  }) => {
+    return sessionEngineRef.current.failSubagent(params)
+  }, [])
+
+  const cancelRuntimeSubagent = useCallback((subagentId: string) => {
+    return sessionEngineRef.current.cancelSubagent(subagentId)
+  }, [])
+
+  const appendRuntimeSubagentTranscript = useCallback((params: {
+    subagentId: string
+    messages?: import('../agent/core/messageTypes').AgentRuntimeMessage[]
+    toolCalls?: import('../agent/tools/ir').ToolCallIR[]
+    toolProgress?: import('../agent/tools/ir').ToolProgressIR[]
+    toolResults?: import('../agent/tools/ir').ToolResultIR[]
+  }) => {
+    sessionEngineRef.current.appendSubagentTranscript(params)
+  }, [])
+
+  const loadRuntimeSubagentTranscript = useCallback((subagentId: string) => {
+    return sessionEngineRef.current.loadSubagentTranscript(subagentId)
+  }, [])
+
+  const runRuntimeSubagentSession = useCallback(async (params: {
+    content: string
+    systemPrompt?: string
+    documentContext?: string
+    filesContext?: string
+    callbacks?: AgentCallbacks
+    memoryContext?: {
+      workspaceKey?: string
+      workspaceSummary?: string
+      workspaceProfile?: string
+      skillDescriptions?: string
+      activeSkill?: Record<string, unknown>
+      availableToolsDelta?: Record<string, unknown>
+    }
+    images?: string[]
+    includeRecentMessages?: boolean
+  }) => {
+    const signalController = new AbortController()
+    const turnId = createAgentTurnId()
+    const conversationMessages: Array<{ role: string; content: MessageContent }> = []
+    const localStreamPrefixRef = { current: '' }
+    let localReasoning = ''
+    let localSummary = ''
+    let localPhase: 'idle' | 'editing' | 'done' = 'idle'
+    let iteration = 0
+    let allToolResults: ToolResult[] = []
+    let finalContent = ''
+
+    const effectiveSystemPrompt = params.systemPrompt
+      ? `${composedAgentSystemPrompt}\n\n<subagent_profile>\n${params.systemPrompt}\n</subagent_profile>`
+      : composedAgentSystemPrompt
+    const assembled = assembleTurnContext({
+      userInput: params.content,
+      skillDescriptions: params.memoryContext?.skillDescriptions,
+      activeSkill: params.memoryContext?.activeSkill,
+      availableToolsDelta: params.memoryContext?.availableToolsDelta,
+      documentContext: params.documentContext,
+      filesContext: params.filesContext,
+      workspaceProfile: params.memoryContext?.workspaceProfile,
+    })
+
+    let userMessageContent: MessageContent = assembled.userContent
+    if (params.images && params.images.length > 0) {
+      const parts: Array<
+        { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }
+      > = [{ type: 'text', text: assembled.userContent }]
+      params.images.forEach((imgUrl) => {
+        parts.push({ type: 'image_url', image_url: { url: imgUrl } })
+      })
+      userMessageContent = parts
+    }
+
+    const recentMessages = params.includeRecentMessages
+      ? messages
+          .filter((message) => message.id !== 'welcome')
+          .slice(-50)
+          .map((message) => ({
+            role: message.role as string,
+            content: cleanMessageForSend(message.content),
+          }))
+          .filter((message) => message.content.length > 0)
+      : []
+
+    const nativeToolsForTurn =
+      params.callbacks?.onToolCall && shouldUseNativeTooling
+        ? nativeTooling.tools
+        : undefined
+
+    conversationMessages.push(
+      { role: 'system', content: effectiveSystemPrompt },
+      ...(nativeToolsForTurn
+        ? [{ role: 'system', content: nativeTooling.systemPrompt as MessageContent }]
+        : []),
+      ...recentMessages,
+      { role: 'user', content: userMessageContent },
+    )
+
+    const callModel = (
+      allMessages: Array<{ role: string; content: MessageContent }>,
+      signal: AbortSignal,
+      options?: {
+        returnRaw?: boolean
+        onToolCallStart?: (tool: string) => void
+        onToolCallPreview?: (tool: string, args: Record<string, string>) => void
+        maxToolCallPreviews?: number
+        onResponseFinal?: (payload: { raw: string; cleaned: string }) => void
+        nativeTools?: unknown[]
+      },
+    ) => {
+      return callLegacyModelGateway({
+        settings,
+        allMessages,
+        signal,
+        streamPrefixRef: localStreamPrefixRef,
+        setStreamingContent: () => {
+          // child session stays silent unless caller handles callbacks
+        },
+        setStreamingReasoning: (value) => {
+          localReasoning = value
+        },
+        setStreamingSummary: (value) => {
+          localSummary = value
+        },
+        setEditPhase: (value) => {
+          localPhase = value
+        },
+        options: {
+          ...options,
+          nativeTools: nativeToolsForTurn,
+        },
+      })
+    }
+
+    try {
+      const loopResult = await runLegacyAgentLoop({
+        conversationMessages,
+        signal: signalController.signal,
+        turnId,
+        callbacks: params.callbacks,
+        callModel,
+        emitDebugEvent: async (event) => {
+          await params.callbacks?.onDebugEvent?.(event)
+        },
+        streamPrefixRef: localStreamPrefixRef,
+        setStreamingContent: (value) => {
+          params.callbacks?.onTextChunk?.(value)
+        },
+        getStreamingReasoning: () => localReasoning,
+        parseAssistantOutput: (responseText) => {
+          const parsed = parseAssistantOutput(responseText)
+          if (parsed.summary) {
+            localSummary = parsed.summary
+          }
+          localPhase = parsed.phase
+          return parsed
+        },
+        cleanModelOutput,
+        hasToolCall,
+        parseToolCallsToIR,
+        buildNativeAssistantMessage: (response) =>
+          buildNativeAssistantConversationMessageFromResponse({
+            settings,
+            response,
+          }),
+        buildNativeToolResultMessages: (bindings) =>
+          buildNativeToolResultConversationMessages({
+            settings,
+            bindings,
+          }),
+        buildToolFailureHint,
+        toolLogger: toolCallLogger,
+        yieldAfterToolCall: async () => undefined,
+      })
+
+      iteration = loopResult.iteration
+      allToolResults = loopResult.toolResults
+      finalContent = loopResult.finalContentForMemory || localSummary || ''
+
+      return {
+        finalContent,
+        toolResults: allToolResults,
+        reasoning: loopResult.accumulatedReasoningForTurn || localReasoning || undefined,
+        iteration,
+      }
+    } finally {
+      signalController.abort()
+      void localPhase
+    }
+  }, [
+    assembleTurnContext,
+    buildToolFailureHint,
+    callLegacyModelGateway,
+    cleanMessageForSend,
+    cleanModelOutput,
+    composedAgentSystemPrompt,
+    hasToolCall,
+    messages,
+    nativeTooling,
+    shouldUseNativeTooling,
+    parseAssistantOutput,
+    parseToolCallsToIR,
+    settings,
+  ])
+
   return (
     <AIContext.Provider
       value={{
@@ -4113,6 +3512,18 @@ ${recentText}
         getCompletion,
         cancelCompletion,
         stopGeneration,
+        getAgentRuntimeSnapshot,
+        recordRuntimeToolExecution,
+        syncRuntimeTools,
+        syncRuntimeSkills,
+        spawnRuntimeSubagent,
+        startRuntimeSubagent,
+        completeRuntimeSubagent,
+        failRuntimeSubagent,
+        cancelRuntimeSubagent,
+        appendRuntimeSubagentTranscript,
+        loadRuntimeSubagentTranscript,
+        runRuntimeSubagentSession,
       }}
     >
       {children}

@@ -61,8 +61,23 @@ export function normalizeFontFamilyForDisplay(raw: string | null | undefined): s
 export function toChineseDefaultFallbackStack(primary?: string): string {
   const p = (primary || '').trim()
   const quoted = p ? (/[^\w-]/.test(p) ? `"${p.replace(/"/g, '\\"')}"` : `"${p}"`) : ''
-  const fallback = `"DengXian","SimSun","Songti SC","Microsoft YaHei",serif`
-  return quoted ? `${quoted},${fallback}` : fallback
+  const lower = p.toLowerCase()
+
+  const serifFallback = `"STSong","Songti SC","SimSun",serif`
+  const fangsongFallback = `"STFangsong","FangSong","Fangsong SC","STSong","Songti SC",serif`
+  const kaitiFallback = `"STKaiti","Kaiti SC","KaiTi","STSong","Songti SC",serif`
+  const sansFallback = `"DengXian","PingFang SC","Microsoft YaHei","Heiti SC",sans-serif`
+
+  let fallback = serifFallback
+  if (/仿宋|fangsong/.test(lower)) {
+    fallback = fangsongFallback
+  } else if (/楷体|kaiti/.test(lower)) {
+    fallback = kaitiFallback
+  } else if (/等线|dengxian|微软雅黑|yahei|黑体|simhei/.test(lower)) {
+    fallback = sansFallback
+  }
+
+  return quoted ? `${quoted},${fallback}` : serifFallback
 }
 
 

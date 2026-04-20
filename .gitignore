@@ -96,3 +96,15 @@ word/
 电气学院*/
 主界面word.png
 挑战杯（部分图表添加)v2(1)(1)(1)/
+
+# 本地调试/自动研究产物
+agent-trace-*.md
+autoresearch-*.json
+autoresearch-*.md
+research-results*.tsv
+claude-code-main/
+
+# 本机临时导入/备份文件
+.~*.docx
+\\Users\\mac\\Desktop\\实践部*
+“心桥相连，守望成长”城乡儿童志愿服务活动策划*

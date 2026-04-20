@@ -17,9 +17,8 @@ import {
   Settings,
   Image,
   Clock,
-  Pencil
 } from 'lucide-react'
-import { useDocument } from '../context/DocumentContext'
+import { useDocument } from '../context/useDocument'
 import { FileItem } from '../types'
 
 interface FileTreeItemProps {
@@ -148,6 +147,8 @@ export default function Sidebar() {
     files, 
     currentFile, 
     workspacePath,
+    effectiveWorkspacePath,
+    sessionMode,
     isElectron,
     openFolder, 
     openFile,
@@ -306,11 +307,13 @@ export default function Sidebar() {
       {/* Logo 和品牌 - 极简风格 */}
       <div className="px-5 pt-5 pb-3">
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-accent flex items-center justify-center shadow-md shadow-accent/20">
-            <Pencil className="w-4 h-4 text-white" strokeWidth={2.5} />
-          </div>
+          <img
+            src="./icon.png"
+            alt="智启文档图标"
+            className="w-8 h-8 rounded-lg object-cover shadow-md shadow-accent/20"
+          />
           <div>
-            <h1 className="text-sm font-bold text-text tracking-wide">Word Cursor</h1>
+            <h1 className="text-sm font-bold text-text tracking-wide">智启文档</h1>
           </div>
           <button
             onClick={() => setIsCollapsed(true)}
@@ -337,9 +340,16 @@ export default function Sidebar() {
 
       {/* 分区标题 - WORKSPACE */}
       <div className="px-4 py-2 flex items-center justify-between group">
-        <span className="text-[10px] font-bold text-text-muted tracking-wider uppercase">
-          Workspace
-        </span>
+        <div className="flex flex-col min-w-0">
+          <span className="text-[10px] font-bold text-text-muted tracking-wider uppercase">
+            Workspace
+          </span>
+          {effectiveWorkspacePath && (
+            <span className="text-[10px] text-text-dim truncate max-w-[180px]" title={effectiveWorkspacePath}>
+              {sessionMode === 'single-file' ? '轻工作区' : '文件夹工作区'}
+            </span>
+          )}
+        </div>
         <div className="flex opacity-0 group-hover:opacity-100 transition-opacity gap-0.5">
           {isElectron && (
              <button 
@@ -389,13 +399,17 @@ export default function Sidebar() {
             </div>
             <p className="text-sm text-text-secondary mb-1 font-medium">
               {isElectron
-                ? (workspacePath ? '文件夹为空' : '没有打开的文件夹')
+                ? (effectiveWorkspacePath
+                    ? (sessionMode === 'single-file' ? '轻工作区为空' : '文件夹为空')
+                    : '没有打开的文件夹')
                 : '没有文档'}
             </p>
             <p className="text-xs text-text-muted mb-4 leading-relaxed max-w-[180px]">
               {isElectron 
-                ? (workspacePath
-                    ? '该文件夹内暂无可用文件'
+                ? (effectiveWorkspacePath
+                    ? (sessionMode === 'single-file'
+                        ? '已按当前文档所在目录建立轻工作区，但该目录内暂无可用文件'
+                        : '该文件夹内暂无可用文件')
                     : '点击上方按钮打开一个本地文件夹')
                 : '上传一个 .docx 文件开始编辑'}
             </p>

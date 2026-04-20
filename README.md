@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="public/favicon.svg" width="84" height="84" alt="Word-Cursor Logo">
+  <img src="public/icon.png" width="84" height="84" alt="智启文档 Logo">
 </p>
 
-<h1 align="center">Word-Cursor</h1>
+<h1 align="center">智启文档（Word-Cursor）</h1>
 
 <p align="center">
   <strong>AI 驱动的智能办公文档编辑器</strong><br>
@@ -10,11 +10,15 @@
 </p>
 
 <p align="center">
+  GitHub 仓库名保留为 <code>Word-Cursor</code>，桌面应用当前显示名为 <strong>智启文档</strong>
+</p>
+
+<p align="center">
   📮 <strong>如遇部署问题，欢迎咨询 QQ：2935076541</strong>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/版本-v1.0.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/版本-v1.0.1-blue" alt="Version">
   <img src="https://img.shields.io/badge/React-18-61dafb?logo=react" alt="React">
   <img src="https://img.shields.io/badge/TypeScript-5-3178c6?logo=typescript" alt="TypeScript">
   <img src="https://img.shields.io/badge/Electron-33-47848f?logo=electron" alt="Electron">
@@ -32,6 +36,21 @@
   <a href="#-仓库结构">仓库结构</a> •
   <a href="#-faq">FAQ</a>
 </p>
+
+---
+
+## 🆕 相对云端 main 的本地版本更新
+
+以下内容是本地当前版本相对 GitHub 云端 `main` 基线整理出的核心升级点，已同步体现在本次 README 更新中：
+
+- **Agent Runtime 重构落地**：新增 `src/agent/` 运行时分层，包含 provider 适配、tool registry / executor / IR、skills、subagents、tasks、transcript / replay 存储与上下文压缩能力。
+- **Electron 后端按领域拆分**：主进程从“大一统 main”逐步拆为 `electron/services/* + electron/ipc/*`，覆盖 files、excel、ppt、memory、web-search、ai-proxy、docx-inspector、word-oracle、native-text 等服务。
+- **Word 文档链路增强**：DOCX 解析、字体/排版提取、审阅 diff、批注、Track Changes 导出、图表持久化、程序化加载统计同步、轻工作区文件树过滤等问题都做了补强。
+- **渲染与排版调优**：新增/强化 Canvas 打印预览、Word Oracle 对齐对比、Render Lab 回归工具，以及中文字体/行高/分页相关的兼容修复。
+- **PPT 能力升级**：支持端到端生成、整页重做、局部框选编辑、文字层识别与改字、HTML 预览器、多页选择编辑和相关主进程服务。
+- **Excel 能力升级**：从只读预览扩展到更多读写/筛选/公式/图表/格式化能力，并接入 Agent 工具包。
+- **工作区与技能系统**：支持工作区画像、文件摘要、workspace skills、子代理命令、搜索与本地 memory 联动。
+- **桌面产品化与体验修复**：应用名称更新为“智启文档”，补齐桌面图标资源，ONLYOFFICE 失败态可回退到内置编辑器，开发态默认不再自动弹出 DevTools。
 
 ---
 
@@ -272,6 +291,8 @@ npm run build:electron
 - **`.env`（可选）**：Electron 主进程会读取根目录 `.env`
 
 > 安全提示：**不要把真实 API Key 提交到公开仓库**。仓库已提供 `.env.example` 作为模板。
+
+> 当前公开仓库版本 **不再内嵌任何真实 API Key**。首次运行请在设置面板或根目录 `.env` 中填写主模型、Brave、OpenRouter、DashScope 等凭据。
 
 ### 配置优先级（避免“我配了但没生效”）
 

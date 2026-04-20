@@ -86,6 +86,7 @@ export interface FileItem {
 }
 
 export interface DiffChange {
+  diffId?: string
   searchText: string
   replaceText: string
   count: number
@@ -165,8 +166,13 @@ export interface AISettings {
   openRouterApiKey?: string
   // DashScope API Key（阿里云百炼，用于 PPT 图像生成）
   dashscopeApiKey?: string
+  // Adobe Firefly（用于高保真清底/融合）
+  adobeFireflyClientId?: string
+  adobeFireflyClientSecret?: string
+  // Black Forest Labs（用于后续 FLUX 高配图像编辑）
+  bflApiKey?: string
   // PPT 图像生成模型
-  pptImageModel?: 'z-image-turbo' | 'qwen-image-plus' | 'gemini-image'
+  pptImageModel?: 'gemini-image' | 'z-image-turbo' | 'qwen-image-plus' | 'qwen-image-max'
   // Brave Search API Key（用于联网搜索）
   braveApiKey?: string
   // 记忆系统
@@ -176,6 +182,427 @@ export interface AISettings {
   memoryTextWeight?: number
   memoryVectorWeight?: number
   memoryFlushThresholdChars?: number
+  knowledgeEnabled?: boolean
+  workspaceKnowledgeEnabled?: boolean
+  globalKnowledgePath?: string
+  profileMemoryEnabled?: boolean
+  embeddingBaseUrl?: string
+  embeddingApiKey?: string
+  embeddingModel?: string
+  knowledgeTopK?: number
+}
+
+export type KnowledgeSourceScope =
+  | 'workspace'
+  | 'global'
+  | 'profile'
+  | 'daily'
+  | 'sessions'
+  | string
+
+export interface KnowledgeSearchResult {
+  sourceScope: KnowledgeSourceScope
+  sourcePath: string
+  relativePath?: string
+  fileType?: string
+  title?: string
+  score: number
+  snippet: string
+  metadata?: Record<string, unknown>
+  category?: string
+  statement?: string
+}
+
+export interface KnowledgePendingProfileItem {
+  id: string
+  category: string
+  statement: string
+  evidenceHash: string
+  evidenceText: string
+  sourceScope?: KnowledgeSourceScope
+  sourcePath?: string
+  metadata?: Record<string, unknown>
+  createdAt: string
+  updatedAt: string
+}
+
+export interface KnowledgeProfileFact extends KnowledgePendingProfileItem {}
+
+export interface KnowledgeStatusResponse {
+  success: boolean
+  configured?: {
+    knowledgeEnabled: boolean
+    workspaceKnowledgeEnabled: boolean
+    profileMemoryEnabled: boolean
+    globalKnowledgePath: string
+    embeddingBaseUrl: string
+    embeddingModel: string
+    embeddingConfigured: boolean
+    knowledgeTopK: number
+  }
+  workspace?: {
+    rootPath: string
+    status: string
+    fileCount: number
+    indexedFileCount: number
+    chunkCount: number
+    lastIndexedAt?: string | null
+    lastError?: string
+  } | null
+  global?: {
+    rootPath: string
+    status: string
+    fileCount: number
+    indexedFileCount: number
+    chunkCount: number
+    lastIndexedAt?: string | null
+    lastError?: string
+  } | null
+  profile?: {
+    pendingCount: number
+    factCount: number
+  }
+  error?: string
+}
+
+export interface PptTextStyleHint {
+  fontSize: number
+  textColor: string
+  backgroundColor: string
+  rotation: number
+  lineCount: number
+  align: 'left' | 'center' | 'right'
+  familyHint?: string
+  shadowColor?: string
+  shadowOpacity?: number
+  shadowOffsetX?: number
+  shadowOffsetY?: number
+  shadowBlur?: number
+  strokeColor?: string
+  strokeWidth?: number
+  letterSpacing?: number
+  lineHeight?: number
+  opacity?: number
+  blendMode?: 'normal' | 'multiply'
+  textBounds?: {
+    left: number
+    top: number
+    width: number
+    height: number
+  }
+}
+
+export interface PptCharBox {
+  char: string
+  index: number
+  bounds: {
+    left: number
+    top: number
+    width: number
+    height: number
+  }
+}
+
+export interface PptFontCandidate {
+  candidateId: string
+  family: string
+  confidence: number
+  source: 'workspace' | 'bundled' | 'system' | 'remote'
+  fontPath?: string
+  previewText?: string
+}
+
+export interface PptStyleEstimate extends PptTextStyleHint {
+  textDirection: 'ltr' | 'rtl' | 'ttb'
+  skewX?: number
+  skewY?: number
+}
+
+export type PptCleanupStrategy =
+  | 'analytic_fill'
+  | 'local_inpaint'
+  | 'adobe_firefly_fill'
+  | 'none'
+
+export type PptBlendStrategy =
+  | 'deterministic'
+  | 'adobe_composite'
+  | 'flux_refine'
+  | 'none'
+
+export interface PptEditScore {
+  total: number
+  ocrExactness: number
+  fontStyleSimilarity: number
+  backgroundPreservation: number
+  edgeArtifactScore: number
+  overflowPenalty: number
+}
+
+export interface PptEditCandidate {
+  candidateId: string
+  boxId: string
+  label: string
+  previewDataUrl?: string
+  fontCandidateId?: string
+  cleanupStrategy: PptCleanupStrategy
+  blendStrategy: PptBlendStrategy
+  score: PptEditScore
+  applied?: boolean
+  metrics?: Record<string, number | string | boolean | undefined>
+}
+
+export interface PptDetectedTextBoxV2 {
+  boxId: string
+  text: string
+  confidence: number
+  polygon: Array<[number, number]>
+  bounds: {
+    left: number
+    top: number
+    width: number
+    height: number
+  }
+  readingOrder: number
+  styleHint: PptTextStyleHint
+  charBoxes?: PptCharBox[]
+  rotation?: number
+  skew?: number
+  textDirection?: 'ltr' | 'rtl' | 'ttb'
+  backgroundComplexity?: 'simple' | 'medium' | 'complex'
+  styleComplexity?: 'plain' | 'styled' | 'textured'
+  fontCandidates?: PptFontCandidate[]
+  styleEstimate?: PptStyleEstimate
+}
+
+export type PptDetectedTextBox = PptDetectedTextBoxV2
+
+export interface PptTextEditStyleOverride {
+  fontCandidateId?: string
+  fontFamily?: string
+  fontSize?: number
+  textColor?: string
+  strokeColor?: string
+  strokeWidth?: number
+  shadowBlur?: number
+  shadowColor?: string
+  shadowOffsetX?: number
+  shadowOffsetY?: number
+  letterSpacing?: number
+  lineHeight?: number
+  opacity?: number
+  cleanupStrategy?: PptCleanupStrategy
+  blendStrategy?: PptBlendStrategy
+}
+
+export interface PptTextEditOperation {
+  boxId: string
+  fromText: string
+  toText: string
+  styleMode?: 'preserve'
+  bounds?: {
+    left: number
+    top: number
+    width: number
+    height: number
+  }
+  styleOverride?: PptTextEditStyleOverride
+}
+
+export interface DocxCompatSettings {
+  compatibilityMode?: string
+  characterSpacingControl?: string
+  noPunctuationKerning?: boolean
+  useFELayout?: boolean
+  doNotUseEastAsianBreakRules?: boolean
+  compressPunctuation?: boolean
+}
+
+export interface DocxFontTableEntry {
+  name: string
+  altName?: string
+  family?: string
+  charset?: string
+  pitch?: string
+  panose1?: string
+}
+
+export interface DocxStyleGraphNode {
+  styleId: string
+  type?: string
+  name?: string
+  basedOn?: string
+  next?: string
+  link?: string
+  isDefault?: boolean
+}
+
+export interface DocxRelationshipSummary {
+  id: string
+  type?: string
+  target?: string
+}
+
+export interface DocxImageAssetSummary {
+  relId: string
+  target: string
+  size: number
+}
+
+export interface DocxTableSummary {
+  index: number
+  rows: number
+  columns: number
+  widthTwips?: number
+  layout?: string
+  floating?: boolean
+}
+
+export interface DocxReferencedFont {
+  name: string
+  alternates: string[]
+}
+
+export interface DocxInspectionReport {
+  sourcePath: string
+  extractedDir: string
+  extractedFiles: string[]
+  xmlPaths: {
+    document?: string
+    styles?: string
+    settings?: string
+    fontTable?: string
+    numbering?: string
+    theme?: string
+    footers?: string[]
+    rels?: string[]
+  }
+  createdAt: string
+  summary: {
+    pageSettings?: {
+      widthTwips?: number
+      heightTwips?: number
+      marginTopTwips?: number
+      marginRightTwips?: number
+      marginBottomTwips?: number
+      marginLeftTwips?: number
+      headerTwips?: number
+      footerTwips?: number
+      columns?: number
+      columnSpacingTwips?: number
+      docGridLinePitch?: number
+      docGridCharSpace?: number
+    }
+    compat: DocxCompatSettings
+    fontTable: DocxFontTableEntry[]
+    referencedFonts: DocxReferencedFont[]
+    styleGraph: DocxStyleGraphNode[]
+    relationships: DocxRelationshipSummary[]
+    images: DocxImageAssetSummary[]
+    tables: DocxTableSummary[]
+    tocFields: string[]
+    footerTargets: string[]
+    referencedStyleIds: string[]
+  }
+}
+
+export interface WordOracleMissingFont {
+  name: string
+  alternates?: string[]
+  resolvedName?: string
+}
+
+export interface WordOraclePageImage {
+  pageIndex: number
+  path: string
+  width: number
+  height: number
+}
+
+export interface WordOracleArtifact {
+  exportId: string
+  sourcePath: string
+  pdfPath: string
+  imageDir: string
+  pageCount: number
+  pages: WordOraclePageImage[]
+  exportedAt: string
+  wordAppPath?: string
+  inspectorExtractedDir?: string
+  missingFonts?: WordOracleMissingFont[]
+}
+
+export interface RenderMismatch {
+  pageIndex: number
+  oracleImagePath: string
+  diffImagePath: string
+  mismatchRatio: number
+  mismatchPixels: number
+  thresholdRatio: number
+  thresholdExceeded: boolean
+  oracleSize: {
+    width: number
+    height: number
+  }
+  currentSize: {
+    width: number
+    height: number
+  }
+  bbox?: {
+    x: number
+    y: number
+    width: number
+    height: number
+  } | null
+}
+
+export interface RenderAlignmentReport {
+  artifactId: string
+  sourcePath: string
+  createdAt: string
+  expectedPageCount: number
+  actualPageCount: number
+  pageCountMatches: boolean
+  thresholdRatio: number
+  mismatchCount: number
+  pages: RenderMismatch[]
+  currentPageIndicesOverThreshold: number[]
+  status: 'aligned' | 'misaligned' | 'unavailable'
+}
+
+export interface NativeTextMeasureEntry {
+  id: string
+  text: string
+  fontFamily: string
+  fontSize: number
+  fontWeight?: 'normal' | 'bold' | number
+  fontStyle?: 'normal' | 'italic'
+  letterSpacing?: number
+  lineHeight?: number
+}
+
+export interface NativeTextMeasureResult {
+  id: string
+  width: number
+  ascent: number
+  descent: number
+  lineHeight: number
+  baseline: number
+  resolvedFontFamily?: string
+  usedFallback?: boolean
+}
+
+export interface NativeTextFontAvailability {
+  name: string
+  available: boolean
+  resolvedName?: string
+}
+
+export interface NativeTextMeasureResponse {
+  success: boolean
+  measurements?: NativeTextMeasureResult[]
+  fonts?: NativeTextFontAvailability[]
+  error?: string
 }
 
 export interface EditorCommand {

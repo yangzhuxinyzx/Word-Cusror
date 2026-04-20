@@ -1,3 +1,11 @@
+import type {
+  DocxInspectionReport,
+  NativeTextMeasureEntry,
+  NativeTextMeasureResponse,
+  RenderAlignmentReport,
+  WordOracleArtifact,
+} from './index'
+
 // Electron API 类型定义
 export interface FileItem {
   name: string
@@ -321,6 +329,80 @@ export interface MemoryClearResponse {
   error?: string
 }
 
+export interface KnowledgeSearchOptions {
+  query: string
+  topK?: number
+}
+
+export interface KnowledgeSearchResult {
+  sourceScope: string
+  sourcePath: string
+  relativePath?: string
+  fileType?: string
+  title?: string
+  score: number
+  snippet: string
+  metadata?: Record<string, unknown>
+  category?: string
+  statement?: string
+}
+
+export interface KnowledgeRetrieveResponse {
+  success: boolean
+  results: KnowledgeSearchResult[]
+  error?: string
+}
+
+export interface KnowledgePendingProfileItem {
+  id: string
+  category: string
+  statement: string
+  evidenceHash: string
+  evidenceText: string
+  sourceScope?: string
+  sourcePath?: string
+  metadata?: Record<string, unknown>
+  createdAt: string
+  updatedAt: string
+}
+
+export interface KnowledgeStatusResponse {
+  success: boolean
+  configured?: {
+    knowledgeEnabled: boolean
+    workspaceKnowledgeEnabled: boolean
+    profileMemoryEnabled: boolean
+    globalKnowledgePath: string
+    embeddingBaseUrl: string
+    embeddingModel: string
+    embeddingConfigured: boolean
+    knowledgeTopK: number
+  }
+  workspace?: {
+    rootPath: string
+    status: string
+    fileCount: number
+    indexedFileCount: number
+    chunkCount: number
+    lastIndexedAt?: string | null
+    lastError?: string
+  } | null
+  global?: {
+    rootPath: string
+    status: string
+    fileCount: number
+    indexedFileCount: number
+    chunkCount: number
+    lastIndexedAt?: string | null
+    lastError?: string
+  } | null
+  profile?: {
+    pendingCount: number
+    factCount: number
+  }
+  error?: string
+}
+
 export interface ElectronAPI {
   // 文件夹操作
   selectFolder: () => Promise<string | null>
@@ -475,6 +557,26 @@ export interface ElectronAPI {
   getEnvSettings: () => Promise<Record<string, any>>
   saveEnvSettings: (settings: Record<string, any>) => Promise<{ success: boolean; error?: string }>
 
+  // DOCX 调试与 Word Oracle
+  docxInspect: (filePath: string) => Promise<{ success: boolean; report?: DocxInspectionReport; error?: string }>
+  wordOracleExport: (options: {
+    filePath: string
+    refreshFields?: boolean
+    dpi?: number
+  }) => Promise<{ success: boolean; artifact?: WordOracleArtifact; error?: string; unavailableReason?: string }>
+  wordOracleDiff: (options: {
+    sourcePath: string
+    artifactId: string
+    oraclePages: Array<{ pageIndex: number; path: string }>
+    currentPages: Array<{ pageIndex: number; dataUrl?: string; path?: string }>
+    thresholdRatio?: number
+  }) => Promise<{ success: boolean; report?: RenderAlignmentReport; error?: string }>
+  textMeasureNative: (options: {
+    mode?: 'measure' | 'font-check'
+    entries?: NativeTextMeasureEntry[]
+    fonts?: string[]
+  }) => Promise<NativeTextMeasureResponse>
+
   // 记忆系统
   memorySearch: (options: MemorySearchOptions) => Promise<MemorySearchResponse>
   memoryAppend: (options: { text: string; source?: string; tags?: string[] }) => Promise<MemoryAppendResponse>
@@ -484,16 +586,54 @@ export interface ElectronAPI {
   memoryClear: (options?: { scope?: 'all' | 'daily' | 'long' | 'sessions' }) => Promise<MemoryClearResponse>
   memoryRebuildIndex: () => Promise<MemoryStatusDetailResponse>
 
+  knowledgeConfigure: (options: {
+    knowledgeEnabled?: boolean
+    workspaceKnowledgeEnabled?: boolean
+    globalKnowledgePath?: string
+    profileMemoryEnabled?: boolean
+    embeddingBaseUrl?: string
+    embeddingApiKey?: string
+    embeddingModel?: string
+    knowledgeTopK?: number
+  }) => Promise<KnowledgeStatusResponse>
+  knowledgeSetActiveWorkspace: (options: { workspacePath?: string | null }) => Promise<{ success: boolean; workspacePath?: string }>
+  knowledgeStatus: () => Promise<KnowledgeStatusResponse>
+  knowledgeRetrieve: (options: KnowledgeSearchOptions) => Promise<KnowledgeRetrieveResponse>
+  knowledgeRebuild: (options?: { scope?: 'all' | 'workspace' | 'global' }) => Promise<KnowledgeStatusResponse>
+  knowledgeListPendingProfile: () => Promise<{ success: boolean; items: KnowledgePendingProfileItem[]; error?: string }>
+  knowledgeResolvePendingProfile: (options: {
+    id?: string
+    ids?: string[]
+    action: 'accept' | 'reject'
+  }) => Promise<{ success: boolean; items?: KnowledgePendingProfileItem[]; error?: string }>
+  knowledgeListProfileFacts: () => Promise<{ success: boolean; items: KnowledgePendingProfileItem[]; error?: string }>
+  knowledgeQueueProfileCandidates: (options: {
+    items: Array<{
+      id?: string
+      category: string
+      statement: string
+      evidenceText: string
+      sourceScope?: string
+      sourcePath?: string
+      metadata?: Record<string, unknown>
+    }>
+  }) => Promise<{ success: boolean; created?: number; skipped?: number; items?: KnowledgePendingProfileItem[]; error?: string }>
+
   // AI 请求代理（主进程 Node fetch，绕开渲染进程 HTTP/2）
   aiChatCompletions: (options: {
     requestId: string
     baseUrl: string
     apiKey?: string
     model: string
-    messages: Array<{ role: string; content: string }>
+    messages: Array<{
+      role: string
+      content: unknown
+      nativePayload?: Record<string, unknown>
+    }>
     temperature?: number
     maxTokens?: number
-  }) => Promise<{ success: boolean; content?: string; error?: string }>
+    tools?: unknown[]
+  }) => Promise<{ success: boolean; content?: string; rawResponse?: unknown; error?: string }>
 
   aiCancel: (requestId: string) => Promise<{ success: boolean; error?: string }>
 
@@ -514,6 +654,7 @@ export interface ElectronAPI {
     slideCount?: number
     theme?: string
     style?: string
+    styleImages?: string[]
     model?: string
     // 主模型回退参数（当没有 OpenRouter API Key 时使用）
     mainApiKey?: string
@@ -547,7 +688,7 @@ export interface ElectronAPI {
       apiKey?: string
       region?: 'cn' | 'intl'
       size?: string // DashScope preset, default 1664*928
-      model?: 'z-image-turbo' | 'qwen-image-plus' | 'gemini-image' // 生图模型
+      model?: 'gemini-image' | 'z-image-turbo' | 'qwen-image-plus' | 'qwen-image-max' // 生图模型
       promptExtend?: boolean
       watermark?: boolean
       negativePromptDefault?: string
@@ -576,10 +717,10 @@ export interface ElectronAPI {
     mode: 'regenerate' | 'partial_edit'
     openRouterApiKey: string
     dashscopeApiKey: string
-    /** 主模型 API Key（当 pptImageModel=gemini-image 时用于 LinAPI 生图；否则可不传） */
+    /** 主模型 API Key（可选） */
     mainApiKey?: string
     /** 生图模型选择（与设置面板一致） */
-    pptImageModel?: 'z-image-turbo' | 'qwen-image-plus' | 'gemini-image'
+    pptImageModel?: 'gemini-image' | 'z-image-turbo' | 'qwen-image-plus' | 'qwen-image-max'
     deckContext?: {
       designConcept?: string
       colorPalette?: string
@@ -596,6 +737,57 @@ export interface ElectronAPI {
     path?: string
     editedPages?: number[]
     logs?: Array<{ pageNum: number; success: boolean; error?: string }>
+    error?: string
+  }>
+
+  pptDetectTextLayer: (options: {
+    pptxPath: string
+    pageNumber: number
+    useCache?: boolean
+    cacheOnly?: boolean
+  }) => Promise<{
+    success: boolean
+    cached?: boolean
+    cacheVersion?: 'v2'
+    canvasWidth?: number
+    canvasHeight?: number
+    boxes?: import('./index').PptDetectedTextBox[]
+    sourceImagePath?: string
+    error?: string
+  }>
+
+  pptApplyTextEdits: (options: {
+    pptxPath: string
+    pageNumber: number
+    edits: import('./index').PptTextEditOperation[]
+  }) => Promise<{
+    success: boolean
+    path?: string
+    imageDataUrl?: string
+    editedBoxes?: string[]
+    appliedCandidateId?: string
+    candidateCount?: number
+    fontMatchConfidence?: number
+    cleanupStrategy?: import('./index').PptCleanupStrategy
+    blendStrategy?: import('./index').PptBlendStrategy
+    candidates?: import('./index').PptEditCandidate[]
+    perBoxCandidates?: Record<string, import('./index').PptEditCandidate[]>
+    logs?: Array<{ boxId?: string; success: boolean; error?: string }>
+    fallbackSuggested?: boolean
+    error?: string
+  }>
+
+  pptTextEditHealth: (options?: { bootstrap?: boolean }) => Promise<{
+    success: boolean
+    ready?: boolean
+    ocrEngine?: string
+    editEngine?: string
+    highFidelityAvailable?: boolean
+    deterministicRendererAvailable?: boolean
+    cleanupEngines?: string[]
+    externalAdapters?: Array<{ name: string; available: boolean; reason?: string }>
+    paddleAvailable?: boolean
+    runtimeDir?: string
     error?: string
   }>
 

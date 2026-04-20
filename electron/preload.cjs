@@ -88,9 +88,26 @@ contextBridge.exposeInMainWorld('electronAPI', {
   memoryClear: (options) => ipcRenderer.invoke('memory-clear', options),
   memoryRebuildIndex: () => ipcRenderer.invoke('memory-rebuild-index'),
 
+  // 本地知识库与用户记忆
+  knowledgeConfigure: (options) => ipcRenderer.invoke('knowledge-configure', options),
+  knowledgeSetActiveWorkspace: (options) => ipcRenderer.invoke('knowledge-set-active-workspace', options),
+  knowledgeStatus: () => ipcRenderer.invoke('knowledge-status'),
+  knowledgeRetrieve: (options) => ipcRenderer.invoke('knowledge-retrieve', options),
+  knowledgeRebuild: (options) => ipcRenderer.invoke('knowledge-rebuild', options),
+  knowledgeListPendingProfile: () => ipcRenderer.invoke('knowledge-list-pending-profile'),
+  knowledgeResolvePendingProfile: (options) => ipcRenderer.invoke('knowledge-resolve-pending-profile', options),
+  knowledgeListProfileFacts: () => ipcRenderer.invoke('knowledge-list-profile-facts'),
+  knowledgeQueueProfileCandidates: (options) => ipcRenderer.invoke('knowledge-queue-profile-candidates', options),
+
   // 环境变量配置读写（.env 文件）
   getEnvSettings: () => ipcRenderer.invoke('get-env-settings'),
   saveEnvSettings: (settings) => ipcRenderer.invoke('save-env-settings', settings),
+
+  // DOCX 调试与 Word Oracle
+  docxInspect: (filePath) => ipcRenderer.invoke('docx-inspect', filePath),
+  wordOracleExport: (options) => ipcRenderer.invoke('word-oracle-export', options),
+  wordOracleDiff: (options) => ipcRenderer.invoke('word-oracle-diff', options),
+  textMeasureNative: (options) => ipcRenderer.invoke('text-measure-native', options),
 
   // AI 请求代理（主进程 Node fetch，绕开渲染进程 HTTP/2）
   aiChatCompletions: (options) => ipcRenderer.invoke('ai-chat-completions', options),
@@ -106,6 +123,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   
   // PPT 编辑：整页重做 / 局部编辑
   pptEditSlides: (options) => ipcRenderer.invoke('ppt-edit-slides', options),
+
+  // PPT 图片页文字编辑：OCR / 应用改字 / 健康检查
+  pptDetectTextLayer: (options) => ipcRenderer.invoke('ppt-detect-text-layer', options),
+  pptApplyTextEdits: (options) => ipcRenderer.invoke('ppt-apply-text-edits', options),
+  pptTextEditHealth: (options) => ipcRenderer.invoke('ppt-text-edit-health', options),
+  onPptTextEditProgress: (callback) => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('ppt-text-edit-progress', listener)
+    return () => ipcRenderer.removeListener('ppt-text-edit-progress', listener)
+  },
 
   // OpenRouter Gemini：大纲转文生图提示词
   openrouterGeminiPptPrompts: (options) => ipcRenderer.invoke('openrouter-gemini-ppt-prompts', options),
@@ -124,6 +151,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
 // 通知渲染进程 Electron 已就绪
 window.addEventListener('DOMContentLoaded', () => {
-  console.log('Word-Cursor Electron 已就绪')
+  console.log('智启文档 Electron 已就绪')
 })
 

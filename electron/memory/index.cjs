@@ -15,6 +15,8 @@ const DEFAULT_CHUNK_OVERLAP_LINES = 2
 const DEFAULT_SNIPPET_MAX = 600
 const SESSION_CURSOR_FILE = 'session-cursors.json'
 const DEFAULT_WORKSPACE_KEY = 'global'
+const DEFAULT_PROFILE_REJECTION_TTL_DAYS = 30
+const PROFILE_SOURCE = 'profile'
 
 const normalizeText = (text) => (text || '').replace(/\s+/g, ' ').trim()
 
@@ -24,6 +26,23 @@ const ensureDir = (dir) => {
 
 const hashText = (text) =>
   crypto.createHash('sha1').update(text || '').digest('hex')
+
+const nowIso = () => new Date().toISOString()
+
+const addDaysIso = (days) => {
+  const date = new Date()
+  date.setDate(date.getDate() + days)
+  return date.toISOString()
+}
+
+const safeJsonParse = (value, fallback) => {
+  if (!value) return fallback
+  try {
+    return JSON.parse(value)
+  } catch {
+    return fallback
+  }
+}
 
 const safeReadFile = (filePath) => {
   try {
@@ -159,6 +178,48 @@ const initDb = (db) => {
       sessionId TEXT
     );
   `)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS profile_pending (
+      id TEXT PRIMARY KEY,
+      category TEXT NOT NULL,
+      statement TEXT NOT NULL,
+      evidenceHash TEXT NOT NULL,
+      evidenceText TEXT NOT NULL,
+      sourceScope TEXT,
+      sourcePath TEXT,
+      metadataJson TEXT,
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
+    );
+  `)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS profile_facts (
+      id TEXT PRIMARY KEY,
+      category TEXT NOT NULL,
+      statement TEXT NOT NULL,
+      evidenceHash TEXT NOT NULL,
+      evidenceText TEXT NOT NULL,
+      sourceScope TEXT,
+      sourcePath TEXT,
+      metadataJson TEXT,
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
+    );
+  `)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS profile_rejections (
+      id TEXT PRIMARY KEY,
+      category TEXT NOT NULL,
+      statement TEXT NOT NULL,
+      evidenceHash TEXT NOT NULL,
+      sourceScope TEXT,
+      sourcePath TEXT,
+      metadataJson TEXT,
+      rejectedUntil TEXT NOT NULL,
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
+    );
+  `)
   const fileCols = db.prepare('PRAGMA table_info(memory_files)').all()
   const addCol = (name) => {
     if (!fileCols.some((c) => c.name === name)) {
@@ -168,6 +229,17 @@ const initDb = (db) => {
   addCol('source')
   addCol('workspaceKey')
   addCol('sessionId')
+
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS profile_facts_fts USING fts5(
+      statement,
+      category UNINDEXED,
+      factId UNINDEXED,
+      sourceScope UNINDEXED,
+      sourcePath UNINDEXED,
+      embedding UNINDEXED
+    );
+  `)
 
   return ensureFtsTable(db)
 }
@@ -270,6 +342,10 @@ class MemoryManager {
       this.db.exec('DELETE FROM chunks_fts;')
       this.db.exec('DELETE FROM memory_files;')
       this.db.exec('DELETE FROM memory_meta;')
+      this.db.exec('DELETE FROM profile_pending;')
+      this.db.exec('DELETE FROM profile_facts;')
+      this.db.exec('DELETE FROM profile_rejections;')
+      this.db.exec('DELETE FROM profile_facts_fts;')
     }
     this.markDirty()
     return { success: true }
@@ -331,6 +407,228 @@ class MemoryManager {
       chunkSources: sources,
       fileSources,
       lastIndexedAt,
+    }
+  }
+
+  listPendingProfile() {
+    if (!this.db) {
+      return { success: false, items: [], error: 'better-sqlite3 未安装' }
+    }
+    const rows = this.db.prepare(
+      `SELECT id, category, statement, evidenceHash, evidenceText, sourceScope, sourcePath, metadataJson, createdAt, updatedAt
+       FROM profile_pending
+       ORDER BY datetime(createdAt) DESC`,
+    ).all()
+    return {
+      success: true,
+      items: rows.map((row) => ({
+        id: row.id,
+        category: row.category,
+        statement: row.statement,
+        evidenceHash: row.evidenceHash,
+        evidenceText: row.evidenceText,
+        sourceScope: row.sourceScope || '',
+        sourcePath: row.sourcePath || '',
+        metadata: safeJsonParse(row.metadataJson, {}),
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      })),
+    }
+  }
+
+  listProfileFacts() {
+    if (!this.db) {
+      return { success: false, items: [], error: 'better-sqlite3 未安装' }
+    }
+    const rows = this.db.prepare(
+      `SELECT id, category, statement, evidenceHash, evidenceText, sourceScope, sourcePath, metadataJson, createdAt, updatedAt
+       FROM profile_facts
+       ORDER BY datetime(updatedAt) DESC, datetime(createdAt) DESC`,
+    ).all()
+    return {
+      success: true,
+      items: rows.map((row) => ({
+        id: row.id,
+        category: row.category,
+        statement: row.statement,
+        evidenceHash: row.evidenceHash,
+        evidenceText: row.evidenceText,
+        sourceScope: row.sourceScope || '',
+        sourcePath: row.sourcePath || '',
+        metadata: safeJsonParse(row.metadataJson, {}),
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      })),
+    }
+  }
+
+  queueProfileCandidates(candidates = []) {
+    if (!this.db) {
+      return { success: false, created: 0, skipped: 0, error: 'better-sqlite3 未安装' }
+    }
+
+    const selectPending = this.db.prepare(
+      'SELECT id FROM profile_pending WHERE evidenceHash = ? OR (category = ? AND statement = ?)',
+    )
+    const selectFact = this.db.prepare(
+      'SELECT id FROM profile_facts WHERE evidenceHash = ? OR (category = ? AND statement = ?)',
+    )
+    const selectRejection = this.db.prepare(
+      'SELECT id, rejectedUntil FROM profile_rejections WHERE evidenceHash = ? OR (category = ? AND statement = ?)',
+    )
+    const insertPending = this.db.prepare(
+      `INSERT INTO profile_pending (
+        id, category, statement, evidenceHash, evidenceText, sourceScope, sourcePath, metadataJson, createdAt, updatedAt
+      ) VALUES (
+        @id, @category, @statement, @evidenceHash, @evidenceText, @sourceScope, @sourcePath, @metadataJson, @createdAt, @updatedAt
+      )`,
+    )
+
+    let created = 0
+    let skipped = 0
+    const createdItems = []
+
+    for (const item of candidates) {
+      const category = String(item.category || '').trim()
+      const statement = String(item.statement || '').replace(/\s+/g, ' ').trim()
+      const evidenceText = String(item.evidenceText || '').replace(/\s+/g, ' ').trim()
+      const sourceScope = String(item.sourceScope || '').trim()
+      const sourcePath = String(item.sourcePath || '').trim()
+      const metadata = item.metadata && typeof item.metadata === 'object' ? item.metadata : {}
+      if (!category || !statement || !evidenceText) {
+        skipped += 1
+        continue
+      }
+
+      const evidenceHash = hashText([category, statement, evidenceText].join('\n'))
+      if (selectPending.get(evidenceHash, category, statement)) {
+        skipped += 1
+        continue
+      }
+      if (selectFact.get(evidenceHash, category, statement)) {
+        skipped += 1
+        continue
+      }
+      const rejection = selectRejection.get(evidenceHash, category, statement)
+      if (rejection?.rejectedUntil && new Date(rejection.rejectedUntil).getTime() > Date.now()) {
+        skipped += 1
+        continue
+      }
+
+      const createdAt = nowIso()
+      const next = {
+        id: item.id || `profile-pending-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        category,
+        statement,
+        evidenceHash,
+        evidenceText,
+        sourceScope,
+        sourcePath,
+        metadataJson: JSON.stringify(metadata),
+        createdAt,
+        updatedAt: createdAt,
+      }
+      insertPending.run(next)
+      created += 1
+      createdItems.push({
+        id: next.id,
+        category,
+        statement,
+        evidenceHash,
+        evidenceText,
+        sourceScope,
+        sourcePath,
+        metadata,
+        createdAt,
+        updatedAt: createdAt,
+      })
+    }
+
+    return { success: true, created, skipped, items: createdItems }
+  }
+
+  resolvePendingProfile({ id, action }) {
+    if (!this.db) {
+      return { success: false, error: 'better-sqlite3 未安装' }
+    }
+    const row = this.db.prepare(
+      `SELECT id, category, statement, evidenceHash, evidenceText, sourceScope, sourcePath, metadataJson, createdAt, updatedAt
+       FROM profile_pending WHERE id = ?`,
+    ).get(id)
+    if (!row) {
+      return { success: false, error: '未找到待确认画像' }
+    }
+
+    const metadataJson = row.metadataJson || '{}'
+    const now = nowIso()
+
+    if (action === 'accept') {
+      this.db.prepare(
+        `INSERT OR REPLACE INTO profile_facts (
+          id, category, statement, evidenceHash, evidenceText, sourceScope, sourcePath, metadataJson, createdAt, updatedAt
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        row.id,
+        row.category,
+        row.statement,
+        row.evidenceHash,
+        row.evidenceText,
+        row.sourceScope || '',
+        row.sourcePath || '',
+        metadataJson,
+        row.createdAt || now,
+        now,
+      )
+      this.db.prepare('DELETE FROM profile_rejections WHERE evidenceHash = ? OR id = ?').run(row.evidenceHash, row.id)
+      this.db.prepare('DELETE FROM profile_facts_fts WHERE factId = ?').run(row.id)
+      const embedding = embedTextLocal(`${row.category} ${row.statement}`)
+      this.db.prepare(
+        `INSERT INTO profile_facts_fts (statement, category, factId, sourceScope, sourcePath, embedding)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(
+        row.statement,
+        row.category,
+        row.id,
+        row.sourceScope || '',
+        row.sourcePath || '',
+        JSON.stringify(embedding),
+      )
+    } else if (action === 'reject') {
+      this.db.prepare(
+        `INSERT OR REPLACE INTO profile_rejections (
+          id, category, statement, evidenceHash, sourceScope, sourcePath, metadataJson, rejectedUntil, createdAt, updatedAt
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        row.id,
+        row.category,
+        row.statement,
+        row.evidenceHash,
+        row.sourceScope || '',
+        row.sourcePath || '',
+        metadataJson,
+        addDaysIso(DEFAULT_PROFILE_REJECTION_TTL_DAYS),
+        row.createdAt || now,
+        now,
+      )
+    } else {
+      return { success: false, error: '不支持的处理动作' }
+    }
+
+    this.db.prepare('DELETE FROM profile_pending WHERE id = ?').run(row.id)
+    return {
+      success: true,
+      item: {
+        id: row.id,
+        category: row.category,
+        statement: row.statement,
+        evidenceHash: row.evidenceHash,
+        evidenceText: row.evidenceText,
+        sourceScope: row.sourceScope || '',
+        sourcePath: row.sourcePath || '',
+        metadata: safeJsonParse(metadataJson, {}),
+        createdAt: row.createdAt,
+        updatedAt: now,
+      },
     }
   }
 
@@ -601,7 +899,9 @@ class MemoryManager {
       whereSql += ' AND (workspaceKey = ? OR workspaceKey IS NULL OR workspaceKey = "")'
       params.push(workspaceKey)
     }
-    const sourceList = Array.isArray(sources) ? sources : (sources ? [sources] : [])
+    const sourceList = Array.isArray(sources)
+      ? sources
+      : (sources ? [sources] : ['daily', 'sessions', PROFILE_SOURCE])
     if (sourceList.length) {
       const placeholders = sourceList.map(() => '?').join(',')
       whereSql += ` AND source IN (${placeholders})`
@@ -637,6 +937,40 @@ class MemoryManager {
         snippet: buildSnippet(row.content),
       }
     })
+
+    if (sourceList.includes(PROFILE_SOURCE)) {
+      const profileParams = [ftsQuery, Math.max(topK * 2, 5)]
+      const profileRows = this.db.prepare(
+        `SELECT rowid, statement, category, factId, sourceScope, sourcePath, embedding, bm25(profile_facts_fts) as rank
+         FROM profile_facts_fts
+         WHERE profile_facts_fts MATCH ?
+         ORDER BY rank
+         LIMIT ?`,
+      ).all(...profileParams)
+
+      for (const row of profileRows) {
+        let vectorScore = 0
+        if (row.embedding) {
+          try {
+            vectorScore = cosineSimilarity(queryEmbedding, JSON.parse(row.embedding))
+          } catch {
+            vectorScore = 0
+          }
+        }
+        const textScore = 1 / (1 + Math.abs(row.rank || 0))
+        results.push({
+          path: row.sourcePath || `profile:${row.factId}`,
+          source: PROFILE_SOURCE,
+          workspaceKey: '',
+          sessionId: '',
+          startLine: 1,
+          endLine: 1,
+          score: textWeight * textScore + vectorWeight * vectorScore,
+          snippet: `${row.category}: ${row.statement}`,
+        })
+      }
+    }
+
     results.sort((a, b) => b.score - a.score)
     return { success: true, results: results.slice(0, topK) }
   }

@@ -5,15 +5,20 @@ import OnlyOfficeEditor from './components/OnlyOfficeEditor'
 import ChatPanel from './components/ChatPanel'
 import Header from './components/Header'
 import SettingsModal from './components/SettingsModal'
-import { DocumentProvider, useDocument } from './context/DocumentContext'
+import { DocumentProvider } from './context/DocumentContext'
+import { useDocument } from './context/useDocument'
 import { AIProvider } from './context/AIContext'
 import { CommentProvider } from './context/CommentContext'
 
 import Dashboard from './components/Dashboard'
+import RenderLab from './components/RenderLab'
 
 // 内部组件，可以访问 DocumentContext
 function AppContent() {
   const { editorMode, currentFile } = useDocument()
+  const renderLabMode =
+    typeof window !== 'undefined' &&
+    new URLSearchParams(window.location.search).get('render-lab') === '1'
   const [showChat, setShowChat] = useState(true)
   const [showSettings, setShowSettings] = useState(false)
   const [activeView, setActiveView] = useState<'editor' | 'preview' | 'split'>('editor')
@@ -77,6 +82,10 @@ function AppContent() {
       document.removeEventListener('mouseup', handleMouseUp)
     }
   }, [])
+
+  if (renderLabMode) {
+    return <RenderLab />
+  }
 
   return (
     <div className="h-screen w-screen flex flex-col overflow-hidden relative bg-background transition-colors duration-300">

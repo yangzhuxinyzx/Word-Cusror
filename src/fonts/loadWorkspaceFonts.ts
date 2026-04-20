@@ -89,6 +89,10 @@ const FONT_ALIAS_MAP: Record<string, string[]> = {
   'STCaiyun': ['STCAIYUN.TTF', 'NotoSansSC-VF.ttf'],
 
   // 方正系列
+  '方正小标宋简体': ['simsun.ttc', 'simsunb.ttf', 'NotoSerifSC-VF.ttf'],
+  '方正小标宋_GBK': ['simsun.ttc', 'simsunb.ttf', 'NotoSerifSC-VF.ttf'],
+  '方正仿宋简体': ['STFANGSO.TTF', 'simsun.ttc', 'NotoSerifSC-VF.ttf'],
+  '方正仿宋_GBK': ['STFANGSO.TTF', 'simsun.ttc', 'NotoSerifSC-VF.ttf'],
   '方正姚体': ['FZYTK.TTF', 'NotoSerifSC-VF.ttf'],
   'FZYaoti': ['FZYTK.TTF', 'NotoSerifSC-VF.ttf'],
   '方正舒体': ['FZSTK.TTF', 'NotoSerifSC-VF.ttf'],

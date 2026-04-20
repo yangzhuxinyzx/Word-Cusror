@@ -40,6 +40,9 @@ interface FootnoteMap {
   endnotes: Map<string, FootnoteData>
 }
 
+const MIN_RELIABLE_TABLE_WIDTH_PT = 60
+const MIN_RELIABLE_CELL_WIDTH_PT = 24
+
 // MIME 类型映射
 const IMAGE_MIME_TYPES: Record<string, string> = {
   'png': 'image/png',
@@ -94,6 +97,7 @@ interface RunStyle {
   fontSize?: string
   fontFamily?: string  // CSS font-family 值（包含回退字体栈）
   fontName?: string    // 原始字体名（用于 UI 显示）
+  fontWeight?: string
   color?: string
   highlight?: string
 }
@@ -108,6 +112,11 @@ interface ParagraphStyle {
   lineHeight?: string
   marginTop?: string
   marginBottom?: string
+}
+
+interface RunStyle {
+  fontWeight?: string
+  letterSpacing?: string
 }
 
 // 字体名标准化映射：将常见的字体别名统一为首选名称
@@ -232,45 +241,45 @@ function normalizeFontName(fontName: string | null | undefined): string {
 // 字体映射 - 将 Word 字体映射到系统可用字体
 const FONT_FALLBACK_MAP: Record<string, string> = {
   // 宋体系列
-  '宋体': '"宋体", "SimSun", "Songti SC", serif',
-  'SimSun': '"宋体", "SimSun", "Songti SC", serif',
-  '新宋体': '"新宋体", "NSimSun", "宋体", serif',
-  'NSimSun': '"新宋体", "NSimSun", "宋体", serif',
-  '华文宋体': '"华文宋体", "STSong", "宋体", serif',
-  'STSong': '"华文宋体", "STSong", "宋体", serif',
-  '方正小标宋简体': '"方正小标宋简体", "宋体", serif',
-  '方正小标宋_GBK': '"方正小标宋_GBK", "宋体", serif',
+  '宋体': '"宋体", "STSong", "Songti SC", "SimSun", serif',
+  'SimSun': '"宋体", "STSong", "Songti SC", "SimSun", serif',
+  '新宋体': '"新宋体", "NSimSun", "STSong", "Songti SC", serif',
+  'NSimSun': '"新宋体", "NSimSun", "STSong", "Songti SC", serif',
+  '华文宋体': '"华文宋体", "STSong", "Songti SC", serif',
+  'STSong': '"华文宋体", "STSong", "Songti SC", serif',
+  '方正小标宋简体': '"方正小标宋简体", "STSong", "Songti SC", serif',
+  '方正小标宋_GBK': '"方正小标宋_GBK", "STSong", "Songti SC", serif',
   
   // 黑体系列
-  '黑体': '"黑体", "SimHei", "Microsoft YaHei", "微软雅黑", "Heiti SC", sans-serif',
-  'SimHei': '"黑体", "SimHei", "Microsoft YaHei", "微软雅黑", "Heiti SC", sans-serif',
-  '华文黑体': '"华文黑体", "STHeiti", "黑体", sans-serif',
-  'STHeiti': '"华文黑体", "STHeiti", "黑体", sans-serif',
-  '微软雅黑': '"微软雅黑", "Microsoft YaHei", "黑体", sans-serif',
-  'Microsoft YaHei': '"微软雅黑", "Microsoft YaHei", "黑体", sans-serif',
+  '黑体': '"黑体", "STHeiti", "Heiti SC", "SimHei", "PingFang SC", sans-serif',
+  'SimHei': '"黑体", "STHeiti", "Heiti SC", "SimHei", "PingFang SC", sans-serif',
+  '华文黑体': '"华文黑体", "STHeiti", "Heiti SC", sans-serif',
+  'STHeiti': '"华文黑体", "STHeiti", "Heiti SC", sans-serif',
+  '微软雅黑': '"微软雅黑", "Microsoft YaHei", "PingFang SC", "Heiti SC", sans-serif',
+  'Microsoft YaHei': '"微软雅黑", "Microsoft YaHei", "PingFang SC", "Heiti SC", sans-serif',
   
   // 楷体系列
-  '楷体': '"楷体", "STKAITI", "KaiTi", "Kaiti SC", serif',
-  'KaiTi': '"楷体", "KaiTi", "Kaiti SC", serif',
-  '楷体_GB2312': '"楷体_GB2312", "楷体", "KaiTi", serif',
-  '华文楷体': '"华文楷体", "STKAITI", "STKaiti", "楷体", serif',
-  'STKaiti': '"华文楷体", "STKAITI", "STKaiti", "楷体", serif',
-  'STKAITI': '"华文楷体", "STKAITI", "STKaiti", "楷体", serif',
+  '楷体': '"楷体", "STKaiti", "Kaiti SC", "KaiTi", serif',
+  'KaiTi': '"楷体", "STKaiti", "Kaiti SC", "KaiTi", serif',
+  '楷体_GB2312': '"楷体_GB2312", "STKaiti", "Kaiti SC", "KaiTi", serif',
+  '华文楷体': '"华文楷体", "STKaiti", "Kaiti SC", serif',
+  'STKaiti': '"华文楷体", "STKaiti", "Kaiti SC", serif',
+  'STKAITI': '"华文楷体", "STKaiti", "Kaiti SC", serif',
   
   // 仿宋系列
-  '仿宋': '"仿宋", "STFANGSO", "FangSong", "Fangsong SC", serif',
-  'FangSong': '"仿宋", "FangSong", "Fangsong SC", serif',
-  '仿宋_GB2312': '"仿宋_GB2312", "仿宋", "FangSong", serif',
-  '华文仿宋': '"华文仿宋", "STFANGSO", "STFangsong", "仿宋", serif',
-  'STFangsong': '"华文仿宋", "STFANGSO", "STFangsong", "仿宋", serif',
-  'STFANGSO': '"华文仿宋", "STFANGSO", "STFangsong", "仿宋", serif',
+  '仿宋': '"仿宋", "STFangsong", "Fangsong SC", "FangSong", serif',
+  'FangSong': '"仿宋", "STFangsong", "Fangsong SC", "FangSong", serif',
+  '仿宋_GB2312': '"仿宋_GB2312", "STFangsong", "Fangsong SC", "FangSong", serif',
+  '华文仿宋': '"华文仿宋", "STFangsong", "Fangsong SC", serif',
+  'STFangsong': '"华文仿宋", "STFangsong", "Fangsong SC", serif',
+  'STFANGSO': '"华文仿宋", "STFangsong", "Fangsong SC", serif',
   
   // 其他常用字体
   '华文中宋': '"华文中宋", "STZhongsong", "宋体", serif',
   'STZhongsong': '"华文中宋", "STZhongsong", "宋体", serif',
   '华文细黑': '"华文细黑", "STXIHEI", "STXihei", "黑体", sans-serif',
-  '等线': '"等线", "DengXian", "微软雅黑", sans-serif',
-  'DengXian': '"等线", "DengXian", "微软雅黑", sans-serif',
+  '等线': '"等线", "DengXian", "PingFang SC", "Microsoft YaHei", sans-serif',
+  'DengXian': '"等线", "DengXian", "PingFang SC", "Microsoft YaHei", sans-serif',
   
   // 英文字体
   'Times New Roman': '"Times New Roman", "宋体", serif',
@@ -847,6 +856,17 @@ function getSafeFontFamily(fontName: string | null | undefined): string {
   }
   
   return `"${fontName}", "Arial", sans-serif`
+}
+
+function shouldUseSyntheticBold(fontName: string | null | undefined): boolean {
+  const name = (fontName || '').trim()
+  if (!name) return false
+  return (
+    name === '方正小标宋简体' ||
+    name === '方正小标宋_GBK' ||
+    name === '华文中宋' ||
+    name === 'STZhongsong'
+  )
 }
 
 // 检查文件是否是有效的 ZIP/DOCX 格式
@@ -2192,6 +2212,21 @@ function parseHeaderFooterStyleFromXml(
       }
     }
 
+    if (style.fontName && !style.fontFamily) {
+      style.fontFamily = getSafeFontFamily(style.fontName)
+    }
+
+    const spacing = rPr.getElementsByTagName('w:spacing')[0]
+    if (spacing) {
+      const spacingVal = spacing.getAttribute('w:val')
+      if (spacingVal) {
+        const spacingPt = parseInt(spacingVal, 10) / 20
+        if (Number.isFinite(spacingPt) && spacingPt !== 0) {
+          style.letterSpacing = `${spacingPt}pt`
+        }
+      }
+    }
+
     const color = rPr.getElementsByTagName('w:color')[0]
     if (color) {
       const val = color.getAttribute('w:val')
@@ -2212,11 +2247,7 @@ function parseHeaderFooterStyleFromXml(
     const lineVal = parseInt(line)
     if (!lineVal) return
     const lineRule = spacing.getAttribute('w:lineRule')
-    if (lineRule === 'exact' || lineRule === 'atLeast') {
-      style.lineHeight = `${(lineVal / 20).toFixed(1)}pt`
-    } else {
-      style.lineHeight = (lineVal / 240).toFixed(2)
-    }
+    style.lineHeight = resolveDocxLineHeightCss(lineVal, lineRule)
   }
 
   const pPr = firstPara.getElementsByTagName('w:pPr')[0]
@@ -2336,13 +2367,38 @@ async function parseDocxCustomComplete(bytes: Uint8Array): Promise<DocxParseResu
     // 解析正文内容（不包含页眉页脚）
     let bodyHtml = ''
     const numberingState: NumberingState = {}
+    let tocSectionActive = false
+    const appendBodyBlock = (html: string) => {
+      if (!html) return
+      const isTocBlock = isStructuredTocHtmlBlock(html) || isTocHeadingHtmlBlock(html)
+      const isBlankBlock = isEffectivelyBlankHtmlBlock(html)
+
+      if (isTocBlock) {
+        tocSectionActive = true
+        bodyHtml += html
+        return
+      }
+
+      if (tocSectionActive && isBlankBlock) {
+        return
+      }
+
+      if (tocSectionActive && !isBlankBlock) {
+        if (!/^\s*<hr class="page-break"\s*\/>/.test(html)) {
+          bodyHtml += '<hr class="page-break" />'
+        }
+        tocSectionActive = false
+      }
+
+      bodyHtml += html
+    }
     const children = body.childNodes
     for (let i = 0; i < children.length; i++) {
       const child = children[i] as Element
       if (child.nodeName === 'w:p') {
-        bodyHtml += parseParagraph(child, styles, imageMap, footnoteMap, chartImageCtx, numberingState)
+        appendBodyBlock(parseParagraph(child, styles, imageMap, footnoteMap, chartImageCtx, numberingState))
       } else if (child.nodeName === 'w:tbl') {
-        bodyHtml += parseTable(child, styles, imageMap, footnoteMap, chartImageCtx)
+        appendBodyBlock(parseTable(child, styles, imageMap, footnoteMap, chartImageCtx))
       } else if (child.nodeName === 'w:sdt') {
         const sdtContent = child.getElementsByTagName('w:sdtContent')[0]
         if (sdtContent) {
@@ -2350,9 +2406,9 @@ async function parseDocxCustomComplete(bytes: Uint8Array): Promise<DocxParseResu
           for (let j = 0; j < sdtChildren.length; j++) {
             const sdtChild = sdtChildren[j] as Element
             if (sdtChild.nodeName === 'w:p') {
-              bodyHtml += parseParagraph(sdtChild, styles, imageMap, footnoteMap, chartImageCtx, numberingState)
+              appendBodyBlock(parseParagraph(sdtChild, styles, imageMap, footnoteMap, chartImageCtx, numberingState))
             } else if (sdtChild.nodeName === 'w:tbl') {
-              bodyHtml += parseTable(sdtChild, styles, imageMap, footnoteMap, chartImageCtx)
+              appendBodyBlock(parseTable(sdtChild, styles, imageMap, footnoteMap, chartImageCtx))
             }
           }
         }
@@ -2603,6 +2659,118 @@ function mergeCellMargin(
   }
 }
 
+function parseTablePctWidth(raw?: string | null): number | null {
+  const value = (raw || '').trim()
+  if (!value) return null
+
+  if (value.endsWith('%')) {
+    const pct = parseFloat(value)
+    return Number.isFinite(pct) ? pct : null
+  }
+
+  const numeric = parseFloat(value)
+  if (!Number.isFinite(numeric)) return null
+  return numeric / 50
+}
+
+const DEFAULT_TABLE_CELL_MARGIN_PT = {
+  top: 0,
+  right: 5.75,
+  bottom: 0,
+  left: 5.75,
+}
+
+function resolveDocxLineHeightCss(lineVal: number, lineRule?: string | null): string {
+  if (!Number.isFinite(lineVal) || lineVal <= 0) return ''
+  const normalizedRule = String(lineRule || 'auto').trim().toLowerCase()
+  if (!normalizedRule || normalizedRule === 'auto') {
+    const multiplier = lineVal / 240
+    return multiplier.toFixed(2).replace(/\.?0+$/, '')
+  }
+  return `${(lineVal / 20).toFixed(1)}pt`
+}
+
+function inferUniformRunTextStyle(para: Element): {
+  fontSize?: string
+  fontFamily?: string
+  fontName?: string
+  color?: string
+  letterSpacing?: string
+} | null {
+  const runs = para.getElementsByTagName('w:r')
+  let fontSize: string | undefined
+  let fontFamily: string | undefined
+  let fontName: string | undefined
+  let color: string | undefined
+  let letterSpacing: string | undefined
+  let hasVisibleRun = false
+
+  for (let i = 0; i < runs.length; i += 1) {
+    const run = runs[i]
+    const text = Array.from(run.getElementsByTagName('w:t'))
+      .map((node) => node.textContent || '')
+      .join('')
+      .replace(/\u00a0/g, ' ')
+      .trim()
+    if (!text) continue
+
+    hasVisibleRun = true
+    const rPr = run.getElementsByTagName('w:rPr')[0]
+    const sz = rPr?.getElementsByTagName('w:sz')[0]
+    const rFonts = rPr?.getElementsByTagName('w:rFonts')[0]
+    const colorEl = rPr?.getElementsByTagName('w:color')[0]
+    const spacingEl = rPr?.getElementsByTagName('w:spacing')[0]
+
+    const nextFontSize = sz?.getAttribute('w:val') ? halfPointsToPt(parseInt(sz.getAttribute('w:val') || '0', 10)) : undefined
+    const nextFontName = rFonts ? resolveFontNameFromRFonts(rFonts) : ''
+    const nextFontFamily = nextFontName ? (getSafeFontFamily(nextFontName) || '') : undefined
+    const nextColor =
+      colorEl?.getAttribute('w:val') && colorEl.getAttribute('w:val') !== 'auto'
+        ? `#${colorEl.getAttribute('w:val')}`
+        : undefined
+    const nextLetterSpacing =
+      spacingEl?.getAttribute('w:val') != null
+        ? `${parseInt(spacingEl.getAttribute('w:val') || '0', 10) / 20}pt`
+        : undefined
+
+    if (fontSize === undefined) fontSize = nextFontSize
+    else if ((nextFontSize || '') !== fontSize) fontSize = ''
+
+    if (fontFamily === undefined) fontFamily = nextFontFamily
+    else if ((nextFontFamily || '') !== fontFamily) fontFamily = ''
+
+    if (fontName === undefined) fontName = nextFontName || undefined
+    else if ((nextFontName || '') !== (fontName || '')) fontName = ''
+
+    if (color === undefined) color = nextColor
+    else if ((nextColor || '') !== (color || '')) color = ''
+
+    if (letterSpacing === undefined) letterSpacing = nextLetterSpacing
+    else if ((nextLetterSpacing || '') !== (letterSpacing || '')) letterSpacing = ''
+  }
+
+  if (!hasVisibleRun) return null
+  return {
+    fontSize: fontSize || undefined,
+    fontFamily: fontFamily || undefined,
+    fontName: fontName || undefined,
+    color: color || undefined,
+    letterSpacing: letterSpacing || undefined,
+  }
+}
+
+function isStructuredTocHtmlBlock(html: string): boolean {
+  return /\bclass="[^"]*\bdocx-toc\b/.test(html)
+}
+
+function isTocHeadingHtmlBlock(html: string): boolean {
+  return /text-align:\s*center/i.test(html) && />\s*(?:<span[^>]*>)?\s*目录\s*(?:<\/span>)?\s*<\/p>/i.test(html)
+}
+
+function isEffectivelyBlankHtmlBlock(html: string): boolean {
+  return /^<(?:p|h[1-6])[^>]*>\s*(?:<br[^>]*>)?\s*<\/(?:p|h[1-6])>$/i.test((html || '').trim())
+}
+
 // 解析表格
 function parseTable(
   tbl: Element,
@@ -2617,6 +2785,7 @@ function parseTable(
   let tableCellMargin: { top?: number; right?: number; bottom?: number; left?: number } | undefined
   let headerRowStyle: TableStylePr | null = null
   let tableLayoutType: string | undefined
+  let explicitTableWidthCss: string | null = null
   
   // 获取表格网格定义（列宽）
   const tblGrid = tbl.getElementsByTagName('w:tblGrid')[0]
@@ -2634,6 +2803,10 @@ function parseTable(
       }
     }
   }
+  const hasReliableGridWidth =
+    totalWidth > 0 && totalWidth / 20 >= MIN_RELIABLE_TABLE_WIDTH_PT
+  const effectiveColumnWidths = hasReliableGridWidth ? columnWidths : []
+  const effectiveTotalWidth = hasReliableGridWidth ? totalWidth : 0
   
   // 解析表格属性
   const tblPr = tbl.getElementsByTagName('w:tblPr')[0]
@@ -2687,25 +2860,35 @@ function parseTable(
     
     // 表格宽度
     const tblW = tblPr.getElementsByTagName('w:tblW')[0]
-    let tableWidthCss: string | null = null
     if (tblW) {
       const w = tblW.getAttribute('w:w')
       const type = tblW.getAttribute('w:type')
       if (w && type === 'pct') {
-        tableWidthCss = `${parseInt(w) / 50}%`
+        const pctWidth = parseTablePctWidth(w)
+        if (Number.isFinite(pctWidth) && pctWidth! >= 5) {
+          explicitTableWidthCss = `${Math.min(pctWidth!, 100)}%`
+        } else if (effectiveTotalWidth > 0) {
+          explicitTableWidthCss = `${effectiveTotalWidth / 20}pt`
+        } else {
+          explicitTableWidthCss = '100%'
+        }
       } else if (w && (!type || type === 'dxa')) {
-        tableWidthCss = `${parseInt(w) / 20}pt`
+        const widthPt = parseInt(w) / 20
+        if (Number.isFinite(widthPt) && widthPt >= 40) {
+          explicitTableWidthCss = `${widthPt}pt`
+        } else if (effectiveTotalWidth > 0) {
+          explicitTableWidthCss = `${effectiveTotalWidth / 20}pt`
+        } else {
+          explicitTableWidthCss = widthPt >= MIN_RELIABLE_TABLE_WIDTH_PT ? `${widthPt}pt` : 'auto'
+        }
       } else if (type === 'auto') {
-        tableWidthCss = totalWidth > 0 ? `${totalWidth / 20}pt` : '100%'
+        explicitTableWidthCss = effectiveTotalWidth > 0 ? `${effectiveTotalWidth / 20}pt` : '100%'
       }
-    } else if (totalWidth > 0) {
+    } else if (effectiveTotalWidth > 0) {
       // 使用计算出的总宽度
-      tableWidthCss = `${totalWidth / 20}pt`
+      explicitTableWidthCss = `${effectiveTotalWidth / 20}pt`
     } else {
-      tableWidthCss = '100%'
-    }
-    if (tableWidthCss) {
-      tableStyle += ` width: ${tableWidthCss}; --table-width: ${tableWidthCss};`
+      explicitTableWidthCss = '100%'
     }
 
     const tblBordersEl = tblPr.getElementsByTagName('w:tblBorders')[0]
@@ -2726,15 +2909,22 @@ function parseTable(
       }
     }
   } else {
-    tableStyle += ' width: 100%;'
+    explicitTableWidthCss = '100%'
   }
+
+  if (!tableLayoutType && !hasReliableGridWidth) {
+    tableStyle = tableStyle.replace(/table-layout:\s*fixed;?/i, 'table-layout: auto;')
+  }
+
+  const tableWidthCss = explicitTableWidthCss || '100%'
+  tableStyle += ` width: ${tableWidthCss}; --table-width: ${tableWidthCss};`
   
   const dataAttrs: string[] = []
-  if (columnWidths.length > 0) {
-    dataAttrs.push(`data-tbl-grid="${columnWidths.join(',')}"`)
+  if (effectiveColumnWidths.length > 0) {
+    dataAttrs.push(`data-tbl-grid="${effectiveColumnWidths.join(',')}"`)
   }
-  if (totalWidth > 0) {
-    dataAttrs.push(`data-tbl-grid-total="${totalWidth}"`)
+  if (effectiveTotalWidth > 0) {
+    dataAttrs.push(`data-tbl-grid-total="${effectiveTotalWidth}"`)
   }
   if (tableLayoutType) {
     dataAttrs.push(`data-tbl-layout="${tableLayoutType}"`)
@@ -2742,12 +2932,12 @@ function parseTable(
   let html = `<table style="${tableStyle}" ${dataAttrs.join(' ')}>`
   
   // 如果有列宽定义，添加 colgroup
-  if (columnWidths.length > 0) {
+  if (effectiveColumnWidths.length > 0) {
     html += '<colgroup>'
-    for (const width of columnWidths) {
+    for (const width of effectiveColumnWidths) {
       // 转换为百分比或固定宽度
-      if (totalWidth > 0) {
-        const pct = (width / totalWidth * 100).toFixed(2)
+      if (effectiveTotalWidth > 0) {
+        const pct = (width / effectiveTotalWidth * 100).toFixed(2)
         html += `<col style="width: ${pct}%;">`
       } else {
         html += `<col style="width: ${width / 20}pt;">`
@@ -2772,8 +2962,8 @@ function parseTable(
         styles, 
         isHeaderRow,
         isFirstRow,
-        columnWidths, 
-        totalWidth, 
+        effectiveColumnWidths, 
+        effectiveTotalWidth, 
         imageMap, 
         footnoteMap, 
         imageCtx,
@@ -2809,6 +2999,8 @@ function parseTableRow(
   tableCellMargin?: { top?: number; right?: number; bottom?: number; left?: number }
 ): string {
   let rowStyle = ''
+  let rowHeightValue: string | null = null
+  let rowHeightRule: 'exact' | 'atLeast' | null = null
   
   // 解析行属性
   const trPr = tr.getElementsByTagName('w:trPr')[0]
@@ -2817,11 +3009,25 @@ function parseTableRow(
     const trHeight = trPr.getElementsByTagName('w:trHeight')[0]
     if (trHeight) {
       const val = trHeight.getAttribute('w:val')
+      const hRule = (trHeight.getAttribute('w:hRule') || '').toLowerCase()
       if (val) {
-        rowStyle += `height: ${parseInt(val) / 20}pt;`
+        const heightPt = `${parseInt(val) / 20}pt`
+        if (hRule === 'exact') {
+          rowStyle += `height: ${heightPt};`
+          rowHeightValue = heightPt
+          rowHeightRule = 'exact'
+        } else {
+          rowStyle += `min-height: ${heightPt};`
+          rowHeightValue = heightPt
+          rowHeightRule = 'atLeast'
+        }
       }
     }
   }
+  const hasReliableGridWidth =
+    totalWidth > 0 && totalWidth / 20 >= MIN_RELIABLE_TABLE_WIDTH_PT
+  const effectiveColumnWidths = hasReliableGridWidth ? columnWidths : []
+  const effectiveTotalWidth = hasReliableGridWidth ? totalWidth : 0
   
   let html = rowStyle ? `<tr style="${rowStyle}">` : '<tr>'
   
@@ -2848,6 +3054,8 @@ function parseTableRow(
         headerRowStyle,
         tableBorders,
         tableCellMargin,
+        rowHeightValue,
+        rowHeightRule,
         totalCols,
         !!isLastRow,
         isFirstRow
@@ -2882,6 +3090,85 @@ function parseCellMarginFromPr(pr?: Element | null) {
   }
 }
 
+function decodeHtmlText(html: string): string {
+  return (html || '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+}
+
+function getDirectRowCells(tr: Element): Element[] {
+  const cells: Element[] = []
+  const children = tr.childNodes
+  for (let i = 0; i < children.length; i++) {
+    const child = children[i] as Element
+    if (child?.nodeName === 'w:tc') {
+      cells.push(child)
+    }
+  }
+  return cells
+}
+
+function getCellColSpan(tc: Element): number {
+  const tcPr = tc.getElementsByTagName('w:tcPr')[0]
+  if (!tcPr) return 1
+  const gridSpan = tcPr.getElementsByTagName('w:gridSpan')[0]
+  if (!gridSpan) return 1
+  const val = parseInt(gridSpan.getAttribute('w:val') || '1', 10)
+  return Number.isFinite(val) && val > 0 ? val : 1
+}
+
+function getCellAtVisualColumn(tr: Element, targetColIndex: number): Element | null {
+  const cells = getDirectRowCells(tr)
+  let currentCol = 0
+  for (const cell of cells) {
+    const span = getCellColSpan(cell)
+    if (currentCol === targetColIndex) {
+      return cell
+    }
+    currentCol += span
+  }
+  return null
+}
+
+function computeVerticalRowSpan(tc: Element, colIndex: number): number {
+  const tcPr = tc.getElementsByTagName('w:tcPr')[0]
+  if (!tcPr) return 1
+  const vMerge = tcPr.getElementsByTagName('w:vMerge')[0]
+  if (!vMerge) return 1
+  const val = vMerge.getAttribute('w:val')
+  if (val && val !== 'restart') return 1
+
+  let span = 1
+  let currentRow = tc.parentElement
+  while (currentRow) {
+    let nextRow = currentRow.nextElementSibling as Element | null
+    while (nextRow && nextRow.nodeName !== 'w:tr') {
+      nextRow = nextRow.nextElementSibling as Element | null
+    }
+    if (!nextRow) break
+
+    const nextCell = getCellAtVisualColumn(nextRow, colIndex)
+    if (!nextCell) break
+
+    const nextTcPr = nextCell.getElementsByTagName('w:tcPr')[0]
+    const nextVMerge = nextTcPr?.getElementsByTagName('w:vMerge')[0]
+    if (!nextVMerge) break
+
+    const nextVal = nextVMerge.getAttribute('w:val')
+    if (nextVal && nextVal !== 'continue') break
+
+    span += 1
+    currentRow = nextRow
+  }
+
+  return span
+}
+
 // 解析表格单元格
 function parseTableCell(
   tc: Element,
@@ -2897,15 +3184,23 @@ function parseTableCell(
   headerRowStyle?: TableStylePr,
   tableBorders?: TableBorders,
   tableCellMargin?: { top?: number; right?: number; bottom?: number; left?: number },
+  rowHeightValue?: string | null,
+  rowHeightRule?: 'exact' | 'atLeast' | null,
   totalCols: number = 0,
   isLastRow: boolean = false,
   isFirstRow: boolean = false
 ): { html: string; colSpan: number } {
-  let cellStyle = 'padding: 2pt 5pt; vertical-align: middle;'
+  let cellStyle = `box-sizing: border-box; vertical-align: ${isHeader ? 'middle' : 'top'};`
   let colspan = ''
+  let rowspan = ''
   let colSpan = 1
   let hasCellBackground = false
   let hasBorderStyle = false
+  const gridWidthTwips = columnWidths.length > 0
+    ? columnWidths
+      .slice(colIndex, colIndex + colSpan)
+      .reduce((sum, w) => sum + w, 0)
+    : 0
   
   // 解析单元格属性
   const tcPr = tc.getElementsByTagName('w:tcPr')[0]
@@ -2917,9 +3212,9 @@ function parseTableCell(
     const left = margin.left
     if (top == null && right == null && bottom == null && left == null) return
     cellStyle = cellStyle.replace(/padding:[^;]+;?/i, '')
-    if (top != null) cellStyle += ` padding-top: ${top}pt;`
+    if (top != null && top > 0) cellStyle += ` padding-top: ${top}pt;`
     if (right != null) cellStyle += ` padding-right: ${right}pt;`
-    if (bottom != null) cellStyle += ` padding-bottom: ${bottom}pt;`
+    if (bottom != null && bottom > 0) cellStyle += ` padding-bottom: ${bottom}pt;`
     if (left != null) cellStyle += ` padding-left: ${left}pt;`
   }
   
@@ -2943,6 +3238,10 @@ function parseTableCell(
         return { html: '', colSpan }
       }
       // val="restart" 表示这是合并的起始单元格
+      const rowSpan = computeVerticalRowSpan(tc, colIndex)
+      if (rowSpan > 1) {
+        rowspan = ` rowspan="${rowSpan}"`
+      }
     }
     
     // 单元格宽度 - 优先使用 tcW，否则从 columnWidths 计算
@@ -2950,10 +3249,20 @@ function parseTableCell(
     if (tcW) {
       const w = tcW.getAttribute('w:w')
       const type = tcW.getAttribute('w:type')
-      if (w && (!type || type === 'dxa')) {
-        cellStyle += ` width: ${parseInt(w) / 20}pt;`
-      } else if (w && type === 'pct') {
-        cellStyle += ` width: ${parseInt(w) / 50}%;`
+      if (w && (!type || type === 'dxa') && gridWidthTwips <= 0) {
+        const widthPt = parseInt(w) / 20
+        if (Number.isFinite(widthPt) && widthPt >= MIN_RELIABLE_CELL_WIDTH_PT) {
+          cellStyle += ` width: ${widthPt}pt;`
+        }
+      } else if (w && type === 'pct' && gridWidthTwips <= 0) {
+        const widthPct = parseInt(w) / 50
+        if (Number.isFinite(widthPct) && widthPct >= 10) {
+          cellStyle += ` width: ${widthPct}%;`
+        }
+      }
+    } else if (gridWidthTwips > 0) {
+      if (gridWidthTwips > 0) {
+        cellStyle += ` width: ${gridWidthTwips / 20}pt;`
       }
     }
     
@@ -3003,7 +3312,7 @@ function parseTableCell(
     
     // 单元格内边距
     const tcMar = tcPr.getElementsByTagName('w:tcMar')[0]
-    const cellMargin = parseCellMarginFromPr(tcMar) || tableCellMargin
+    const cellMargin = mergeCellMargin(DEFAULT_TABLE_CELL_MARGIN_PT, parseCellMarginFromPr(tcMar) || tableCellMargin)
     applyCellMargin(cellMargin)
 
     // 垂直对齐
@@ -3020,17 +3329,19 @@ function parseTableCell(
     }
   }
   
-  if (!tcPr && tableCellMargin) {
-    applyCellMargin(tableCellMargin)
+  if (!tcPr) {
+    applyCellMargin(mergeCellMargin(DEFAULT_TABLE_CELL_MARGIN_PT, tableCellMargin))
   }
 
+  if (!/(?:^|;)\s*padding-top:\s*/i.test(cellStyle)) cellStyle += ` padding-top: ${DEFAULT_TABLE_CELL_MARGIN_PT.top}pt;`
+  if (!/(?:^|;)\s*padding-right:\s*/i.test(cellStyle)) cellStyle += ` padding-right: ${DEFAULT_TABLE_CELL_MARGIN_PT.right}pt;`
+  if (!/(?:^|;)\s*padding-bottom:\s*/i.test(cellStyle)) cellStyle += ` padding-bottom: ${DEFAULT_TABLE_CELL_MARGIN_PT.bottom}pt;`
+  if (!/(?:^|;)\s*padding-left:\s*/i.test(cellStyle)) cellStyle += ` padding-left: ${DEFAULT_TABLE_CELL_MARGIN_PT.left}pt;`
+
   const hasWidthStyle = /(?:^|;)\s*width:\s*/i.test(cellStyle)
-  if (!hasWidthStyle && columnWidths.length && totalWidth > 0) {
-    const widthTwips = columnWidths
-      .slice(colIndex, colIndex + colSpan)
-      .reduce((sum, w) => sum + w, 0)
-    if (widthTwips > 0) {
-      cellStyle += ` width: ${widthTwips / 20}pt;`
+  if (!hasWidthStyle && gridWidthTwips > 0) {
+    if (gridWidthTwips > 0) {
+      cellStyle += ` width: ${gridWidthTwips / 20}pt;`
     }
   }
 
@@ -3050,6 +3361,10 @@ function parseTableCell(
   if (!hasBorderStyle) {
     cellStyle += ' border: 0.5pt solid var(--word-rule);'
   }
+
+  if (rowHeightValue) {
+    cellStyle += ` height: ${rowHeightValue};`
+  }
   
   // 解析单元格内容（只处理直接子段落）
   let content = ''
@@ -3059,9 +3374,6 @@ function parseTableCell(
   for (let i = 0; i < children.length; i++) {
     const child = children[i] as Element
     if (child.nodeName === 'w:p') {
-      if (paragraphCount > 0) {
-        content += '<br>'
-      }
       content += parseParagraphContent(child, styles, true, imageMap, footnoteMap, imageCtx)
       paragraphCount++
     }
@@ -3092,7 +3404,7 @@ function parseTableCell(
   }
   
   return { 
-    html: `<${tag} style="${cellStyle}"${colspan}>${content || '&nbsp;'}</${tag}>`,
+    html: `<${tag} style="${cellStyle}"${colspan}${rowspan}>${content || '&nbsp;'}</${tag}>`,
     colSpan 
   }
 }
@@ -3122,14 +3434,28 @@ function parseParagraphContent(
   imageCtx?: ImageParseContext
 ): string {
   const pPr = para.getElementsByTagName('w:pPr')[0]
-  let alignment = ''
+  const blockStyleParts: string[] = []
   
   if (pPr) {
     const jc = pPr.getElementsByTagName('w:jc')[0]
     if (jc) {
       const val = jc.getAttribute('w:val')
-      if (val === 'center') alignment = 'text-align: center;'
-      else if (val === 'right') alignment = 'text-align: right;'
+      if (val === 'center') blockStyleParts.push('text-align: center')
+      else if (val === 'right') blockStyleParts.push('text-align: right')
+      else if (val === 'both' || val === 'distribute') blockStyleParts.push('text-align: justify')
+    }
+
+    const spacing = pPr.getElementsByTagName('w:spacing')[0]
+    if (spacing) {
+      const line = spacing.getAttribute('w:line')
+      const lineRule = spacing.getAttribute('w:lineRule')
+      if (line) {
+        const lineVal = parseInt(line, 10)
+        const lineHeightCss = resolveDocxLineHeightCss(lineVal, lineRule)
+        if (lineHeightCss) {
+          blockStyleParts.push(`line-height: ${lineHeightCss}`)
+        }
+      }
     }
   }
   
@@ -3160,10 +3486,18 @@ function parseParagraphContent(
     }
   }
   
-  if (alignment && content) {
-    return `<span style="${alignment}">${content}</span>`
+  if (!content) return ''
+
+  if (inTable) {
+    blockStyleParts.push('display: block')
+    blockStyleParts.push('margin: 0')
+    blockStyleParts.push('padding: 0')
+    const styleAttr = blockStyleParts.length > 0
+      ? ` style="${blockStyleParts.join('; ')}"`
+      : ''
+    return `<div class="docx-cell-para"${styleAttr}>${content}</div>`
   }
-  
+
   return content
 }
 
@@ -3228,6 +3562,12 @@ function parseStyles(stylesXml: string, themeColors?: Record<string, string>): R
 
 function parseStyleElement(style: Element, themeColors?: Record<string, string>): any {
   const result: any = {}
+
+  const nameEl = style.getElementsByTagName('w:name')[0]
+  if (nameEl) {
+    const styleName = nameEl.getAttribute('w:val')
+    if (styleName) result.styleName = styleName
+  }
   
   const basedOn = style.getElementsByTagName('w:basedOn')[0]
   if (basedOn) {
@@ -3264,11 +3604,7 @@ function parseStyleElement(style: Element, themeColors?: Record<string, string>)
       if (after) result.marginBottom = `${parseInt(after) / 20}pt`
       if (line) {
         const lineRule = spacing.getAttribute('w:lineRule')
-        if (lineRule === 'auto') {
-          result.lineHeight = (parseInt(line) / 240).toFixed(2)
-        } else {
-          result.lineHeight = `${parseInt(line) / 20}pt`
-        }
+        result.lineHeight = resolveDocxLineHeightCss(parseInt(line), lineRule)
       }
     }
   }
@@ -3329,6 +3665,17 @@ function parseStyleElement(style: Element, themeColors?: Record<string, string>)
       const val = underline.getAttribute('w:val')
       if (val && val !== 'none') {
         result.underline = true
+      }
+    }
+
+    const spacing = rPr.getElementsByTagName('w:spacing')[0]
+    if (spacing) {
+      const val = spacing.getAttribute('w:val')
+      if (val) {
+        const spacingPt = parseInt(val, 10) / 20
+        if (Number.isFinite(spacingPt) && spacingPt !== 0) {
+          result.letterSpacing = `${spacingPt}pt`
+        }
       }
     }
     
@@ -3535,6 +3882,7 @@ function parseParagraph(
   let paraFontFamily = ''
   let paraFontName = ''  // 原始字体名（用于 UI 显示）
   let paraColor = ''
+  let paraLetterSpacing = ''
   let isListItem = false
   let listLevel = 0
   let listMarker = ''  // 列表项标记文本
@@ -3605,9 +3953,6 @@ function parseParagraph(
       const styleId = pStyle.getAttribute('w:val')
       if (styleId) {
         const lowerStyleId = styleId.toLowerCase()
-        if (lowerStyleId.includes('toc') || styleId.includes('目录')) {
-          isTocParagraph = true
-        }
         // 检查是否为列表样式（无 numPr 时仅标记，不添加 CSS list-item 避免干扰）
         if (styleId.includes('ListParagraph') || styleId.includes('列表段落')) {
           if (!isListItem) {
@@ -3622,6 +3967,10 @@ function parseParagraph(
         if (styles[styleId]) {
           styleData = styles[styleId]
           Object.assign(paraStyle, styleData)
+          const styleName = String(styleData.styleName || '').toLowerCase()
+          if (lowerStyleId.includes('toc') || styleId.includes('目录') || styleName.includes('toc') || styleName.includes('目录')) {
+            isTocParagraph = true
+          }
           // 从样式中继承字体信息（如果段落自身没有定义）
           if (styleData.fontFamily && !paraFontFamily) {
             paraFontFamily = styleData.fontFamily
@@ -3700,6 +4049,17 @@ function parseParagraph(
           }
         }
       }
+
+      const spacing = pRpr.getElementsByTagName('w:spacing')[0]
+      if (spacing) {
+        const val = spacing.getAttribute('w:val')
+        if (val) {
+          const spacingPt = parseInt(val, 10) / 20
+          if (Number.isFinite(spacingPt) && spacingPt !== 0) {
+            paraLetterSpacing = `${spacingPt}pt`
+          }
+        }
+      }
     }
 
     // 对齐方式
@@ -3737,8 +4097,8 @@ function parseParagraph(
       } else if (firstLine) {
         const twips = parseInt(firstLine)
         if (twips > 0) {
-          const em = twips / 240
-          styleProps.push(`text-indent: ${em.toFixed(2)}em`)
+          const pt = twips / 20
+          styleProps.push(`text-indent: ${pt.toFixed(1)}pt`)
           hasIndent = true
         }
       }
@@ -3747,8 +4107,8 @@ function parseParagraph(
       if (hanging) {
         const twips = parseInt(hanging)
         if (twips > 0) {
-          const em = twips / 240
-          styleProps.push(`text-indent: -${em.toFixed(2)}em`)
+          const pt = twips / 20
+          styleProps.push(`text-indent: -${pt.toFixed(1)}pt`)
           hasIndent = true
         }
       }
@@ -3762,8 +4122,8 @@ function parseParagraph(
       } else if (left) {
         const twips = parseInt(left)
         if (twips > 0) {
-          const em = twips / 240
-          styleProps.push(`padding-left: ${em.toFixed(2)}em`)
+          const pt = twips / 20
+          styleProps.push(`padding-left: ${pt.toFixed(1)}pt`)
         }
       }
     }
@@ -3813,18 +4173,9 @@ function parseParagraph(
       // 行距处理
       if (line) {
         const lineVal = parseInt(line)
-        if (lineRule === 'exact') {
-          // 固定值行距
-          styleProps.push(`line-height: ${(lineVal / 20).toFixed(1)}pt`)
-          hasLineHeight = true
-        } else if (lineRule === 'atLeast') {
-          // 最小值行距
-          styleProps.push(`line-height: ${(lineVal / 20).toFixed(1)}pt`)
-          hasLineHeight = true
-        } else if (!lineRule || lineRule === 'auto') {
-          // 倍数行距：240 = 单倍行距
-          const multiplier = lineVal / 240
-          styleProps.push(`line-height: ${multiplier.toFixed(2)}`)
+        const lineHeightCss = resolveDocxLineHeightCss(lineVal, lineRule)
+        if (lineHeightCss) {
+          styleProps.push(`line-height: ${lineHeightCss}`)
           hasLineHeight = true
         }
       }
@@ -3932,6 +4283,37 @@ function parseParagraph(
   const hasImage = /<img\b/i.test(content)
   const hasVisibleContent = plainText.length > 0 || hasImage
   const isImageOnly = hasImage && plainText.length === 0
+  const compactPlainText = plainText.replace(/\s+/g, '')
+  const paraFontSizePt = paraFontSize ? parseFloat(paraFontSize) : NaN
+  const inlineFontSizeMatch = content.match(/font-size:\s*(\d+(?:\.\d+)?)pt/i)
+  const inlineFontSizePt = inlineFontSizeMatch ? parseFloat(inlineFontSizeMatch[1]) : NaN
+  const dominantFontSizePt = Math.max(
+    Number.isFinite(paraFontSizePt) ? paraFontSizePt : 0,
+    Number.isFinite(inlineFontSizePt) ? inlineFontSizePt : 0,
+  )
+  const isCenteredParagraph = paraStyle.alignment === 'center'
+  const isCoverTitleLine =
+    isCenteredParagraph &&
+    !hasImage &&
+    !isTocParagraph &&
+    compactPlainText.length >= 12 &&
+    compactPlainText.length <= 32 &&
+    dominantFontSizePt >= 24 &&
+    dominantFontSizePt <= 40
+  const isCoverMetaLine =
+    isCenteredParagraph &&
+    !hasImage &&
+    plainText.length > 0 &&
+    plainText.length <= 40 &&
+    /^(主办单位|承办单位|活动时间|活动日期|策划部门|活动地点|活动名称|时间|日期|部门)[:：]/.test(plainText)
+  const isCoverDisplayLine =
+    isCenteredParagraph &&
+    !hasImage &&
+    compactPlainText.length === 1 &&
+    dominantFontSizePt >= 48
+  const isCenteredCoverSpacer =
+    isCenteredParagraph &&
+    !hasVisibleContent
 
   if (pendingNumbering && hasVisibleContent) {
     const marker = buildListMarkerText(pendingNumbering.numId, pendingNumbering.level, numberingState || {})
@@ -3943,6 +4325,11 @@ function parseParagraph(
   if (isImageOnly) {
     styleProps.push('line-height: 0')
     styleProps.push('font-size: 0')
+  }
+
+  if ((isCoverDisplayLine || isCenteredCoverSpacer) && !hasLineHeight) {
+    styleProps.push('line-height: 1')
+    hasLineHeight = true
   }
 
   if (!hasVisibleContent && isListItem) {
@@ -3963,7 +4350,36 @@ function parseParagraph(
     return `<span class="docx-toc-left">${left}</span><span class="docx-toc-leader">${dots}</span><span class="docx-toc-right">${right}</span>`
   }
 
+  const detectLiteralTocLeader = (rawHtml: string) => {
+    const plain = decodeHtmlText(rawHtml)
+      .replace(/\u00a0/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+    if (!plain) return null
+    const match = plain.match(/^(.+?)([.．·…]{8,})\s*(\d+)\s*$/)
+    if (!match) return null
+    return {
+      left: escapeHtml(match[1].trim()),
+      right: escapeHtml(match[3].trim()),
+    }
+  }
+
   const isTocWithTabs = isTocParagraph && content.includes(DOCX_TAB_TOKEN)
+  const literalTocLeader = !isTocWithTabs ? detectLiteralTocLeader(content) : null
+  const isStructuredToc = isTocWithTabs || !!literalTocLeader
+
+  if (isStructuredToc && (!paraFontSize || !paraFontFamily || !paraFontName || !paraLetterSpacing || !paraColor)) {
+    const inferredRunStyle = inferUniformRunTextStyle(para)
+    if (inferredRunStyle) {
+      if (!paraFontSize && inferredRunStyle.fontSize) paraFontSize = inferredRunStyle.fontSize
+      if (!paraFontFamily && inferredRunStyle.fontFamily) paraFontFamily = inferredRunStyle.fontFamily
+      if (!paraFontName && inferredRunStyle.fontName) paraFontName = inferredRunStyle.fontName
+      if (!paraLetterSpacing && inferredRunStyle.letterSpacing) paraLetterSpacing = inferredRunStyle.letterSpacing
+      if (!paraColor && inferredRunStyle.color && !shouldIgnoreColorInDarkMode(inferredRunStyle.color)) {
+        paraColor = inferredRunStyle.color
+      }
+    }
+  }
 
   if (isTocWithTabs) {
     const anchorMatch = content.match(/^<a\s+[^>]*>[\s\S]*<\/a>$/)
@@ -3976,8 +4392,12 @@ function parseParagraph(
       content = buildTocMarkup(content)
     }
     styleProps.push('display: flex')
-    styleProps.push('align-items: center')
-    styleProps.push('gap: 0.5em')
+    styleProps.push('align-items: baseline')
+    styleProps.push('white-space: nowrap')
+  } else if (literalTocLeader) {
+    content = `<span class="docx-toc-left">${literalTocLeader.left}</span><span class="docx-toc-leader">${'.'.repeat(80)}</span><span class="docx-toc-right">${literalTocLeader.right}</span>`
+    styleProps.push('display: flex')
+    styleProps.push('align-items: baseline')
     styleProps.push('white-space: nowrap')
   } else if (content.includes(DOCX_TAB_TOKEN)) {
     const segments = content.split(DOCX_TAB_TOKEN)
@@ -3993,20 +4413,18 @@ function parseParagraph(
     dataAttrs.push(`data-docx-tab-leader="${tocTabLeader}"`)
   }
 
-  styleAttr = styleProps.length > 0 ? ` style="${styleProps.join('; ')}"` : ''
-
   const classNames: string[] = []
-  if (isTocWithTabs) classNames.push('docx-toc')
+  if (isStructuredToc) classNames.push('docx-toc')
   if (isImageOnly) classNames.push('docx-image-only')
+  if (isCoverTitleLine) classNames.push('docx-cover-title-line')
+  if (isCoverDisplayLine) classNames.push('docx-cover-display-line')
+  if (isCoverMetaLine) classNames.push('docx-cover-meta-line')
+  if (isCenteredCoverSpacer) classNames.push('docx-cover-spacer')
   const classAttr = classNames.length > 0 ? ` class="${classNames.join(' ')}"` : ''
   const dataAttr = dataAttrs.length > 0 ? ` ${dataAttrs.join(' ')}` : ''
 
   const wrapWithPageBreak = (html: string) =>
     hasPageBreakBefore ? `<hr class="page-break" />${html}` : html
-
-  if (!content.trim()) {
-    return wrapWithPageBreak(`<${tag}${classAttr}${dataAttr}${styleAttr}><br></${tag}>`)
-  }
 
   // 关键：段落级字体/字号/颜色不要挂在 block(<p>/<h*>) 上，
   // 因为 Tiptap 导入 HTML 时通常不会保留 block 的 style（会导致字体信息丢失）。
@@ -4014,6 +4432,8 @@ function parseParagraph(
   const paraSpanStyle: string[] = []
   if (paraFontFamily) paraSpanStyle.push(`font-family: ${paraFontFamily}`)
   if (paraFontSize) paraSpanStyle.push(`font-size: ${paraFontSize}`)
+  if (paraLetterSpacing) paraSpanStyle.push(`letter-spacing: ${paraLetterSpacing}`)
+  if (shouldUseSyntheticBold(paraFontName)) paraSpanStyle.push('font-weight: 800')
   // 在深色模式下，忽略黑色或接近黑色的颜色，让 CSS 变量自动处理
   if (paraColor && !shouldIgnoreColorInDarkMode(paraColor)) {
     paraSpanStyle.push(`color: ${paraColor}`)
@@ -4023,10 +4443,24 @@ function parseParagraph(
     paraSpanStyle.length = 0
   }
 
+  if (isStructuredToc && paraSpanStyle.length > 0) {
+    styleProps.push(...paraSpanStyle)
+  }
+
+  if (!hasVisibleContent && paraSpanStyle.length > 0) {
+    styleProps.push(...paraSpanStyle)
+  }
+
+  styleAttr = styleProps.length > 0 ? ` style="${styleProps.join('; ').replace(/"/g, '&quot;')}"` : ''
+
+  if (!content.trim()) {
+    return wrapWithPageBreak(`<${tag}${classAttr}${dataAttr}${styleAttr}><br></${tag}>`)
+  }
+
   if (paraSpanStyle.length > 0) {
     // 添加 data-font-name 属性存储原始字体名，方便 UI 检测
     const fontNameAttr = paraFontName ? ` data-font-name="${paraFontName}"` : ''
-    const innerClassAttr = isTocWithTabs ? ' class="docx-toc-inner"' : ''
+    const innerClassAttr = isStructuredToc ? ' class="docx-toc-inner"' : ''
     // 转义 style 属性值中的双引号，避免与 HTML 属性引号冲突
     const styleValue = paraSpanStyle.join('; ').replace(/"/g, '&quot;')
     return wrapWithPageBreak(
@@ -4290,12 +4724,20 @@ function parseRun(run: Element, imageMap: ImageMap = {}, footnoteMap?: FootnoteM
   let style: RunStyle = {}
 
   if (rPr) {
-    if (rPr.getElementsByTagName('w:b').length > 0) {
-      style.bold = true
+    const bold = rPr.getElementsByTagName('w:b')[0]
+    if (bold) {
+      const val = bold.getAttribute('w:val')
+      if (val !== '0' && val !== 'false') {
+        style.bold = true
+      }
     }
 
-    if (rPr.getElementsByTagName('w:i').length > 0) {
-      style.italic = true
+    const italic = rPr.getElementsByTagName('w:i')[0]
+    if (italic) {
+      const val = italic.getAttribute('w:val')
+      if (val !== '0' && val !== 'false') {
+        style.italic = true
+      }
     }
 
     const u = rPr.getElementsByTagName('w:u')[0]
@@ -4317,8 +4759,12 @@ function parseRun(run: Element, imageMap: ImageMap = {}, footnoteMap?: FootnoteM
       }
     }
 
-    if (rPr.getElementsByTagName('w:strike').length > 0) {
-      style.strike = true
+    const strike = rPr.getElementsByTagName('w:strike')[0]
+    if (strike) {
+      const val = strike.getAttribute('w:val')
+      if (val !== '0' && val !== 'false') {
+        style.strike = true
+      }
     }
 
     const sz = rPr.getElementsByTagName('w:sz')[0]
@@ -4336,6 +4782,9 @@ function parseRun(run: Element, imageMap: ImageMap = {}, footnoteMap?: FootnoteM
       if (fontName) {
         style.fontName = fontName  // 存储原始字体名（用于 UI 显示）
         style.fontFamily = getSafeFontFamily(fontName)  // CSS font-family（包含回退）
+        if (shouldUseSyntheticBold(fontName)) {
+          style.fontWeight = '800'
+        }
       }
     }
 
@@ -4535,6 +4984,12 @@ function parseRun(run: Element, imageMap: ImageMap = {}, footnoteMap?: FootnoteM
   }
   if (style.fontFamily) {
     styleProps.push(`font-family: ${style.fontFamily}`)
+  }
+  if (style.fontWeight) {
+    styleProps.push(`font-weight: ${style.fontWeight}`)
+  }
+  if (style.letterSpacing) {
+    styleProps.push(`letter-spacing: ${style.letterSpacing}`)
   }
   if (style.highlight) {
     styleProps.push(`background-color: ${style.highlight}`)

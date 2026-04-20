@@ -22,7 +22,7 @@ import {
   Scissors,
   ClipboardPaste
 } from 'lucide-react'
-import { useDocument } from '../context/DocumentContext'
+import { useDocument } from '../context/useDocument'
 import { useAI } from '../context/AIContext'
 
 export default function Editor() {

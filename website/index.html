@@ -1,0 +1,1698 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Word-Cursor — AI 驱动的智能办公文档编辑器</title>
+  <meta name="description" content="Word-Cursor 把 Cursor 级别的对话式编辑、工具调用、可审阅变更带进 Word / Excel / PowerPoint。">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <script src="https://cdn.jsdelivr.net/npm/animejs@3.2.2/lib/anime.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/ScrollTrigger.min.js"></script>
+  <style>
+    /* ===== Reset & Base ===== */
+    *,
+    *::before,
+    *::after {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+      font-size: 16px;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      background: #0a0e1a;
+      color: #e0e6f0;
+      overflow-x: hidden;
+      line-height: 1.6;
+    }
+
+    a {
+      color: inherit;
+      text-decoration: none;
+    }
+
+    img {
+      max-width: 100%;
+      display: block;
+    }
+
+    /* ===== CG Cinematic Scroll Animations & Classes Built with GSAP ===== */
+    .cg-showcase-section {
+      position: relative;
+      width: 100%;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      padding: 120px 24px;
+    }
+
+    /* Background Ambient Effects */
+    .cg-ambient-glow {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(100px);
+      opacity: 0;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    .glow-word {
+      width: 600px;
+      height: 600px;
+      background: rgba(59, 130, 246, 0.15);
+    }
+
+    .glow-excel {
+      width: 500px;
+      height: 500px;
+      background: rgba(52, 211, 153, 0.15);
+    }
+
+    .glow-ppt {
+      width: 700px;
+      height: 700px;
+      background: rgba(167, 139, 250, 0.15);
+    }
+
+    /* Layout Container for Text & Mock */
+    .cg-content-wrapper {
+      position: relative;
+      z-index: 10;
+      width: 100%;
+      max-width: 1200px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 60px;
+    }
+
+    /* Mock UI Elements matching Word-Cursor-CG.html */
+    .mock-editor {
+      position: relative;
+      width: 100%;
+      max-width: 960px;
+      height: 520px;
+      background: rgba(10, 12, 20, 0.85);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 40px 100px -20px rgba(0, 0, 0, 0.8), 0 0 40px rgba(59, 130, 246, 0.1);
+      opacity: 0;
+      transform: translateY(60px) scale(0.95);
+    }
+
+    .mock-sidebar {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 200px;
+      background: rgba(255, 255, 255, 0.02);
+      border-right: 1px solid rgba(255, 255, 255, 0.05);
+      padding-top: 20px;
+    }
+
+    .mock-sidebar .file {
+      padding: 10px 16px;
+      font-size: 0.85rem;
+      color: rgba(255, 255, 255, 0.3);
+      border-left: 2px solid transparent;
+      transition: all 0.3s;
+    }
+
+    .mock-sidebar .file.active {
+      color: #60a5fa;
+      border-left-color: #60a5fa;
+      background: linear-gradient(90deg, rgba(96, 165, 250, 0.1) 0%, transparent 100%);
+    }
+
+    .mock-main {
+      position: absolute;
+      left: 200px;
+      top: 0;
+      right: 300px;
+      bottom: 0;
+      padding: 40px;
+      overflow: hidden;
+    }
+
+    .mock-chat {
+      position: absolute;
+      right: 0;
+      top: 0;
+      bottom: 0;
+      width: 300px;
+      background: rgba(255, 255, 255, 0.015);
+      border-left: 1px solid rgba(255, 255, 255, 0.05);
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .mock-main .line {
+      height: 16px;
+      margin-bottom: 12px;
+      border-radius: 4px;
+      opacity: 0.1;
+      background: #fff;
+      width: 100%;
+    }
+
+    .mock-main .line.heading {
+      width: 50%;
+      height: 28px;
+      background: #60a5fa;
+      margin-bottom: 24px;
+      opacity: 0.8;
+    }
+
+    .mock-main .line.short {
+      width: 60%;
+    }
+
+    .mock-main .diff-add {
+      background: rgba(34, 197, 94, 0.1);
+      border-left: 3px solid rgba(34, 197, 94, 0.6);
+      padding: 8px 12px;
+      margin: 8px 0;
+      border-radius: 4px;
+      font-size: 0.9rem;
+      color: rgba(34, 197, 94, 0.9);
+      opacity: 0;
+      transform: translateX(-10px);
+    }
+
+    .mock-main .diff-del {
+      background: rgba(239, 68, 68, 0.08);
+      border-left: 3px solid rgba(239, 68, 68, 0.4);
+      padding: 8px 12px;
+      margin: 8px 0;
+      border-radius: 4px;
+      font-size: 0.9rem;
+      color: rgba(239, 68, 68, 0.6);
+      text-decoration: line-through;
+      opacity: 0;
+      transform: translateX(-10px);
+    }
+
+    .mock-chat .msg {
+      padding: 12px 16px;
+      border-radius: 10px;
+      font-size: 0.9rem;
+      line-height: 1.5;
+      opacity: 0;
+      transform: translateY(10px);
+    }
+
+    .mock-chat .msg.user {
+      background: linear-gradient(135deg, rgba(59, 130, 246, 0.15), rgba(96, 165, 250, 0.05));
+      color: #93c5fd;
+      align-self: flex-end;
+      border-bottom-right-radius: 2px;
+    }
+
+    .mock-chat .msg.ai {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      color: rgba(255, 255, 255, 0.7);
+      align-self: flex-start;
+      border-bottom-left-radius: 2px;
+      position: relative;
+    }
+
+    /* Excel Grid Mock */
+    .mock-sheet {
+      position: relative;
+      width: 100%;
+      max-width: 900px;
+      background: rgba(10, 12, 20, 0.85);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 40px 100px -20px rgba(0, 0, 0, 0.8), 0 0 40px rgba(52, 211, 153, 0.08);
+      opacity: 0;
+      transform: translateY(60px) scale(0.95);
+    }
+
+    .sheet-grid {
+      display: grid;
+      grid-template-columns: 50px repeat(5, 1fr);
+      font-size: 0.9rem;
+    }
+
+    .sheet-grid .cell {
+      padding: 12px 16px;
+      border: 1px solid rgba(255, 255, 255, 0.03);
+      color: rgba(255, 255, 255, 0.5);
+    }
+
+    .sheet-grid .cell.header {
+      background: rgba(255, 255, 255, 0.02);
+      color: #8892a8;
+      font-weight: 600;
+      text-align: center;
+    }
+
+    .sheet-grid .cell.error {
+      color: #f87171;
+      background: rgba(248, 113, 113, 0.08);
+      font-weight: 600;
+      text-shadow: 0 0 8px rgba(248, 113, 113, 0.4);
+    }
+
+    .sheet-grid .cell.success {
+      color: #34d399;
+      background: rgba(52, 211, 153, 0.08);
+      font-weight: 600;
+      text-shadow: 0 0 8px rgba(52, 211, 153, 0.4);
+    }
+
+    /* PPT Grid Mock */
+    .mock-ppt-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 24px;
+      width: 100%;
+      max-width: 1000px;
+      perspective: 1000px;
+    }
+
+    .mock-ppt-slide {
+      aspect-ratio: 16/10;
+      background: rgba(10, 12, 20, 0.7);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      position: relative;
+      overflow: hidden;
+      opacity: 0;
+      transform: translateY(40px) rotateX(10deg);
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+    }
+
+    .mock-ppt-slide.pro {
+      background: radial-gradient(circle at top right, rgba(139, 92, 246, 0.2), rgba(10, 14, 26, 0.95));
+      border-color: rgba(139, 92, 246, 0.4);
+      box-shadow: 0 30px 60px rgba(0, 0, 0, 0.6), 0 0 30px rgba(139, 92, 246, 0.15);
+    }
+
+    .mock-ppt-slide .slide-num {
+      position: absolute;
+      top: 12px;
+      left: 16px;
+      font-size: 0.8rem;
+      color: rgba(255, 255, 255, 0.2);
+      font-family: monospace;
+    }
+
+    .mock-ppt-slide .slide-title {
+      font-size: 1.1rem;
+      color: #f8fafc;
+      font-weight: 600;
+      margin-bottom: 12px;
+      letter-spacing: 1px;
+    }
+
+    .mock-ppt-slide .slide-bar {
+      width: 60%;
+      height: 6px;
+      border-radius: 3px;
+      background: rgba(139, 92, 246, 0.25);
+      margin: 4px 0;
+    }
+
+    /* Text Blocks */
+    .cg-text-block {
+      text-align: center;
+      z-index: 10;
+      opacity: 0;
+      transform: translateY(30px);
+    }
+
+    .cg-text-hero {
+      font-size: clamp(2.8rem, 5vw, 4rem);
+      font-weight: 800;
+      line-height: 1.15;
+      margin-bottom: 20px;
+      letter-spacing: -0.02em;
+    }
+
+    .cg-text-hero.blue {
+      background: linear-gradient(135deg, #fff 20%, #60a5fa 80%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .cg-text-hero.green {
+      background: linear-gradient(135deg, #fff 20%, #34d399 80%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .cg-text-hero.purple {
+      background: linear-gradient(135deg, #fff 20%, #a78bfa 80%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .cg-text-sub {
+      font-size: clamp(1.1rem, 1.8vw, 1.4rem);
+      color: #94a3b8;
+      max-width: 700px;
+      margin: 0 auto;
+      line-height: 1.6;
+    }
+
+    .cg-tag-row {
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+      margin-top: 30px;
+      flex-wrap: wrap;
+    }
+
+    .cg-tag {
+      padding: 8px 20px;
+      border-radius: 30px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      backdrop-filter: blur(8px);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .cg-tag.blue {
+      color: #93c5fd;
+      border-color: rgba(96, 165, 250, 0.3);
+      background: rgba(96, 165, 250, 0.05);
+    }
+
+    .cg-tag.green {
+      color: #6ee7b7;
+      border-color: rgba(52, 211, 153, 0.3);
+      background: rgba(52, 211, 153, 0.05);
+    }
+
+    .cg-tag.purple {
+      color: #c4b5fd;
+      border-color: rgba(167, 139, 250, 0.3);
+      background: rgba(167, 139, 250, 0.05);
+    }
+
+    /* Floating Particles */
+    .cg-particle {
+      position: absolute;
+      border-radius: 50%;
+      background: #fff;
+      opacity: 0.2;
+      pointer-events: none;
+    }
+
+    /* ===== Utility ===== */
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    .section {
+      padding: 100px 0;
+      position: relative;
+    }
+
+    .section-title {
+      font-size: 2.4rem;
+      font-weight: 700;
+      text-align: center;
+      margin-bottom: 16px;
+      background: linear-gradient(135deg, #60a5fa, #a78bfa, #f472b6);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .section-subtitle {
+      text-align: center;
+      color: #8892a8;
+      font-size: 1.1rem;
+      margin-bottom: 60px;
+      max-width: 600px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    .anim-target {
+      opacity: 0;
+      transform: translateY(40px);
+    }
+
+    /* ===== Nav ===== */
+    .nav {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      background: rgba(10, 14, 26, 0.8);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      transition: background 0.3s;
+    }
+
+    .nav-inner {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 64px;
+    }
+
+    .nav-logo {
+      font-size: 1.3rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .nav-logo img {
+      width: 28px;
+      height: 28px;
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 28px;
+    }
+
+    .nav-links a {
+      font-size: 0.9rem;
+      color: #8892a8;
+      transition: color 0.2s;
+    }
+
+    .nav-links a:hover {
+      color: #60a5fa;
+    }
+
+    .nav-cta {
+      padding: 8px 20px;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      color: #fff;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+
+    .nav-cta:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
+    }
+
+    /* ===== Hero ===== */
+    .hero {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      overflow: hidden;
+      padding-top: 64px;
+    }
+
+    .hero-bg {
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+    }
+
+    .hero-bg canvas {
+      width: 100%;
+      height: 100%;
+    }
+
+    .hero-content {
+      position: relative;
+      z-index: 1;
+      text-align: center;
+      padding: 40px 24px;
+    }
+
+    .hero-badge {
+      display: inline-block;
+      padding: 6px 16px;
+      border-radius: 20px;
+      font-size: 0.8rem;
+      background: rgba(99, 102, 241, 0.15);
+      border: 1px solid rgba(99, 102, 241, 0.3);
+      color: #a5b4fc;
+      margin-bottom: 24px;
+    }
+
+    .hero h1 {
+      font-size: clamp(2.8rem, 6vw, 4.5rem);
+      font-weight: 800;
+      line-height: 1.15;
+      margin-bottom: 20px;
+      background: linear-gradient(135deg, #fff 0%, #60a5fa 50%, #a78bfa 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .hero p {
+      font-size: 1.25rem;
+      color: #8892a8;
+      max-width: 560px;
+      margin: 0 auto 40px;
+    }
+
+    .hero-buttons {
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .btn-primary {
+      padding: 14px 32px;
+      border-radius: 12px;
+      font-size: 1rem;
+      font-weight: 600;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      color: #fff;
+      transition: transform 0.2s, box-shadow 0.3s;
+      cursor: pointer;
+      border: none;
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 30px rgba(99, 102, 241, 0.4);
+    }
+
+    .btn-secondary {
+      padding: 14px 32px;
+      border-radius: 12px;
+      font-size: 1rem;
+      font-weight: 600;
+      background: rgba(255, 255, 255, 0.06);
+      color: #e0e6f0;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      transition: transform 0.2s, background 0.2s;
+      cursor: pointer;
+    }
+
+    .btn-secondary:hover {
+      transform: translateY(-2px);
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    /* ===== Glow Orbs (background decoration) ===== */
+    .glow-orb {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(80px);
+      opacity: 0.15;
+      pointer-events: none;
+    }
+
+    .glow-orb-1 {
+      width: 500px;
+      height: 500px;
+      background: #3b82f6;
+      top: -100px;
+      left: -100px;
+    }
+
+    .glow-orb-2 {
+      width: 400px;
+      height: 400px;
+      background: #8b5cf6;
+      bottom: -50px;
+      right: -50px;
+    }
+
+    .glow-orb-3 {
+      width: 300px;
+      height: 300px;
+      background: #f472b6;
+      top: 50%;
+      left: 60%;
+    }
+
+    /* ===== Highlights Cards ===== */
+    .highlights {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 24px;
+    }
+
+    .highlight-card {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 16px;
+      padding: 36px 28px;
+      text-align: center;
+      transition: transform 0.3s, border-color 0.3s, box-shadow 0.3s;
+    }
+
+    .highlight-card:hover {
+      transform: translateY(-6px);
+      border-color: rgba(99, 102, 241, 0.3);
+      box-shadow: 0 12px 40px rgba(99, 102, 241, 0.1);
+    }
+
+    .highlight-icon {
+      width: 64px;
+      height: 64px;
+      margin: 0 auto 20px;
+      border-radius: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.8rem;
+      background: linear-gradient(135deg, rgba(59, 130, 246, 0.15), rgba(139, 92, 246, 0.15));
+    }
+
+    .highlight-card h3 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin-bottom: 10px;
+      color: #f0f4ff;
+    }
+
+    .highlight-card p {
+      font-size: 0.92rem;
+      color: #8892a8;
+      line-height: 1.7;
+    }
+
+    /* ===== Feature Showcase ===== */
+    .feature-row {
+      display: flex;
+      align-items: center;
+      gap: 60px;
+      margin-bottom: 80px;
+    }
+
+    .feature-row.reverse {
+      flex-direction: row-reverse;
+    }
+
+    .feature-img {
+      flex: 1;
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .feature-img img {
+      width: 100%;
+      display: block;
+    }
+
+    .feature-text {
+      flex: 1;
+    }
+
+    .feature-tag {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: rgba(59, 130, 246, 0.15);
+      color: #60a5fa;
+      margin-bottom: 16px;
+      text-transform: uppercase;
+    }
+
+    .feature-text h3 {
+      font-size: 1.8rem;
+      font-weight: 700;
+      margin-bottom: 14px;
+      color: #f0f4ff;
+    }
+
+    .feature-text p {
+      color: #8892a8;
+      margin-bottom: 20px;
+      line-height: 1.8;
+    }
+
+    .feature-list {
+      list-style: none;
+    }
+
+    .feature-list li {
+      padding: 6px 0;
+      color: #a0aec0;
+      font-size: 0.92rem;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .feature-list li::before {
+      content: '✦';
+      color: #60a5fa;
+      font-size: 0.7rem;
+    }
+
+    /* ===== PPT Gallery ===== */
+    .gallery-wrapper {
+      position: relative;
+      width: 100%;
+      overflow: hidden;
+      padding: 20px 0 60px;
+      mask-image: linear-gradient(to right, transparent, black 10%, black 90%, transparent);
+      -webkit-mask-image: linear-gradient(to right, transparent, black 10%, black 90%, transparent);
+    }
+
+    .gallery-track {
+      display: flex;
+      gap: 32px;
+      width: max-content;
+      animation: marquee 30s linear infinite;
+    }
+
+    .gallery-track:hover {
+      animation-play-state: paused;
+    }
+
+    @keyframes marquee {
+      0% {
+        transform: translateX(0);
+      }
+
+      100% {
+        transform: translateX(calc(-50% - 16px));
+      }
+    }
+
+    .gallery-card {
+      position: relative;
+      flex: 0 0 420px;
+      border-radius: 20px;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      background: rgba(255, 255, 255, 0.02);
+      transition: transform 0.5s cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 0.5s ease, border-color 0.5s ease;
+      cursor: pointer;
+      transform-style: preserve-3d;
+      will-change: transform;
+    }
+
+    .gallery-card::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      opacity: 0.7;
+      pointer-events: none;
+      background: linear-gradient(180deg, transparent 40%, rgba(10, 14, 26, 0.95) 100%);
+      transition: opacity 0.4s;
+    }
+
+    .gallery-card:hover {
+      border-color: rgba(99, 102, 241, 0.5);
+      box-shadow: 0 24px 60px rgba(99, 102, 241, 0.25), 0 0 20px rgba(99, 102, 241, 0.1) inset;
+    }
+
+    .gallery-card:hover::after {
+      opacity: 0.95;
+    }
+
+    .gallery-card img {
+      width: 100%;
+      height: 100%;
+      aspect-ratio: 16/9;
+      object-fit: cover;
+      transition: transform 0.7s cubic-bezier(0.2, 0.8, 0.2, 1);
+      pointer-events: none;
+    }
+
+    .gallery-card:hover img {
+      transform: scale(1.08);
+    }
+
+    .gallery-card .caption {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      padding: 30px 24px 20px;
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: #fff;
+      z-index: 2;
+      pointer-events: none;
+      transform: translateY(15px) translateZ(30px);
+      opacity: 0.8;
+      transition: transform 0.4s ease, opacity 0.4s ease;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .gallery-card:hover .caption {
+      transform: translateY(0) translateZ(50px);
+      opacity: 1;
+    }
+
+    .gallery-card .caption span.badge {
+      font-size: 0.75rem;
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-weight: 500;
+      background: rgba(99, 102, 241, 0.25);
+      border: 1px solid rgba(99, 102, 241, 0.4);
+      backdrop-filter: blur(4px);
+    }
+
+    /* ===== Commands Table ===== */
+    .commands-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 16px;
+    }
+
+    .command-item {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 16px 20px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 12px;
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .command-item:hover {
+      border-color: rgba(99, 102, 241, 0.3);
+      background: rgba(99, 102, 241, 0.05);
+    }
+
+    .command-name {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: #a78bfa;
+      white-space: nowrap;
+    }
+
+    .command-desc {
+      font-size: 0.85rem;
+      color: #8892a8;
+    }
+
+    /* ===== Tech Stack ===== */
+    .tech-grid {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 20px;
+    }
+
+    .tech-item {
+      text-align: center;
+      padding: 28px 16px;
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      transition: transform 0.3s, border-color 0.3s;
+    }
+
+    .tech-item:hover {
+      transform: translateY(-4px);
+      border-color: rgba(99, 102, 241, 0.3);
+    }
+
+    .tech-item .tech-icon {
+      font-size: 2rem;
+      margin-bottom: 10px;
+    }
+
+    .tech-item .tech-name {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #c0c8dc;
+    }
+
+    .tech-item .tech-role {
+      font-size: 0.75rem;
+      color: #6b7280;
+      margin-top: 4px;
+    }
+
+    /* ===== Footer ===== */
+    .footer {
+      padding: 60px 0 40px;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      text-align: center;
+    }
+
+    .footer-links {
+      display: flex;
+      justify-content: center;
+      gap: 32px;
+      margin-bottom: 24px;
+    }
+
+    .footer-links a {
+      color: #8892a8;
+      font-size: 0.9rem;
+      transition: color 0.2s;
+    }
+
+    .footer-links a:hover {
+      color: #60a5fa;
+    }
+
+    .footer-copy {
+      color: #4b5563;
+      font-size: 0.8rem;
+    }
+
+    /* ===== Responsive ===== */
+    @media (max-width: 900px) {
+      .highlights {
+        grid-template-columns: 1fr;
+      }
+
+      .feature-row,
+      .feature-row.reverse {
+        flex-direction: column;
+      }
+
+      .tech-grid {
+        grid-template-columns: repeat(3, 1fr);
+      }
+
+      .nav-links {
+        display: none;
+      }
+
+      .gallery-card {
+        flex: 0 0 300px;
+      }
+    }
+
+    @media (max-width: 600px) {
+      .section {
+        padding: 60px 0;
+      }
+
+      .section-title {
+        font-size: 1.8rem;
+      }
+
+      .tech-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .hero h1 {
+        font-size: 2.2rem;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <!-- Nav -->
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="#" class="nav-logo"><img src="favicon.svg" alt="Logo"> Word-Cursor</a>
+      <div class="nav-links">
+        <a href="#highlights">特性</a>
+        <a href="#features">功能</a>
+        <a href="#gallery">作品</a>
+        <a href="#commands">命令</a>
+        <a href="#tech">技术栈</a>
+      </div>
+      <a href="https://github.com/Yangyangxxx/Word-Cursor/releases" target="_blank" class="nav-cta">下载 v1.0.1</a>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="hero" id="hero">
+    <div class="glow-orb glow-orb-1"></div>
+    <div class="glow-orb glow-orb-2"></div>
+    <div class="glow-orb glow-orb-3"></div>
+    <div class="hero-bg"><canvas id="particleCanvas"></canvas></div>
+    <div class="hero-content">
+      <div class="hero-badge" id="heroBadge">🚀 v1.0.1 正式发布</div>
+      <h1 id="heroTitle">Word-Cursor</h1>
+      <p id="heroDesc">AI 驱动的智能办公文档编辑器<br>对话即编辑，自然语言驱动办公</p>
+      <div class="hero-buttons" id="heroButtons">
+        <a href="https://github.com/Yangyangxxx/Word-Cursor/releases" target="_blank" class="btn-primary">立即下载</a>
+        <a href="#features" class="btn-secondary">了解更多</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Highlights -->
+  <section class="section" id="highlights">
+    <div class="container">
+      <h2 class="section-title anim-target">为什么选择 Word-Cursor</h2>
+      <p class="section-subtitle anim-target">把 Cursor 级别的 AI 编辑体验带进办公文档</p>
+      <div class="highlights">
+        <div class="highlight-card anim-target">
+          <div class="highlight-icon">💬</div>
+          <h3>对话式编辑</h3>
+          <p>用自然语言描述修改意图，AI 自动理解并执行精准的文档编辑操作，告别繁琐的手动排版。</p>
+        </div>
+        <div class="highlight-card anim-target">
+          <div class="highlight-icon">✅</div>
+          <h3>可审阅变更</h3>
+          <p>每次 AI 修改都以 Diff 形式呈现，逐条接受或拒绝，完全掌控文档的每一处变化。</p>
+        </div>
+        <div class="highlight-card anim-target">
+          <div class="highlight-icon">📄</div>
+          <h3>多格式支持</h3>
+          <p>Word 深度编辑、Excel 智能分析、PPT 一键生成，三大办公格式一站式覆盖。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Cinematic Features: Independent Scroll-Triggered Sections (Apple Style) -->
+  <div id="features-wrap" style="position: relative; background: #050508; z-index: 10;">
+
+    <!-- Showcase 1: Word Editor -->
+    <section class="cg-showcase-section cg-sect-word">
+      <div class="cg-ambient-glow glow-word" style="top: 20%; left: 0%; transform: translate(-50%, -50%);"></div>
+      <div class="cg-content-wrapper">
+        <div class="cg-text-block tm-word-text">
+          <h2 class="cg-text-hero blue">三栏合一 · 所见即所得</h2>
+          <p class="cg-text-sub">颠覆传统的文档工作流。文件树、原生编辑器与 AI 智能体同屏呈现。不再需要频繁切换窗口，沉浸在创作的零摩擦心流中。</p>
+          <div class="cg-tag-row">
+            <div class="cg-tag blue">✨ 10亿参数大模型辅助</div>
+            <div class="cg-tag blue">🎯 精准选区润色</div>
+            <div class="cg-tag blue">📝 透明化差异审阅</div>
+          </div>
+        </div>
+
+        <div class="mock-editor tm-word-ui">
+          <div class="mock-sidebar">
+            <div class="file" style="margin-top: 10px; color: #6b7280; font-weight: 600; font-size: 0.95rem;">📁 工作区目录
+            </div>
+            <div class="file active">📄 2026年度业务评估.docx</div>
+            <div class="file">📄 Q1季度数据分析.xlsx</div>
+            <div class="file">📄 产品路演演示稿.pptx</div>
+            <div class="file">📄 核心团队周报.docx</div>
+          </div>
+          <div class="mock-main">
+            <div class="line heading"></div>
+            <div class="line"></div>
+            <div class="line short"></div>
+            <div class="line"></div>
+            <!-- Word Diff Area -->
+            <div class="word-diff-container" style="margin-top: 30px;">
+              <div class="diff-del word-del">- 我们这半年的销售额有上涨，客户也说产品变好用了。</div>
+              <div class="diff-add word-add">+ H1财年核心产品线总营收同比增长达 23.5%；通过回访测试，客户满意度增至 96.3%（NPS提升至+12），创历史新高。</div>
+            </div>
+            <div class="line short" style="margin-top: 20px;"></div>
+          </div>
+          <div class="mock-chat">
+            <div class="msg user tm-word-msg1">帮我把这段大白话报告重新润色一下，加入昨天群里发的最新运营数据，语气要专业严谨。</div>
+            <div class="msg ai ai-typing tm-word-msg2">正在检索工作区上下文，调取 Q3 最新营收与 NPS 指标数据...<br><br><span
+                style="color: #60a5fa; font-size: 0.8rem; font-family: monospace;">> context_retrieved: .xlsx</span>
+            </div>
+            <div class="msg ai ai-done tm-word-msg3" style="opacity: 0; display: none;">✓ 已完成深度重写。<br><br>已嵌入最新增长率
+              (23.5%) 与 NPS 数据 (+12)，并统一为商业汇报格式要求。请在左侧审阅 Diff 差异。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Showcase 2: Excel -->
+    <section class="cg-showcase-section cg-sect-excel border-t border-gray-800"
+      style="border-top: 1px solid rgba(255,255,255,0.05);">
+      <div class="cg-ambient-glow glow-excel" style="bottom: 10%; right: -10%;"></div>
+      <div class="cg-content-wrapper">
+        <div class="cg-text-block tm-excel-text">
+          <h2 class="cg-text-hero green">告别痛苦的公式灾难</h2>
+          <p class="cg-text-sub">还在面对一整张报错的表格发愁？将 #REF! 与 #VALUE! 交给 AI 智能诊断。自然语言生成复杂函数、建立跨表引用，从此告别手动检错。</p>
+          <div class="cg-tag-row">
+            <div class="cg-tag green">⚡ 秒级海量数据纠错</div>
+            <div class="cg-tag green">🧠 智能函数推演</div>
+          </div>
+        </div>
+
+        <div class="mock-sheet tm-excel-ui">
+          <div class="sheet-grid pb-2">
+            <div class="cell header"></div>
+            <div class="cell header">A产品线</div>
+            <div class="cell header">B业务线</div>
+            <div class="cell header">企业采购</div>
+            <div class="cell header">新零售端</div>
+            <div class="cell header">总计核算</div>
+            <div class="cell header">Q1</div>
+            <div class="cell">1,200</div>
+            <div class="cell">1,450</div>
+            <div class="cell fx-err-1 error">#REF!</div>
+            <div class="cell fx-err-2 error">#VALUE!</div>
+            <div class="cell">--</div>
+            <div class="cell header">Q2</div>
+            <div class="cell">890</div>
+            <div class="cell fx-err-3 error">#REF!</div>
+            <div class="cell">1,100</div>
+            <div class="cell fx-err-4 error">#REF!</div>
+            <div class="cell">--</div>
+            <div class="cell header">Q3</div>
+            <div class="cell">3,420</div>
+            <div class="cell">3,110</div>
+            <div class="cell">2,500</div>
+            <div class="cell">1,890</div>
+            <div class="cell fx-err-5 error" style="color: #fca5a5;">#N/A</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Showcase 3: PPT -->
+    <section class="cg-showcase-section cg-sect-ppt"
+      style="border-top: 1px solid rgba(255,255,255,0.05); padding-bottom: 200px;">
+      <div class="cg-ambient-glow glow-ppt" style="top: 30%; left: 50%; transform: translate(-50%, -50%);"></div>
+      <div class="cg-content-wrapper">
+        <div class="cg-text-block tm-ppt-text">
+          <h2 class="cg-text-hero purple">一句话唤醒顶级演示</h2>
+          <p class="cg-text-sub">不需要为了调整图形对齐耗费几个小时。输入大纲，AI 引擎瞬间构筑兼具逻辑与美学的演示长卷。内置六大专业设计流派，自动生成高清配图。</p>
+          <div class="cg-tag-row">
+            <div class="cg-tag purple">🎨 杂志级自动全幅排版</div>
+            <div class="cg-tag purple">🖼️ 高清无版权图文生成</div>
+            <div class="cg-tag purple">🔄 单页逻辑一键重塑</div>
+          </div>
+        </div>
+
+        <div class="mock-ppt-grid tm-ppt-ui">
+          <div class="mock-ppt-slide pro ppt-anim-1">
+            <div class="slide-num">01</div>
+            <div class="slide-title" style="font-size: 1.3rem; margin-top: 16px;">商业融资计划书</div>
+            <div class="slide-bar" style="width: 45%; background: #a78bfa;"></div>
+            <div class="slide-bar" style="width: 25%; background: rgba(167, 139, 250, 0.5);"></div>
+          </div>
+          <div class="mock-ppt-slide ppt-anim-2">
+            <div class="slide-num">02</div>
+            <div class="slide-title" style="color:#d1d5db;">市场痛点拆解</div>
+            <div class="slide-bar" style="width: 30%;"></div>
+            <div class="slide-bar" style="width: 60%;"></div>
+            <div class="slide-bar" style="width: 50%;"></div>
+          </div>
+          <div class="mock-ppt-slide ppt-anim-3">
+            <div class="slide-num">03</div>
+            <div class="slide-title" style="color:#d1d5db;">底层架构与闭环逻辑</div>
+            <div class="slide-bar" style="width: 80%;"></div>
+            <div class="slide-bar" style="width: 70%;"></div>
+          </div>
+          <div class="mock-ppt-slide ppt-anim-4">
+            <div class="slide-num">04</div>
+            <div class="slide-title" style="color:#d1d5db;">竞品对标与护城河</div>
+            <div class="slide-bar" style="width: 40%;"></div>
+            <div class="slide-bar" style="width: 90%;"></div>
+          </div>
+          <div class="mock-ppt-slide ppt-anim-5">
+            <div class="slide-num">05</div>
+            <div class="slide-title" style="color:#d1d5db;">商业化变现路径</div>
+            <div class="slide-bar" style="width: 65%;"></div>
+          </div>
+          <div class="mock-ppt-slide ppt-anim-6">
+            <div class="slide-num">06</div>
+            <div class="slide-title" style="color:#d1d5db;">创始纪元团队</div>
+            <div class="slide-bar" style="width: 35%;"></div>
+            <div class="slide-bar" style="width: 55%;"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- PPT Gallery -->
+  <section class="section" id="gallery" style="background: rgba(255,255,255,0.01);">
+    <div class="container">
+      <h2 class="section-title anim-target">PPT 作品展示</h2>
+      <p class="section-subtitle anim-target">沉浸式视觉体验，AI 赋能每一页演示文稿设计</p>
+    </div>
+    <div class="gallery-wrapper anim-target" style="margin-top: 20px;">
+      <div class="gallery-track" id="galleryTrack">
+        <!-- Original items -->
+        <div class="gallery-card"><img src="assets/ppt作品展示1.png" alt="PPT 作品 1" loading="lazy">
+          <div class="caption">玻璃质感商务风格 <span class="badge">PRO 🌟</span></div>
+        </div>
+        <div class="gallery-card"><img src="assets/ppt作品展示2.png" alt="PPT 作品 2" loading="lazy">
+          <div class="caption">瑞士国际排版风格 <span class="badge">极简美学</span></div>
+        </div>
+        <div class="gallery-card"><img src="assets/ppt作品展示3.png" alt="PPT 作品 3" loading="lazy">
+          <div class="caption">新中式禅意风格 <span class="badge">东方神韵</span></div>
+        </div>
+        <div class="gallery-card"><img src="assets/主界面1.png" alt="主界面" loading="lazy">
+          <div class="caption">Word-Cursor <span class="badge">全景视角</span></div>
+        </div>
+        <!-- Duplicated for infinite loop -->
+        <div class="gallery-card"><img src="assets/ppt作品展示1.png" alt="PPT 作品 1" loading="lazy">
+          <div class="caption">玻璃质感商务风格 <span class="badge">PRO 🌟</span></div>
+        </div>
+        <div class="gallery-card"><img src="assets/ppt作品展示2.png" alt="PPT 作品 2" loading="lazy">
+          <div class="caption">瑞士国际排版风格 <span class="badge">极简美学</span></div>
+        </div>
+        <div class="gallery-card"><img src="assets/ppt作品展示3.png" alt="PPT 作品 3" loading="lazy">
+          <div class="caption">新中式禅意风格 <span class="badge">东方神韵</span></div>
+        </div>
+        <div class="gallery-card"><img src="assets/主界面1.png" alt="主界面" loading="lazy">
+          <div class="caption">Word-Cursor <span class="badge">全景视角</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Quick Commands -->
+  <section class="section" id="commands">
+    <div class="container">
+      <h2 class="section-title anim-target">快捷命令</h2>
+      <p class="section-subtitle anim-target">输入 / 即可触发，一键完成常见操作</p>
+      <div class="commands-grid">
+        <div class="command-item anim-target"><span class="command-name">/审查</span><span
+            class="command-desc">全文审查，分类标记问题</span></div>
+        <div class="command-item anim-target"><span class="command-name">/润色</span><span
+            class="command-desc">优化表达，提升专业度</span></div>
+        <div class="command-item anim-target"><span class="command-name">/精简</span><span
+            class="command-desc">删除冗余，保留核心</span></div>
+        <div class="command-item anim-target"><span class="command-name">/翻译</span><span
+            class="command-desc">中英互译，保持格式</span></div>
+        <div class="command-item anim-target"><span class="command-name">/格式化</span><span
+            class="command-desc">统一字体、字号、行距</span></div>
+        <div class="command-item anim-target"><span class="command-name">/编号</span><span
+            class="command-desc">自动添加中文编号</span></div>
+        <div class="command-item anim-target"><span class="command-name">/公文</span><span
+            class="command-desc">转换为标准公文格式</span></div>
+        <div class="command-item anim-target"><span class="command-name">/会议纪要</span><span
+            class="command-desc">整理为规范会议纪要</span></div>
+        <div class="command-item anim-target"><span class="command-name">/总结</span><span
+            class="command-desc">生成文档摘要</span></div>
+        <div class="command-item anim-target"><span class="command-name">/校对</span><span
+            class="command-desc">语法与逻辑检查</span></div>
+      </div>
+    </div>
+  </section>
+  <!-- Tech Stack -->
+  <section class="section" id="tech" style="background: rgba(255,255,255,0.01);">
+    <div class="container">
+      <h2 class="section-title anim-target">技术栈</h2>
+      <p class="section-subtitle anim-target">现代化技术选型，打造流畅的桌面端体验</p>
+      <div class="tech-grid">
+        <div class="tech-item anim-target">
+          <div class="tech-icon">⚛️</div>
+          <div class="tech-name">React 18</div>
+          <div class="tech-role">UI 框架</div>
+        </div>
+        <div class="tech-item anim-target">
+          <div class="tech-icon">🔷</div>
+          <div class="tech-name">TypeScript 5</div>
+          <div class="tech-role">类型安全</div>
+        </div>
+        <div class="tech-item anim-target">
+          <div class="tech-icon">⚡</div>
+          <div class="tech-name">Vite 5</div>
+          <div class="tech-role">构建工具</div>
+        </div>
+        <div class="tech-item anim-target">
+          <div class="tech-icon">🖥️</div>
+          <div class="tech-name">Electron 33</div>
+          <div class="tech-role">桌面运行时</div>
+        </div>
+        <div class="tech-item anim-target">
+          <div class="tech-icon">🎨</div>
+          <div class="tech-name">TailwindCSS</div>
+          <div class="tech-role">样式系统</div>
+        </div>
+        <div class="tech-item anim-target">
+          <div class="tech-icon">✏️</div>
+          <div class="tech-name">Tiptap</div>
+          <div class="tech-role">富文本编辑</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Comparison -->
+  <section class="section" id="compare">
+    <div class="container">
+      <h2 class="section-title anim-target">对比传统办公</h2>
+      <p class="section-subtitle anim-target">Word-Cursor 带来的全新办公体验</p>
+      <div style="overflow-x:auto;">
+        <table class="anim-target"
+          style="width:100%;border-collapse:separate;border-spacing:0;border-radius:14px;overflow:hidden;border:1px solid rgba(255,255,255,0.08);font-size:0.92rem;">
+          <thead>
+            <tr style="background:rgba(99,102,241,0.12);">
+              <th style="padding:14px 20px;text-align:left;color:#a5b4fc;font-weight:600;">功能</th>
+              <th style="padding:14px 20px;text-align:center;color:#60a5fa;font-weight:600;">Word-Cursor</th>
+              <th style="padding:14px 20px;text-align:center;color:#6b7280;font-weight:600;">传统 Office</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="background:rgba(255,255,255,0.02);">
+              <td style="padding:12px 20px;">AI 编辑</td>
+              <td style="text-align:center;color:#34d399;">✅ 原生内置</td>
+              <td style="text-align:center;color:#6b7280;">❌ 需插件</td>
+            </tr>
+            <tr style="background:rgba(255,255,255,0.04);">
+              <td style="padding:12px 20px;">对话交互</td>
+              <td style="text-align:center;color:#34d399;">✅ 自然语言</td>
+              <td style="text-align:center;color:#6b7280;">❌ 菜单操作</td>
+            </tr>
+            <tr style="background:rgba(255,255,255,0.02);">
+              <td style="padding:12px 20px;">智能补全</td>
+              <td style="text-align:center;color:#34d399;">✅ Tab 续写</td>
+              <td style="text-align:center;color:#6b7280;">❌ 无</td>
+            </tr>
+            <tr style="background:rgba(255,255,255,0.04);">
+              <td style="padding:12px 20px;">联网搜索</td>
+              <td style="text-align:center;color:#34d399;">✅ 内置搜索</td>
+              <td style="text-align:center;color:#6b7280;">❌ 需切换</td>
+            </tr>
+            <tr style="background:rgba(255,255,255,0.02);">
+              <td style="padding:12px 20px;">PPT 生成</td>
+              <td style="text-align:center;color:#34d399;">✅ AI 设计</td>
+              <td style="text-align:center;color:#6b7280;">❌ 仅模板</td>
+            </tr>
+            <tr style="background:rgba(255,255,255,0.04);">
+              <td style="padding:12px 20px;">变更审阅</td>
+              <td style="text-align:center;color:#34d399;">✅ Diff 对比</td>
+              <td style="text-align:center;color:#6b7280;">⚠️ 修订模式</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer" id="footer">
+    <div class="container">
+      <div style="margin-bottom:24px;">
+        <a href="https://github.com/Yangyangxxx/Word-Cursor/releases" target="_blank" class="btn-primary"
+          style="display:inline-block;">下载 Word-Cursor v1.0.1</a>
+      </div>
+      <div class="footer-links anim-target">
+        <a href="https://github.com/Yangyangxxx/Word-Cursor" target="_blank">GitHub</a>
+        <a href="https://github.com/Yangyangxxx/Word-Cursor/issues" target="_blank">反馈</a>
+        <a href="https://github.com/Yangyangxxx/Word-Cursor/releases" target="_blank">下载</a>
+        <a href="mailto:yangyzx@qq.com">联系我们</a>
+      </div>
+      <p class="footer-copy">© 2025 Word-Cursor. Built with ❤️ and AI.</p>
+    </div>
+  </footer>
+
+  <script>
+    // ===== Cinematic ScrollTrigger Animations (Apple Style Independent Trigger) =====
+    gsap.registerPlugin(ScrollTrigger);
+
+    // Particle helper for background setup
+    document.querySelectorAll(".cg-showcase-section").forEach(sec => {
+      for (let i = 0; i < 8; i++) {
+        const p = document.createElement('div');
+        p.className = 'cg-particle';
+        const size = Math.random() * 4 + 2;
+        p.style.width = size + 'px';
+        p.style.height = size + 'px';
+        p.style.left = Math.random() * 100 + '%';
+        p.style.top = Math.random() * 100 + '%';
+        sec.appendChild(p);
+
+        gsap.to(p, {
+          y: `random(-50, 50)`,
+          x: `random(-30, 30)`,
+          opacity: `random(0.1, 0.4)`,
+          duration: `random(4, 8)`,
+          repeat: -1,
+          yoyo: true,
+          ease: "sine.inOut"
+        });
+      }
+    });
+
+    // Generic Text Floating Animation reused
+    // Since CSS has opacity: 0 and translate, we must use .to() rather than .from()
+    const slideToOpts = { opacity: 1, y: 0, duration: 1.2, ease: "power3.out" };
+    const uiToOpts = { opacity: 1, y: 0, scale: 1, duration: 1.4, ease: "power4.out" };
+
+    // Continuous floating animation function
+    function ambientFloat(target, yRange, duration) {
+      gsap.to(target, { y: yRange, duration: duration, repeat: -1, yoyo: true, ease: "sine.inOut", delay: 1.5 });
+    }
+
+    // --- 1. WORD SHOWCASE SEQUENCE ---
+    const wordTl = gsap.timeline({
+      scrollTrigger: {
+        trigger: ".cg-sect-word",
+        start: "top 65%", // Trigger when top of section hits 65% viewport down
+        once: true
+      }
+    });
+
+    wordTl
+      .to(".glow-word", { opacity: 1, duration: 2, ease: "sine.inOut" })
+      .to(".tm-word-text", slideToOpts, "-=1.5")
+      .to(".tm-word-ui", uiToOpts, "-=0.8")
+      .to(".tm-word-msg1", { opacity: 1, y: 0, duration: 0.6, ease: "back.out(1.5)" }, "-=0.2")
+      .to(".tm-word-msg2", { opacity: 1, y: 0, duration: 0.6, ease: "back.out(1.5)" }, "+=0.3")
+      // Simulate AI processing
+      .to(".tm-word-msg2", { opacity: 0, display: "none", duration: 0.4 }, "+=1.2")
+      .to(".tm-word-msg3", { opacity: 1, display: "flex", y: 0, duration: 0.6, ease: "back.out(1.5)" })
+      // Diff applied
+      .to(".word-del", { opacity: 1, x: 0, duration: 0.5, ease: "power2.out" })
+      .to(".word-add", { opacity: 1, x: 0, duration: 0.5, ease: "power2.out" }, "+=0.1");
+
+    ambientFloat(".tm-word-ui", "-=12", 4);
+
+    // --- 2. EXCEL SHOWCASE SEQUENCE ---
+    const excelTl = gsap.timeline({
+      scrollTrigger: {
+        trigger: ".cg-sect-excel",
+        start: "top 65%",
+        once: true
+      }
+    });
+
+    excelTl
+      .to(".glow-excel", { opacity: 1, duration: 2, ease: "sine.inOut" })
+      .to(".tm-excel-text", slideToOpts, "-=1.5")
+      .to(".tm-excel-ui", uiToOpts, "-=0.8")
+      // Error shaking (panic moment)
+      .to(".cg-sect-excel .fx-err-1, .cg-sect-excel .fx-err-2, .cg-sect-excel .fx-err-3, .cg-sect-excel .fx-err-4, .cg-sect-excel .fx-err-5", {
+        x: "random(-4, 4)", y: "random(-4, 4)", duration: 0.06, repeat: 12, yoyo: true
+      }, "+=0.5")
+      // Magic fix
+      .to(".cg-sect-excel .fx-err-1", { textContent: "1,600", className: "cell success", duration: 0.2 })
+      .to(".cg-sect-excel .fx-err-3", { textContent: "1,350", className: "cell success", duration: 0.2 }, "-=0.1")
+      .to(".cg-sect-excel .fx-err-2", { textContent: "8,450", className: "cell success", duration: 0.2 }, "-=0.1")
+      .to(".cg-sect-excel .fx-err-4", { textContent: "6,940", className: "cell success", duration: 0.2 }, "-=0.1")
+      .to(".cg-sect-excel .fx-err-5", { textContent: "23,320", className: "cell success", duration: 0.2 }, "-=0.1")
+      .to(".cg-sect-excel .cell.success", { backgroundColor: "rgba(52,211,153,0.12)", textShadow: "0 0 20px rgba(52,211,153,0.8)", scale: 1.05, duration: 0.4, yoyo: true, repeat: 1 });
+
+    ambientFloat(".tm-excel-ui", "-=10", 3.5);
+
+    // --- 3. PPT SHOWCASE SEQUENCE ---
+    const pptTl = gsap.timeline({
+      scrollTrigger: {
+        trigger: ".cg-sect-ppt",
+        start: "top 65%",
+        once: true
+      }
+    });
+
+    pptTl
+      .to(".glow-ppt", { opacity: 1, duration: 2, ease: "sine.inOut" })
+      .to(".tm-ppt-text", slideToOpts, "-=1.5")
+      // Grid pop in 3D
+      .to(".cg-sect-ppt .ppt-anim-1", { opacity: 1, y: 0, rotateX: 0, duration: 0.8, ease: "back.out(1.4)" }, "-=0.5")
+      .to(".cg-sect-ppt .ppt-anim-2", { opacity: 1, y: 0, rotateX: 0, duration: 0.8, ease: "back.out(1.4)" }, "-=0.6")
+      .to(".cg-sect-ppt .ppt-anim-3", { opacity: 1, y: 0, rotateX: 0, duration: 0.8, ease: "back.out(1.4)" }, "-=0.6")
+      .to(".cg-sect-ppt .ppt-anim-4", { opacity: 1, y: 0, rotateX: 0, duration: 0.8, ease: "back.out(1.4)" }, "-=0.6")
+      .to(".cg-sect-ppt .ppt-anim-5", { opacity: 1, y: 0, rotateX: 0, duration: 0.8, ease: "back.out(1.4)" }, "-=0.6")
+      .to(".cg-sect-ppt .ppt-anim-6", { opacity: 1, y: 0, rotateX: 0, duration: 0.8, ease: "back.out(1.4)" }, "-=0.6");
+
+    ambientFloat(".cg-sect-ppt .ppt-anim-1", "-=8", 3);
+    ambientFloat(".cg-sect-ppt .ppt-anim-2", "+=8", 3.2);
+    ambientFloat(".cg-sect-ppt .ppt-anim-3", "-=6", 2.8);
+    ambientFloat(".cg-sect-ppt .ppt-anim-4", "+=6", 3.5);
+    ambientFloat(".cg-sect-ppt .ppt-anim-5", "-=8", 3.1);
+    ambientFloat(".cg-sect-ppt .ppt-anim-6", "+=8", 2.9);
+
+    // ===== Particle Canvas =====
+    (function () {
+      const canvas = document.getElementById('particleCanvas');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      let w, h, particles = [];
+      function resize() {
+        w = canvas.width = canvas.offsetWidth;
+        h = canvas.height = canvas.offsetHeight;
+      }
+      resize();
+      window.addEventListener('resize', resize);
+
+      for (let i = 0; i < 60; i++) {
+        particles.push({
+          x: Math.random() * w, y: Math.random() * h,
+          r: Math.random() * 2 + 0.5,
+          dx: (Math.random() - 0.5) * 0.3,
+          dy: (Math.random() - 0.5) * 0.3,
+          alpha: Math.random() * 0.5 + 0.1,
+        });
+      }
+
+      function draw() {
+        ctx.clearRect(0, 0, w, h);
+        for (const p of particles) {
+          p.x += p.dx; p.y += p.dy;
+          if (p.x < 0) p.x = w; if (p.x > w) p.x = 0;
+          if (p.y < 0) p.y = h; if (p.y > h) p.y = 0;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(99,102,241,${p.alpha})`;
+          ctx.fill();
+        }
+        // Draw connections
+        for (let i = 0; i < particles.length; i++) {
+          for (let j = i + 1; j < particles.length; j++) {
+            const dx = particles[i].x - particles[j].x;
+            const dy = particles[i].y - particles[j].y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < 150) {
+              ctx.beginPath();
+              ctx.moveTo(particles[i].x, particles[i].y);
+              ctx.lineTo(particles[j].x, particles[j].y);
+              ctx.strokeStyle = `rgba(99,102,241,${0.06 * (1 - dist / 150)})`;
+              ctx.stroke();
+            }
+          }
+        }
+        requestAnimationFrame(draw);
+      }
+      draw();
+    })();
+
+    // ===== Hero Animations =====
+    anime.timeline({ easing: 'easeOutExpo' })
+      .add({ targets: '#heroBadge', opacity: [0, 1], translateY: [20, 0], duration: 800 })
+      .add({ targets: '#heroTitle', opacity: [0, 1], translateY: [40, 0], duration: 1000 }, '-=500')
+      .add({ targets: '#heroDesc', opacity: [0, 1], translateY: [30, 0], duration: 800 }, '-=600')
+      .add({ targets: '#heroButtons', opacity: [0, 1], translateY: [20, 0], duration: 800 }, '-=500');
+
+    // Floating glow orbs
+    anime({ targets: '.glow-orb-1', translateX: [0, 30], translateY: [0, -20], duration: 6000, direction: 'alternate', loop: true, easing: 'easeInOutSine' });
+    anime({ targets: '.glow-orb-2', translateX: [0, -25], translateY: [0, 25], duration: 7000, direction: 'alternate', loop: true, easing: 'easeInOutSine' });
+    anime({ targets: '.glow-orb-3', translateX: [0, 20], translateY: [0, -30], duration: 8000, direction: 'alternate', loop: true, easing: 'easeInOutSine' });
+    // ===== Scroll-triggered Animations =====
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (!entry.isIntersecting) return;
+        const el = entry.target;
+        observer.unobserve(el);
+
+        // Determine animation based on parent section
+        const section = el.closest('.section, .footer');
+        const sectionId = section ? section.id : '';
+
+        if (el.classList.contains('highlight-card')) {
+          const cards = Array.from(el.parentElement.children);
+          const idx = cards.indexOf(el);
+          anime({
+            targets: el, opacity: [0, 1], translateY: [50, 0], scale: [0.9, 1],
+            duration: 700, delay: idx * 150, easing: 'easeOutCubic',
+          });
+        } else if (el.classList.contains('feature-row')) {
+          const img = el.querySelector('.feature-img');
+          const text = el.querySelector('.feature-text');
+          const isReverse = el.classList.contains('reverse');
+          anime.timeline({ easing: 'easeOutCubic' })
+            .add({ targets: img, opacity: [0, 1], translateX: [isReverse ? 60 : -60, 0], duration: 800 })
+            .add({ targets: text, opacity: [0, 1], translateX: [isReverse ? -40 : 40, 0], duration: 700 }, '-=500');
+        } else if (el.classList.contains('command-item')) {
+          const items = Array.from(el.parentElement.children);
+          const idx = items.indexOf(el);
+          anime({
+            targets: el, opacity: [0, 1], translateY: [30, 0],
+            duration: 500, delay: idx * 60, easing: 'easeOutCubic',
+          });
+        } else if (el.classList.contains('tech-item')) {
+          const items = Array.from(el.parentElement.children);
+          const idx = items.indexOf(el);
+          anime({
+            targets: el, opacity: [0, 1], scale: [0.7, 1],
+            duration: 500, delay: idx * 80, easing: 'easeOutBack',
+          });
+        } else if (el.tagName === 'TABLE') {
+          anime({
+            targets: el, opacity: [0, 1], translateY: [40, 0],
+            duration: 800, easing: 'easeOutCubic',
+          });
+        } else {
+          // Default: fade up
+          anime({
+            targets: el, opacity: [0, 1], translateY: [40, 0],
+            duration: 700, easing: 'easeOutCubic',
+          });
+        }
+      });
+    }, { threshold: 0.15, rootMargin: '0px 0px -40px 0px' });
+
+    document.querySelectorAll('.anim-target').forEach(el => observer.observe(el));
+
+    // ===== 3D Hover Effect for Gallery Cards =====
+    (function () {
+      const cards = document.querySelectorAll('.gallery-card');
+      cards.forEach(card => {
+        card.addEventListener('mousemove', e => {
+          const rect = card.getBoundingClientRect();
+          const x = e.clientX - rect.left;
+          const y = e.clientY - rect.top;
+          const centerX = rect.width / 2;
+          const centerY = rect.height / 2;
+          const rotateX = ((y - centerY) / centerY) * -10; // max 10 deg
+          const rotateY = ((x - centerX) / centerX) * 10;
+
+          card.style.transform = `perspective(1000px) rotateX(${rotateX}deg) rotateY(${rotateY}deg) scale3d(1.05, 1.05, 1.05)`;
+          card.style.transition = 'none';
+          card.style.zIndex = '10';
+        });
+
+        card.addEventListener('mouseleave', () => {
+          card.style.transform = '';
+          card.style.transition = 'transform 0.5s cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 0.5s ease, border-color 0.5s ease';
+          card.style.zIndex = '1';
+        });
+      });
+    })();
+  </script>
+</body>
+
+</html>

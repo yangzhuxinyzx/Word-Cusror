@@ -7,7 +7,7 @@ import {
   Presentation,
   ArrowUpRight
 } from 'lucide-react'
-import { useDocument } from '../context/DocumentContext'
+import { useDocument } from '../context/useDocument'
 import { FileItem } from '../types'
 
 export default function Dashboard() {
@@ -16,7 +16,9 @@ export default function Dashboard() {
     openFile, 
     createNewDocument, 
     openFolder,
-    isElectron 
+    isElectron,
+    effectiveWorkspacePath,
+    sessionMode,
   } = useDocument()
 
   const [greeting, setGreeting] = useState('')
@@ -66,6 +68,13 @@ export default function Dashboard() {
           <p className="text-text-secondary text-sm mt-2">
             选择一个文件开始编辑，或创建新文档。中间区域保持留白，用作预览/编辑承载区。
           </p>
+          {effectiveWorkspacePath && (
+            <p className="text-text-muted text-xs mt-2">
+              {sessionMode === 'single-file'
+                ? `当前处于轻工作区：${effectiveWorkspacePath}`
+                : `当前工作区：${effectiveWorkspacePath}`}
+            </p>
+          )}
 
           {/* Compact pill actions (macOS-like) */}
           <div className="mt-4 flex flex-wrap gap-2">

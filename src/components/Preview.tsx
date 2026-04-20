@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { FileText, Maximize2, Minimize2, Printer } from 'lucide-react'
-import { useDocument } from '../context/DocumentContext'
+import { useDocument } from '../context/useDocument'
 import ReactMarkdown from 'react-markdown'
 
 export default function Preview() {

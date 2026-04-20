@@ -17,9 +17,11 @@ import type {
   ElementStyle
 } from '../utils/layoutEngine'
 import { PT_TO_PX } from '../utils/textMeasurer'
+import { getNativeStyleMetrics } from '../utils/nativeTextMeasurement'
 
 interface CanvasPageRendererProps {
   page: PageLayout
+  pageIndex?: number
   pageConfig: PageConfig
   scale?: number
   showPageNumber?: boolean
@@ -33,6 +35,7 @@ interface CanvasPageRendererProps {
  */
 export const CanvasPageRenderer: React.FC<CanvasPageRendererProps> = ({
   page,
+  pageIndex = 1,
   pageConfig,
   scale = 1,
   showPageNumber = true,
@@ -43,9 +46,10 @@ export const CanvasPageRenderer: React.FC<CanvasPageRendererProps> = ({
   
   // 计算 Canvas 实际尺寸（考虑设备像素比）
   const devicePixelRatio = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
+  const renderScale = devicePixelRatio * 2
   
-  const canvasWidth = useMemo(() => pageConfig.width * devicePixelRatio, [pageConfig.width, devicePixelRatio])
-  const canvasHeight = useMemo(() => pageConfig.height * devicePixelRatio, [pageConfig.height, devicePixelRatio])
+  const canvasWidth = useMemo(() => pageConfig.width * renderScale, [pageConfig.width, renderScale])
+  const canvasHeight = useMemo(() => pageConfig.height * renderScale, [pageConfig.height, renderScale])
   
   const getWordPalette = useCallback(() => {
     if (typeof window === 'undefined') {
@@ -88,7 +92,7 @@ export const CanvasPageRenderer: React.FC<CanvasPageRendererProps> = ({
     if (!style) return
     
     // 设置字体
-    const fontSize = (style.fontSize || 12) * PT_TO_PX * scale * devicePixelRatio
+    const fontSize = (style.fontSize || 12) * PT_TO_PX * scale * renderScale
     const fontWeight = style.fontWeight || 'normal'
     const fontStyle = style.fontStyle || 'normal'
     const fontFamily = style.fontFamily || 'DengXian, "Microsoft YaHei", "SimSun", serif'
@@ -98,7 +102,7 @@ export const CanvasPageRenderer: React.FC<CanvasPageRendererProps> = ({
     // 设置颜色
     const palette = getWordPalette()
     ctx.fillStyle = resolveColor(style.color, palette) || palette.ink
-  }, [scale, devicePixelRatio, getWordPalette, resolveColor])
+  }, [scale, renderScale, getWordPalette, resolveColor])
   
   /**
    * 绘制文本元素
@@ -114,39 +118,61 @@ export const CanvasPageRenderer: React.FC<CanvasPageRendererProps> = ({
     const palette = getWordPalette()
     const resolvedColor = resolveColor(style?.color, palette) || palette.ink
     
-    const x = element.x * devicePixelRatio
-    let y = element.y * devicePixelRatio
+    const x = element.x * renderScale
+    let y = element.y * renderScale
+    const letterSpacingPx = ((style?.letterSpacing || 0) * PT_TO_PX * scale) * renderScale
+    const fontSizePx = (style?.fontSize || 12) * PT_TO_PX * scale * renderScale
+    const nativeStyleMetrics = style
+      ? getNativeStyleMetrics({
+          fontFamily: style.fontFamily || 'DengXian, "Microsoft YaHei", "SimSun", serif',
+          fontSize: style.fontSize || 12,
+          fontWeight: style.fontWeight,
+          fontStyle: style.fontStyle,
+          lineHeight: style.lineHeight,
+          letterSpacing: style.letterSpacing,
+          scaleFactor: scale,
+        })
+      : null
+    const baselineOffset = (nativeStyleMetrics?.baseline || (fontSizePx * 0.82) / renderScale) * renderScale
     
     // 绘制每一行
     for (const line of measuredText.lines) {
-      const lineY = y + line.y * devicePixelRatio + (style?.fontSize || 12) * PT_TO_PX * scale * devicePixelRatio
+      const lineY = y + line.y * renderScale + baselineOffset
       
       // 绘制文本
-      ctx.fillText(line.text, x, lineY)
+      if (letterSpacingPx) {
+        let cursorX = x
+        for (const char of Array.from(line.text)) {
+          ctx.fillText(char, cursorX, lineY)
+          cursorX += ctx.measureText(char).width + letterSpacingPx
+        }
+      } else {
+        ctx.fillText(line.text, x, lineY)
+      }
       
       // 绘制下划线
       if (style?.textDecoration === 'underline') {
-        const underlineY = lineY + 2 * devicePixelRatio
+        const underlineY = lineY + 2 * renderScale
         ctx.beginPath()
         ctx.moveTo(x, underlineY)
-        ctx.lineTo(x + line.width * devicePixelRatio, underlineY)
+        ctx.lineTo(x + line.width * renderScale, underlineY)
         ctx.strokeStyle = resolvedColor
-        ctx.lineWidth = 1 * devicePixelRatio
+        ctx.lineWidth = 1 * renderScale
         ctx.stroke()
       }
       
       // 绘制删除线
       if (style?.textDecoration === 'line-through') {
-        const strikeY = lineY - (style?.fontSize || 12) * PT_TO_PX * scale * devicePixelRatio * 0.3
+        const strikeY = lineY - baselineOffset * 0.35
         ctx.beginPath()
         ctx.moveTo(x, strikeY)
-        ctx.lineTo(x + line.width * devicePixelRatio, strikeY)
+        ctx.lineTo(x + line.width * renderScale, strikeY)
         ctx.strokeStyle = resolvedColor
-        ctx.lineWidth = 1 * devicePixelRatio
+        ctx.lineWidth = 1 * renderScale
         ctx.stroke()
       }
     }
-  }, [setContextStyle, scale, devicePixelRatio, getWordPalette, resolveColor])
+  }, [setContextStyle, scale, renderScale, getWordPalette, resolveColor])
   
   /**
    * 绘制段落
@@ -197,30 +223,30 @@ export const CanvasPageRenderer: React.FC<CanvasPageRendererProps> = ({
       // 图片已加载，直接绘制
       ctx.drawImage(
         img,
-        x * devicePixelRatio,
-        y * devicePixelRatio,
-        width * devicePixelRatio,
-        (height - 10 * scale) * devicePixelRatio  // 减去间距
+        x * renderScale,
+        y * renderScale,
+        width * renderScale,
+        (height - 10 * scale) * renderScale  // 减去间距
       )
     } else {
       // 绘制占位符
       const palette = getWordPalette()
       ctx.fillStyle = palette.pageBg
       ctx.fillRect(
-        x * devicePixelRatio,
-        y * devicePixelRatio,
-        width * devicePixelRatio,
-        (height - 10 * scale) * devicePixelRatio
+        x * renderScale,
+        y * renderScale,
+        width * renderScale,
+        (height - 10 * scale) * renderScale
       )
       
       // 绘制加载提示
       ctx.fillStyle = palette.inkMuted
-      ctx.font = `${12 * devicePixelRatio}px sans-serif`
+        ctx.font = `${12 * renderScale}px sans-serif`
       ctx.textAlign = 'center'
       ctx.fillText(
         '图片加载中...',
-        (x + width / 2) * devicePixelRatio,
-        (y + height / 2) * devicePixelRatio
+          (x + width / 2) * renderScale,
+          (y + height / 2) * renderScale
       )
       ctx.textAlign = 'left'
       
@@ -238,10 +264,10 @@ export const CanvasPageRenderer: React.FC<CanvasPageRendererProps> = ({
             if (ctx) {
               ctx.drawImage(
                 img!,
-                x * devicePixelRatio,
-                y * devicePixelRatio,
-                width * devicePixelRatio,
-                (height - 10 * scale) * devicePixelRatio
+                x * renderScale,
+                y * renderScale,
+                width * renderScale,
+                (height - 10 * scale) * renderScale
               )
             }
           }
@@ -250,7 +276,7 @@ export const CanvasPageRenderer: React.FC<CanvasPageRendererProps> = ({
         img.src = src
       }
     }
-  }, [imageCache, devicePixelRatio, scale, getWordPalette])
+  }, [imageCache, renderScale, scale, getWordPalette])
   
   /**
    * 绘制表格
@@ -265,14 +291,18 @@ export const CanvasPageRenderer: React.FC<CanvasPageRendererProps> = ({
     
     let currentY = y
     
-    for (const row of rows) {
-      let currentX = x
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+      const row = rows[rowIndex]
       
       for (const cell of row.cells) {
-        const cellX = currentX * devicePixelRatio
-        const cellY = currentY * devicePixelRatio
-        const cellWidth = cell.width * devicePixelRatio
-        const cellHeight = row.height * devicePixelRatio
+        const cellX = (x + (cell.x || 0)) * renderScale
+        const cellY = currentY * renderScale
+        const cellWidth = cell.width * renderScale
+        const rowSpan = Math.max(1, cell.rowspan || 1)
+        const spannedHeight = rows
+          .slice(rowIndex, Math.min(rows.length, rowIndex + rowSpan))
+          .reduce((sum, tableRow) => sum + tableRow.height, 0)
+        const cellHeight = spannedHeight * renderScale
         
         // 绘制单元格边框（支持每边不同样式）
         const defaultBorderWidth = 0.5 * PT_TO_PX * scale
@@ -288,7 +318,7 @@ export const CanvasPageRenderer: React.FC<CanvasPageRendererProps> = ({
         const drawLine = (x1: number, y1: number, x2: number, y2: number, width: number, color: string) => {
           if (!width || width <= 0) return
           ctx.strokeStyle = color
-          ctx.lineWidth = width * devicePixelRatio
+            ctx.lineWidth = width * renderScale
           ctx.beginPath()
           ctx.moveTo(x1, y1)
           ctx.lineTo(x2, y2)
@@ -305,23 +335,40 @@ export const CanvasPageRenderer: React.FC<CanvasPageRendererProps> = ({
           for (const child of cell.children) {
             if (child.type === 'text') {
               const textChild = child as TextLayoutElement
-              const paddingX = 5 * PT_TO_PX * scale
-              const paddingY = 2 * PT_TO_PX * scale
+              const paddingLeft = textChild.x || 0
+              const paddingTop = textChild.y || 0
+              const paddingRight = cell.style?.paddingRight || paddingLeft
+              const paddingBottom = cell.style?.paddingBottom || paddingTop
+              const usableWidth = Math.max(0, cell.width - paddingLeft - paddingRight)
+              const usableHeight = Math.max(0, (spannedHeight) - paddingTop - paddingBottom)
+              let textX = x + (cell.x || 0) + paddingLeft
+              let textY = currentY + paddingTop
+
+              if (cell.style?.textAlign === 'center') {
+                textX += Math.max(0, (usableWidth - textChild.width) / 2)
+              } else if (cell.style?.textAlign === 'right') {
+                textX += Math.max(0, usableWidth - textChild.width)
+              }
+
+              if (cell.style?.verticalAlign === 'middle') {
+                textY += Math.max(0, (usableHeight - textChild.height) / 2)
+              } else if (cell.style?.verticalAlign === 'bottom') {
+                textY += Math.max(0, usableHeight - textChild.height)
+              }
+
               drawText(ctx, {
                 ...textChild,
-                x: currentX + paddingX,
-                y: currentY + paddingY
+                x: textX,
+                y: textY
               })
             }
           }
         }
-        
-        currentX += cell.width
       }
       
       currentY += row.height
     }
-  }, [drawText, devicePixelRatio, scale, getWordPalette])
+  }, [drawText, renderScale, scale, getWordPalette])
   
   /**
    * 绘制页眉
@@ -352,14 +399,6 @@ export const CanvasPageRenderer: React.FC<CanvasPageRendererProps> = ({
       }
     }
     
-    const palette = getWordPalette()
-    // 绘制页眉下划线
-    ctx.strokeStyle = palette.rule
-    ctx.lineWidth = 0.5 * PT_TO_PX * scale * devicePixelRatio
-    ctx.beginPath()
-    ctx.moveTo(x, y + height)
-    ctx.lineTo(x + width, y + height)
-    ctx.stroke()
   }, [drawText, devicePixelRatio, getWordPalette])
   
   /**
@@ -477,6 +516,8 @@ export const CanvasPageRenderer: React.FC<CanvasPageRendererProps> = ({
   return (
     <canvas
       ref={canvasRef}
+      data-testid={`word-render-canvas-page-${pageIndex}`}
+      data-word-page-index={pageIndex}
       width={canvasWidth}
       height={canvasHeight}
       style={{

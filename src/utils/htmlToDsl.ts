@@ -390,9 +390,12 @@ function convertTableCell(td: HTMLElement, opts: HtmlToDslOptions): DslTableCell
 function convertImage(img: HTMLElement): DslImage | null {
   let src = img.getAttribute('src') || ''
   const rid = img.getAttribute('data-rid')
+  const preserveInlineSrc =
+    img.getAttribute('data-preserve-src') === '1' ||
+    img.getAttribute('data-generated-from') === 'docx-chart'
 
   // base64 → 占位符
-  if (src.startsWith('data:image/')) {
+  if (src.startsWith('data:image/') && !preserveInlineSrc) {
     src = rid ? `[image:${rid}]` : '[image]'
   }
 

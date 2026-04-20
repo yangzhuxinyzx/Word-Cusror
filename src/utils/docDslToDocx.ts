@@ -837,7 +837,7 @@ export async function dslToDocument(dsl: DocDsl): Promise<Document> {
 
   // 创建文档（标题颜色设为黑色，覆盖 docx 库默认的蓝色主题色）
   const doc = new Document({
-    creator: 'Word-Cursor',
+    creator: '智启文档',
     title: dsl.title || '文档',
     styles: {
       default: {

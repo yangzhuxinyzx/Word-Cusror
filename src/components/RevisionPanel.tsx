@@ -1,6 +1,6 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { X, Check, Ban, CornerDownRight } from 'lucide-react'
-import { useDocument } from '../context/DocumentContext'
+import { useDocument } from '../context/useDocument'
 
 type RevisionPanelProps = {
   open: boolean
@@ -24,6 +24,17 @@ export default function RevisionPanel({ open, onClose }: RevisionPanelProps) {
   }, [pendingChanges])
 
   const [trackAuthorFilter, setTrackAuthorFilter] = useState<string>('all')
+  const [hadPendingSinceOpen, setHadPendingSinceOpen] = useState(false)
+
+  useEffect(() => {
+    if (!open) {
+      setHadPendingSinceOpen(false)
+      return
+    }
+    if (items.length > 0) {
+      setHadPendingSinceOpen(true)
+    }
+  }, [items.length, open])
 
   const trackChanges = useMemo(() => {
     const html = document?.content || ''
@@ -119,7 +130,21 @@ export default function RevisionPanel({ open, onClose }: RevisionPanelProps) {
             <div className="px-4 py-3">
               <div className="text-xs text-text-muted mb-2">AI 待审阅修订</div>
               {items.length === 0 ? (
-                <div className="py-4 text-center text-sm text-text-muted">暂无待审阅修改</div>
+                <div className="py-6 text-center">
+                  <div className="text-sm text-text font-medium">
+                    {hadPendingSinceOpen ? '所有修订已处理' : '暂无待审阅修改'}
+                  </div>
+                  <div className="text-xs text-text-muted mt-1">
+                    {hadPendingSinceOpen ? '当前文档里的待处理修订已经清空。' : '当前还没有需要你确认的 AI 修订。'}
+                  </div>
+                  <button
+                    className="mt-3 inline-flex items-center gap-1.5 px-3 py-1.5 bg-black/10 dark:bg-white/10 hover:bg-black/15 dark:hover:bg-white/15 text-text-secondary text-xs rounded-lg transition-colors border border-black/10 dark:border-white/10"
+                    onClick={onClose}
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    <span>关闭面板</span>
+                  </button>
+                </div>
               ) : (
                 <div className="space-y-3">
                   {items.map((c) => {
