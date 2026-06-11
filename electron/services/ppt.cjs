@@ -77,6 +77,20 @@ function createPptService(options = {}) {
     } catch {}
   }
 
+  function normalizeLocalPath(filePath) {
+    const raw = String(filePath || '').trim()
+    if (!raw || process.platform === 'win32') return raw
+    if (!raw.includes('\\')) return raw
+    const slashPath = raw.replace(/\\+/g, '/')
+    if (/^\/(?:Users|Volumes|private|tmp|var|home)\//i.test(slashPath)) {
+      return slashPath
+    }
+    if (/^(?:Users|Volumes|private|tmp|var|home)\//i.test(slashPath)) {
+      return `/${slashPath}`
+    }
+    return slashPath
+  }
+
   function destroyDeterministicRenderWindow() {
     if (deterministicRenderWindow && !deterministicRenderWindow.isDestroyed()) {
       deterministicRenderWindow.destroy()
@@ -772,6 +786,395 @@ function createPptService(options = {}) {
     return count > 0 ? diff / count : 0
   }
 
+  function percentile(values, ratio) {
+    if (!Array.isArray(values) || values.length === 0) return 0
+    const sorted = [...values].sort((a, b) => a - b)
+    const index = clamp(Math.floor((sorted.length - 1) * ratio), 0, sorted.length - 1)
+    return sorted[index]
+  }
+
+  async function estimateOriginalForegroundMaskFromCrop(originalCropBuffer, focusBounds) {
+    const raw = await readImageRaw(originalCropBuffer)
+    const { data, info } = raw
+    const width = info.width
+    const height = info.height
+    const left = clamp(Math.floor(focusBounds.left), 0, width - 1)
+    const top = clamp(Math.floor(focusBounds.top), 0, height - 1)
+    const right = clamp(Math.ceil(focusBounds.left + focusBounds.width), left + 1, width)
+    const bottom = clamp(Math.ceil(focusBounds.top + focusBounds.height), top + 1, height)
+    const bgSamples = []
+    const ring = 8
+    for (let y = Math.max(0, top - ring); y < Math.min(height, bottom + ring); y += 1) {
+      for (let x = Math.max(0, left - ring); x < Math.min(width, right + ring); x += 1) {
+        const inside = x >= left && x < right && y >= top && y < bottom
+        if (inside) continue
+        const idx = (y * width + x) * 4
+        bgSamples.push([
+          data[idx],
+          data[idx + 1],
+          data[idx + 2],
+        ])
+      }
+    }
+    if (!bgSamples.length) {
+      for (let x = 0; x < width; x += 1) {
+        let idxTop = x * 4
+        let idxBottom = ((height - 1) * width + x) * 4
+        bgSamples.push([data[idxTop], data[idxTop + 1], data[idxTop + 2]])
+        bgSamples.push([data[idxBottom], data[idxBottom + 1], data[idxBottom + 2]])
+      }
+    }
+    const avg = bgSamples.reduce((acc, item) => {
+      acc[0] += item[0]
+      acc[1] += item[1]
+      acc[2] += item[2]
+      return acc
+    }, [0, 0, 0])
+    const bg = avg.map((value) => value / Math.max(1, bgSamples.length))
+
+    const mask = new Uint8Array(width * height)
+    const diffs = []
+    for (let y = top; y < bottom; y += 1) {
+      for (let x = left; x < right; x += 1) {
+        const idx = (y * width + x) * 4
+        const diff = (
+          Math.abs(data[idx] - bg[0]) +
+          Math.abs(data[idx + 1] - bg[1]) +
+          Math.abs(data[idx + 2] - bg[2])
+        ) / 3
+        diffs.push(diff)
+      }
+    }
+    const threshold = Math.max(18, percentile(diffs, 0.72))
+    for (let y = top; y < bottom; y += 1) {
+      for (let x = left; x < right; x += 1) {
+        const idx = (y * width + x) * 4
+        const pixelIndex = y * width + x
+        const diff = (
+          Math.abs(data[idx] - bg[0]) +
+          Math.abs(data[idx + 1] - bg[1]) +
+          Math.abs(data[idx + 2] - bg[2])
+        ) / 3
+        mask[pixelIndex] = diff >= threshold ? 255 : 0
+      }
+    }
+    return {
+      width,
+      height,
+      mask,
+      backgroundRgb: bg,
+      focusBounds: { left, top, right, bottom },
+    }
+  }
+
+  function extractAlphaMask(renderRaw) {
+    const mask = new Uint8Array(renderRaw.info.width * renderRaw.info.height)
+    for (let idx = 0, pixel = 0; idx < renderRaw.data.length; idx += 4, pixel += 1) {
+      mask[pixel] = renderRaw.data[idx + 3]
+    }
+    return mask
+  }
+
+  function computeMaskF1(maskA, maskB, focusBounds, width) {
+    let intersection = 0
+    let positivesA = 0
+    let positivesB = 0
+    for (let y = focusBounds.top; y < focusBounds.bottom; y += 1) {
+      for (let x = focusBounds.left; x < focusBounds.right; x += 1) {
+        const index = y * width + x
+        const a = maskA[index] > 32
+        const b = maskB[index] > 32
+        if (a) positivesA += 1
+        if (b) positivesB += 1
+        if (a && b) intersection += 1
+      }
+    }
+    if (positivesA === 0 || positivesB === 0) return 0
+    const precision = intersection / positivesB
+    const recall = intersection / positivesA
+    if (precision + recall === 0) return 0
+    return (2 * precision * recall) / (precision + recall)
+  }
+
+  function computeProjectionSimilarity(maskA, maskB, focusBounds, width) {
+    const columns = []
+    const rows = []
+    for (let x = focusBounds.left; x < focusBounds.right; x += 1) {
+      let sumA = 0
+      let sumB = 0
+      for (let y = focusBounds.top; y < focusBounds.bottom; y += 1) {
+        const index = y * width + x
+        sumA += maskA[index] > 32 ? 1 : 0
+        sumB += maskB[index] > 32 ? 1 : 0
+      }
+      columns.push([sumA, sumB])
+    }
+    for (let y = focusBounds.top; y < focusBounds.bottom; y += 1) {
+      let sumA = 0
+      let sumB = 0
+      for (let x = focusBounds.left; x < focusBounds.right; x += 1) {
+        const index = y * width + x
+        sumA += maskA[index] > 32 ? 1 : 0
+        sumB += maskB[index] > 32 ? 1 : 0
+      }
+      rows.push([sumA, sumB])
+    }
+    const scoreAxis = (pairs, normalizer) => {
+      if (!pairs.length || normalizer <= 0) return 0
+      let total = 0
+      for (const [a, b] of pairs) {
+        total += Math.abs(a - b) / normalizer
+      }
+      return clamp(1 - total / pairs.length, 0, 1)
+    }
+    const height = Math.max(1, focusBounds.bottom - focusBounds.top)
+    const widthSpan = Math.max(1, focusBounds.right - focusBounds.left)
+    const colScore = scoreAxis(columns, height)
+    const rowScore = scoreAxis(rows, widthSpan)
+    return (colScore + rowScore) / 2
+  }
+
+  function averageRgbDifferenceWithinUnion(left, right, maskA, maskB, focusBounds, width) {
+    let diff = 0
+    let count = 0
+    for (let y = focusBounds.top; y < focusBounds.bottom; y += 1) {
+      for (let x = focusBounds.left; x < focusBounds.right; x += 1) {
+        const pixelIndex = y * width + x
+        const active = maskA[pixelIndex] > 32 || maskB[pixelIndex] > 32
+        if (!active) continue
+        const rgbaIndex = pixelIndex * 4
+        diff += (
+          Math.abs(left[rgbaIndex] - right[rgbaIndex]) +
+          Math.abs(left[rgbaIndex + 1] - right[rgbaIndex + 1]) +
+          Math.abs(left[rgbaIndex + 2] - right[rgbaIndex + 2])
+        ) / 3
+        count += 1
+      }
+    }
+    return count > 0 ? diff / count : 255
+  }
+
+  async function calibrateStyleEstimateForOriginalText({
+    width,
+    height,
+    relativeBounds,
+    targetGlyphBounds,
+    text,
+    styleEstimate,
+    fontCandidate,
+  }) {
+    const fontFace = buildFontFaceCss(fontCandidate)
+    const fontFamily = fontFace?.family || fontCandidate?.family || styleEstimate.fontFamily || 'PingFang SC'
+    const html = `<!doctype html>
+      <html>
+        <head>
+          <meta charset="utf-8" />
+          <style>
+            html, body {
+              margin: 0;
+              width: ${Math.ceil(width)}px;
+              height: ${Math.ceil(height)}px;
+              overflow: hidden;
+              background: transparent;
+            }
+            ${fontFace ? fontFace.css : ''}
+            #box {
+              position: absolute;
+              left: ${relativeBounds.left}px;
+              top: ${relativeBounds.top}px;
+              width: ${relativeBounds.width}px;
+              height: ${relativeBounds.height}px;
+              display: flex;
+              align-items: center;
+              justify-content: ${styleEstimate.align === 'right' ? 'flex-end' : styleEstimate.align === 'center' ? 'center' : 'flex-start'};
+            }
+            #text {
+              box-sizing: border-box;
+              width: 100%;
+              color: ${styleEstimate.textColor || '#000000'};
+              font-family: '${fontFamily}', '${fontCandidate?.family || ''}', ${styleEstimate.familyHint === 'serif' ? 'serif' : 'sans-serif'};
+              font-weight: ${Math.max(100, Math.min(900, Number(styleEstimate.fontWeight || 400)))};
+              font-size: ${Math.max(8, Number(styleEstimate.fontSize || 18))}px;
+              line-height: ${Math.max(0.8, Number(styleEstimate.lineHeight || 1))};
+              letter-spacing: ${Number(styleEstimate.letterSpacing || 0)}px;
+              text-align: ${styleEstimate.align || 'left'};
+              white-space: pre-wrap;
+              word-break: break-word;
+              overflow-wrap: anywhere;
+              -webkit-text-stroke: ${Math.max(0, Number(styleEstimate.strokeWidth || 0))}px ${styleEstimate.strokeColor || 'transparent'};
+            }
+          </style>
+        </head>
+        <body>
+          <div id="box"><div id="text">${String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div></div>
+        </body>
+      </html>`
+    const win = await getDeterministicRenderWindow(width, height)
+    await win.loadURL(`data:text/html;charset=UTF-8,${encodeURIComponent(html)}`)
+    const calibrated = await win.webContents.executeJavaScript(`
+      new Promise(async (resolve) => {
+        try {
+          await (document.fonts?.ready || Promise.resolve())
+        } catch {}
+        const box = document.getElementById('box')
+        const text = document.getElementById('text')
+        const baseFontSize = ${Math.max(8, Number(styleEstimate.fontSize || 18))}
+        const baseLetterSpacing = ${Number(styleEstimate.letterSpacing || 0)}
+        const targetGlyphWidth = ${Math.max(1, Number(targetGlyphBounds?.width || relativeBounds.width))}
+        const targetGlyphHeight = ${Math.max(1, Number(targetGlyphBounds?.height || relativeBounds.height))}
+        const weightOptions = [400, 500, 600, 700, 800]
+        let best = null
+        for (const fontWeight of weightOptions) {
+          text.style.fontWeight = String(fontWeight)
+          for (let fontSize = Math.max(8, Math.floor(baseFontSize - 8)); fontSize <= Math.ceil(baseFontSize + 8); fontSize += 1) {
+            for (let letterSpacing = baseLetterSpacing - 2; letterSpacing <= baseLetterSpacing + 3; letterSpacing += 0.5) {
+              text.style.fontSize = fontSize + 'px'
+              text.style.letterSpacing = letterSpacing + 'px'
+              const widthRatio = Math.abs(text.scrollWidth - targetGlyphWidth) / Math.max(1, targetGlyphWidth)
+              const heightRatio = Math.abs(text.scrollHeight - targetGlyphHeight) / Math.max(1, targetGlyphHeight)
+              const overflowPenalty = Math.max(0, text.scrollWidth - box.clientWidth) / Math.max(1, box.clientWidth) + Math.max(0, text.scrollHeight - box.clientHeight) / Math.max(1, box.clientHeight)
+              const weightPenalty = Math.abs(fontWeight - ${Math.max(100, Math.min(900, Number(styleEstimate.fontWeight || 400)))}) / 700
+              const score = widthRatio * 0.6 + heightRatio * 0.25 + overflowPenalty * 2 + weightPenalty * 0.15
+              if (!best || score < best.score) {
+                best = {
+                  score,
+                  fontSize,
+                  letterSpacing,
+                  fontWeight,
+                }
+              }
+            }
+          }
+        }
+        resolve(best || {
+          score: 999,
+          fontSize: baseFontSize,
+          letterSpacing: baseLetterSpacing,
+          fontWeight: ${Math.max(100, Math.min(900, Number(styleEstimate.fontWeight || 400)))},
+        })
+      })
+    `)
+    return {
+      ...styleEstimate,
+      fontSize: calibrated.fontSize,
+      letterSpacing: calibrated.letterSpacing,
+      fontWeight: calibrated.fontWeight,
+    }
+  }
+
+  async function rankFontCandidatesByOriginalGlyphFit({
+    originalCropBuffer,
+    relativeBounds,
+    box,
+    fontCandidates,
+  }) {
+    if (!Array.isArray(fontCandidates) || !fontCandidates.length) return fontCandidates || []
+    const originalMaskInfo = await estimateOriginalForegroundMaskFromCrop(originalCropBuffer, relativeBounds)
+    const rankingStyle = {
+      ...(box.styleEstimate || box.styleHint || {}),
+      shadowOpacity: 0,
+      shadowBlur: 0,
+      shadowOffsetX: 0,
+      shadowOffsetY: 0,
+      opacity: 1,
+    }
+    const ranked = []
+    const originalCropRaw = await readImageRaw(originalCropBuffer)
+    for (const fontCandidate of fontCandidates) {
+      const calibratedStyleEstimate = await calibrateStyleEstimateForOriginalText({
+        width: originalMaskInfo.width,
+        height: originalMaskInfo.height,
+        relativeBounds,
+        targetGlyphBounds: {
+          width: Math.max(1, originalMaskInfo.focusBounds.right - originalMaskInfo.focusBounds.left),
+          height: Math.max(1, originalMaskInfo.focusBounds.bottom - originalMaskInfo.focusBounds.top),
+        },
+        text: box.text,
+        styleEstimate: rankingStyle,
+        fontCandidate,
+      })
+      const render = await renderDeterministicTextLayer({
+        width: originalMaskInfo.width,
+        height: originalMaskInfo.height,
+        relativeBounds,
+        text: box.text,
+        styleEstimate: {
+          ...calibratedStyleEstimate,
+          fontFamily: fontCandidate.family,
+        },
+        fontCandidate,
+      })
+      if (!render.success || !render.buffer) {
+        ranked.push({ ...fontCandidate, visualMatchConfidence: 0 })
+        continue
+      }
+      const normalizedRenderBuffer = await sharp(render.buffer)
+        .resize(originalMaskInfo.width, originalMaskInfo.height, { fit: 'fill' })
+        .png()
+        .toBuffer()
+      const renderRaw = await readImageRaw(normalizedRenderBuffer)
+      const renderMask = extractAlphaMask(renderRaw)
+      const maskF1 = computeMaskF1(renderMask, originalMaskInfo.mask, originalMaskInfo.focusBounds, originalMaskInfo.width)
+      const projectionSimilarity = computeProjectionSimilarity(renderMask, originalMaskInfo.mask, originalMaskInfo.focusBounds, originalMaskInfo.width)
+      const flatBg = await sharp({
+        create: {
+          width: originalMaskInfo.width,
+          height: originalMaskInfo.height,
+          channels: 4,
+          background: {
+            r: Math.round(originalMaskInfo.backgroundRgb[0]),
+            g: Math.round(originalMaskInfo.backgroundRgb[1]),
+            b: Math.round(originalMaskInfo.backgroundRgb[2]),
+            alpha: 1,
+          },
+        },
+      }).png().toBuffer()
+      const renderCompositeOnFlat = await sharp(flatBg)
+        .composite([{ input: normalizedRenderBuffer, left: 0, top: 0 }])
+        .png()
+        .toBuffer()
+      const renderCompositeRaw = await readImageRaw(renderCompositeOnFlat)
+      const inkDiff = averageRgbDifferenceWithinUnion(
+        originalCropRaw.data,
+        renderCompositeRaw.data,
+        originalMaskInfo.mask,
+        renderMask,
+        originalMaskInfo.focusBounds,
+        originalMaskInfo.width,
+      )
+      const inkPixelSimilarity = clamp(1 - inkDiff / 90, 0, 1)
+      const sizeSimilarity = clamp(
+        1 - Math.abs((Number(render.metrics?.finalFontSize || calibratedStyleEstimate.fontSize || 16) - Number(rankingStyle.fontSize || 16)) / Math.max(8, Number(rankingStyle.fontSize || 16))),
+        0,
+        1,
+      )
+      const spacingSimilarity = clamp(1 - Math.abs(Number(calibratedStyleEstimate.letterSpacing || 0)) / 4, 0, 1)
+      const visualMatchConfidence = clamp(
+        0.30 * maskF1 +
+        0.25 * projectionSimilarity +
+        0.25 * inkPixelSimilarity +
+        0.10 * sizeSimilarity +
+        0.10 * spacingSimilarity,
+        0,
+        1,
+      )
+      ranked.push({
+        ...fontCandidate,
+        visualMatchConfidence,
+        projectionSimilarity,
+        inkPixelSimilarity,
+        confidence: clamp(0.35 * Number(fontCandidate.confidence || 0) + 0.65 * visualMatchConfidence, 0, 1),
+        calibratedStyleEstimate,
+      })
+    }
+    ranked.sort((left, right) => {
+      const rightScore = Number(right.visualMatchConfidence || right.confidence || 0)
+      const leftScore = Number(left.visualMatchConfidence || left.confidence || 0)
+      return rightScore - leftScore
+    })
+    return ranked
+  }
+
   function getTextLayerCacheVersion() {
     return 'v2'
   }
@@ -799,10 +1202,10 @@ function createPptService(options = {}) {
     // 优先从 _assets 读取最新的 processed PNG
     if (assetsDir) {
       const seq = String(pageIndex + 1).padStart(2, '0')
-      // 查找最新 attempt 的 1920x1080 PNG（兼容旧的 1920x1200）
+      // 查找最新 attempt 的导出 PNG（兼容旧命名）
       const files = fs.existsSync(assetsDir) ? fs.readdirSync(assetsDir) : []
       const pngFiles = files
-        .filter((f) => (f.startsWith(`slide_${seq}_1920x1080_`) || f.startsWith(`slide_${seq}_1920x1200_`)) && f.endsWith('.png'))
+        .filter((f) => (f.startsWith(`slide_${seq}_2048x1152_`) || f.startsWith(`slide_${seq}_3840x2160_`) || f.startsWith(`slide_${seq}_1920x1080_`) || f.startsWith(`slide_${seq}_1920x1200_`)) && f.endsWith('.png'))
         .sort()
         .reverse()
       if (pngFiles.length > 0) {
@@ -979,11 +1382,72 @@ function createPptService(options = {}) {
     return sharp(Buffer.from(svg)).png().toBuffer()
   }
 
-  async function compositeCropBack(baseBuffer, cropBuffer, extract) {
+  async function buildFinalBlendMaskBuffer({ cleanupMaskBuffer, renderLayerBuffer, width, height }) {
+    const cleanupMask = await sharp(cleanupMaskBuffer)
+      .resize(width, height, { fit: 'fill' })
+      .greyscale()
+      .raw()
+      .toBuffer()
+    const renderRaw = await readImageRaw(renderLayerBuffer)
+    const rgba = Buffer.alloc(width * height * 4)
+    for (let idx = 0, pixel = 0; pixel < width * height; pixel += 1, idx += 4) {
+      const alpha = Math.max(cleanupMask[pixel], renderRaw.data[idx + 3])
+      rgba[idx] = alpha
+      rgba[idx + 1] = alpha
+      rgba[idx + 2] = alpha
+      rgba[idx + 3] = 255
+    }
+    return sharp(rgba, {
+      raw: {
+        width,
+        height,
+        channels: 4,
+      },
+    })
+      .blur(2.5)
+      .png()
+      .toBuffer()
+  }
+
+  async function compositeCropBack(baseBuffer, cropBuffer, extract, blendMaskBuffer = null) {
+    if (!blendMaskBuffer) {
+      return sharp(baseBuffer)
+        .composite([
+          {
+            input: cropBuffer,
+            left: extract.left,
+            top: extract.top,
+          },
+        ])
+        .png()
+        .toBuffer()
+    }
+
+    const cropRaw = await readImageRaw(cropBuffer)
+    const maskRaw = await sharp(blendMaskBuffer)
+      .resize(extract.width, extract.height, { fit: 'fill' })
+      .greyscale()
+      .raw()
+      .toBuffer()
+    const rgba = Buffer.alloc(extract.width * extract.height * 4)
+    for (let idx = 0, pixel = 0; pixel < extract.width * extract.height; pixel += 1, idx += 4) {
+      rgba[idx] = cropRaw.data[idx]
+      rgba[idx + 1] = cropRaw.data[idx + 1]
+      rgba[idx + 2] = cropRaw.data[idx + 2]
+      rgba[idx + 3] = maskRaw[pixel]
+    }
+    const maskedCrop = await sharp(rgba, {
+      raw: {
+        width: extract.width,
+        height: extract.height,
+        channels: 4,
+      },
+    }).png().toBuffer()
+
     return sharp(baseBuffer)
       .composite([
         {
-          input: cropBuffer,
+          input: maskedCrop,
           left: extract.left,
           top: extract.top,
         },
@@ -1228,6 +1692,7 @@ function createPptService(options = {}) {
               width: 100%;
               color: ${styleEstimate.textColor || '#000000'};
               font-family: '${fontFamily}', '${fontCandidate?.family || ''}', ${styleEstimate.familyHint === 'serif' ? 'serif' : 'sans-serif'};
+              font-weight: ${Math.max(100, Math.min(900, Number(styleEstimate.fontWeight || 400)))};
               font-size: ${Math.max(8, Number(styleEstimate.fontSize || 18))}px;
               line-height: ${Math.max(0.8, Number(styleEstimate.lineHeight || 1))};
               letter-spacing: ${Number(styleEstimate.letterSpacing || 0)}px;
@@ -1463,9 +1928,9 @@ function createPptService(options = {}) {
   }
 
   async function postprocessTo1920x1200(buffer, mode = 'letterbox') {
-    // 更新为 16:9 分辨率以匹配 z-image-turbo 输出 (2048*1152)
-    const targetW = 1920
-    const targetH = 1080 // 16:9 比例
+    // 统一导出为 2K 级 16:9 成品图
+    const targetW = 2048
+    const targetH = 1152
     if (mode === 'cover') {
       return await sharp(buffer).resize(targetW, targetH, { fit: 'cover', position: 'attention' }).png().toBuffer()
     }
@@ -1713,6 +2178,76 @@ function createPptService(options = {}) {
     throw lastError
   }
 
+  async function openAICompatibleGenerateImage({
+    apiKey,
+    baseUrl,
+    model = 'gpt-image-2',
+    prompt,
+    size = '2048x1152',
+  }) {
+    if (!apiKey) {
+      throw new Error('缺少主模型 API Key')
+    }
+    if (!prompt || !String(prompt).trim()) {
+      throw new Error('缺少 prompt')
+    }
+
+    let endpoint = String(baseUrl || 'https://api.openai.com/v1').trim()
+    if (endpoint.endsWith('/')) endpoint = endpoint.slice(0, -1)
+    if (!endpoint.endsWith('/images/generations')) {
+      endpoint = `${endpoint}/images/generations`
+    }
+
+    console.log(`[PPT Image] Calling ${model} @ ${endpoint}`)
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        prompt: String(prompt),
+        size,
+      }),
+    })
+
+    const text = await res.text()
+    let json = null
+    try {
+      json = JSON.parse(text)
+    } catch {
+      json = null
+    }
+
+    if (!res.ok) {
+      const message = json?.error?.message || text
+      throw new Error(`图片生成失败: HTTP ${res.status} - ${String(message).slice(0, 500)}`)
+    }
+
+    const item = Array.isArray(json?.data) ? json.data[0] : null
+    if (item?.b64_json) {
+      return {
+        base64: item.b64_json,
+        mimeType: 'image/png',
+        source: 'openai-compatible-b64',
+        raw: json,
+      }
+    }
+
+    if (item?.url) {
+      const raw = await downloadToBuffer(item.url)
+      return {
+        base64: raw.toString('base64'),
+        mimeType: 'image/png',
+        source: item.url,
+        raw: json,
+      }
+    }
+
+    throw new Error(`图片生成返回中未找到 b64_json/url: ${text.slice(0, 500)}`)
+  }
+
   function enhancePromptForGeminiImage({ prompt, negativePrompt }) {
     const safePrompt = String(prompt || '').trim()
     const safeNeg = String(negativePrompt || '').trim()
@@ -1835,14 +2370,15 @@ function createPptService(options = {}) {
           if (!filePath || typeof filePath !== 'string') {
             return { success: false, error: '缺少 filePath' }
           }
-          if (!fs.existsSync(filePath)) {
+          const normalizedFilePath = normalizeLocalPath(filePath)
+          if (!fs.existsSync(normalizedFilePath)) {
             return { success: false, error: '文件不存在' }
           }
-          if (path.extname(filePath).toLowerCase() !== '.pptx') {
+          if (path.extname(normalizedFilePath).toLowerCase() !== '.pptx') {
             return { success: false, error: '仅支持 .pptx' }
           }
 
-          const cacheDir = getPptxPreviewCacheDir(filePath)
+          const cacheDir = getPptxPreviewCacheDir(normalizedFilePath)
           if (fs.existsSync(cacheDir)) {
             const cached = listPngFilesSorted(cacheDir)
             if (cached.length > 0) {
@@ -1850,7 +2386,7 @@ function createPptService(options = {}) {
             }
           }
 
-          const result = await renderPptxToPngsWithLibreOffice(filePath, cacheDir)
+          const result = await renderPptxToPngsWithLibreOffice(normalizedFilePath, cacheDir)
           if (!result.success) {
             return result
           }
@@ -1878,15 +2414,16 @@ function createPptService(options = {}) {
           if (!pptxPath || typeof pptxPath !== 'string') {
             return { success: false, error: '缺少 pptxPath' }
           }
-          if (!fs.existsSync(pptxPath)) {
-            return { success: false, error: `PPTX 文件不存在: ${pptxPath}` }
+          const normalizedPptxPath = normalizeLocalPath(pptxPath)
+          if (!fs.existsSync(normalizedPptxPath)) {
+            return { success: false, error: `PPTX 文件不存在: ${normalizedPptxPath}` }
           }
           if (!Number.isFinite(Number(pageNumber)) || Number(pageNumber) <= 0) {
             return { success: false, error: '缺少有效页码' }
           }
 
           const result = await detectTextLayerInternal({
-            pptxPath,
+            pptxPath: normalizedPptxPath,
             pageNumber: Number(pageNumber),
             useCache,
             cacheOnly,
@@ -1915,8 +2452,9 @@ function createPptService(options = {}) {
           if (!pptxPath || typeof pptxPath !== 'string') {
             return { success: false, error: '缺少 pptxPath' }
           }
-          if (!fs.existsSync(pptxPath)) {
-            return { success: false, error: `PPTX 文件不存在: ${pptxPath}` }
+          const normalizedPptxPath = normalizeLocalPath(pptxPath)
+          if (!fs.existsSync(normalizedPptxPath)) {
+            return { success: false, error: `PPTX 文件不存在: ${normalizedPptxPath}` }
           }
           if (!Number.isFinite(Number(pageNumber)) || Number(pageNumber) <= 0) {
             return { success: false, error: '缺少有效页码' }
@@ -1934,7 +2472,7 @@ function createPptService(options = {}) {
           })
 
           const detection = await detectTextLayerInternal({
-            pptxPath,
+            pptxPath: normalizedPptxPath,
             pageNumber: Number(pageNumber),
             useCache: true,
             cacheOnly: false,
@@ -1948,8 +2486,8 @@ function createPptService(options = {}) {
             return detection
           }
 
-          const assetsDir = detection.assetsDir || getDeckAssetsDir(pptxPath)
-          const source = await ensurePageSourceImage(pptxPath, Number(pageNumber), assetsDir)
+          const assetsDir = detection.assetsDir || getDeckAssetsDir(normalizedPptxPath)
+          const source = await ensurePageSourceImage(normalizedPptxPath, Number(pageNumber), assetsDir)
           const logsDir = getTextEditLogsDir(assetsDir)
           if (!fs.existsSync(logsDir)) {
             fs.mkdirSync(logsDir, { recursive: true })
@@ -1996,7 +2534,7 @@ function createPptService(options = {}) {
               ...(box.styleEstimate || box.styleHint || {}),
               ...styleOverride,
             }
-            const rankedFontCandidates = (() => {
+            let rankedFontCandidates = (() => {
               const base = Array.isArray(box.fontCandidates) && box.fontCandidates.length
                 ? [...box.fontCandidates]
                 : [{
@@ -2020,8 +2558,32 @@ function createPptService(options = {}) {
                 }
                 return Number(right.confidence || 0) - Number(left.confidence || 0)
               })
-              return base.slice(0, 3)
+              return base.slice(0, 6)
             })()
+
+            emitPptTextEditProgress({
+              stage: 'rendering',
+              progress: 0.1 + (completedCandidateUnits / totalCandidateEstimate) * 0.4,
+              message: `正在匹配原字体字形...`,
+              pageNumber: Number(pageNumber),
+              currentBoxId: box.boxId,
+              completedCandidates: completedCandidateUnits,
+              totalCandidates: totalCandidateEstimate,
+            })
+
+            const rankingCrop = await cropImageBuffer(workingBuffer, edit.bounds || box.bounds, 32)
+            const rankingRelativeBounds = {
+              left: Math.max(0, (edit.bounds || box.bounds).left - rankingCrop.extract.left),
+              top: Math.max(0, (edit.bounds || box.bounds).top - rankingCrop.extract.top),
+              width: Math.max(1, (edit.bounds || box.bounds).width),
+              height: Math.max(1, (edit.bounds || box.bounds).height),
+            }
+            rankedFontCandidates = (await rankFontCandidatesByOriginalGlyphFit({
+              originalCropBuffer: rankingCrop.cropBuffer,
+              relativeBounds: rankingRelativeBounds,
+              box,
+              fontCandidates: rankedFontCandidates,
+            })).slice(0, 3)
 
             const cleanupStrategies = styleOverride.cleanupStrategy
               ? [styleOverride.cleanupStrategy]
@@ -2039,26 +2601,26 @@ function createPptService(options = {}) {
 
             const candidateResults = []
             const cleanupRecognitionItems = []
-            for (const cleanupStrategy of cleanupStrategies) {
-              const blendStrategy = styleOverride.blendStrategy || chooseBlendStrategy(box)
-              let cleanPageBuffer = workingBuffer
-              let cleanupResidualText = ''
-              let crop = await cropImageBuffer(workingBuffer, edit.bounds || box.bounds, 32)
-              const originalCropBuffer = crop.cropBuffer
+	            for (const cleanupStrategy of cleanupStrategies) {
+	              const blendStrategy = styleOverride.blendStrategy || chooseBlendStrategy(box)
+	              let cleanPageBuffer = workingBuffer
+	              let cleanupResidualText = ''
+	              let crop = await cropImageBuffer(workingBuffer, edit.bounds || box.bounds, 32)
+	              const originalCropBuffer = crop.cropBuffer
+	              const cleanupMaskBuffer = await buildCleanupMaskCropBuffer({
+	                box,
+	                cropExtract: crop.extract,
+	                strategy: cleanupStrategy === 'adobe_firefly_fill' ? 'local_inpaint' : cleanupStrategy,
+	              })
 
-              if (cleanupStrategy === 'adobe_firefly_fill') {
-                try {
-                  const maskBuffer = await buildCleanupMaskCropBuffer({
-                    box,
-                    cropExtract: crop.extract,
-                    strategy: cleanupStrategy,
-                  })
-                  const adobeCleanCropBuffer = await adobeFillCrop({
-                    sourceBuffer: crop.cropBuffer,
-                    maskBuffer,
-                    prompt: 'Remove the masked text and continue the original background naturally. Preserve the poster layout, texture, lighting, and soft gradients. Do not add any new text, shapes, frames, or decorations.',
-                  })
-                  crop.cropBuffer = adobeCleanCropBuffer
+	              if (cleanupStrategy === 'adobe_firefly_fill') {
+	                try {
+	                  const adobeCleanCropBuffer = await adobeFillCrop({
+	                    sourceBuffer: crop.cropBuffer,
+	                    maskBuffer: cleanupMaskBuffer,
+	                    prompt: 'Remove the masked text and continue the original background naturally. Preserve the poster layout, texture, lighting, and soft gradients. Do not add any new text, shapes, frames, or decorations.',
+	                  })
+	                  crop.cropBuffer = adobeCleanCropBuffer
                 } catch (error) {
                   logs.push({
                     boxId: edit.boxId,
@@ -2094,27 +2656,43 @@ function createPptService(options = {}) {
                 height: Math.max(1, (edit.bounds || box.bounds).height),
               }
 
-              for (const fontCandidate of rankedFontCandidates) {
-                emitPptTextEditProgress({
+	              for (const fontCandidate of rankedFontCandidates) {
+	                emitPptTextEditProgress({
                   stage: 'rendering',
                   progress: 0.1 + (completedCandidateUnits / totalCandidateEstimate) * 0.6,
                   message: `正在生成候选：${fontCandidate.family} · ${cleanupStrategy}...`,
                   pageNumber: Number(pageNumber),
-                  currentBoxId: box.boxId,
-                  completedCandidates: completedCandidateUnits,
-                  totalCandidates: totalCandidateEstimate,
-                })
-                const render = await renderDeterministicTextLayer({
-                  width: crop.extract.width,
-                  height: crop.extract.height,
-                  relativeBounds,
-                  text: edit.toText,
-                  styleEstimate: {
-                    ...styleEstimate,
-                    fontFamily: fontCandidate.family,
-                  },
-                  fontCandidate,
-                })
+	                  currentBoxId: box.boxId,
+	                  completedCandidates: completedCandidateUnits,
+	                  totalCandidates: totalCandidateEstimate,
+	                })
+	                let candidateStyleEstimate = {
+	                  ...styleEstimate,
+	                  ...(fontCandidate.calibratedStyleEstimate || {}),
+	                }
+	                candidateStyleEstimate = await calibrateStyleEstimateForOriginalText({
+	                  width: crop.extract.width,
+	                  height: crop.extract.height,
+	                  relativeBounds,
+	                  targetGlyphBounds: {
+	                    width: Math.max(1, Number(box?.styleEstimate?.textBounds?.width || box?.bounds?.width || relativeBounds.width)),
+	                    height: Math.max(1, Number(box?.styleEstimate?.textBounds?.height || box?.bounds?.height || relativeBounds.height)),
+	                  },
+	                  text: edit.toText,
+	                  styleEstimate: candidateStyleEstimate,
+	                  fontCandidate,
+	                })
+	                const render = await renderDeterministicTextLayer({
+	                  width: crop.extract.width,
+	                  height: crop.extract.height,
+	                  relativeBounds,
+	                  text: edit.toText,
+	                  styleEstimate: {
+	                    ...candidateStyleEstimate,
+	                    fontFamily: fontCandidate.family,
+	                  },
+	                  fontCandidate,
+	                })
                 if (!render.success || !render.buffer) continue
                 const normalizedRenderBuffer = await sharp(render.buffer)
                   .resize(crop.extract.width, crop.extract.height, {
@@ -2148,20 +2726,25 @@ function createPptService(options = {}) {
                   metrics: {
                     fontFamily: fontCandidate.family,
                     fontConfidence: fontCandidate.confidence,
+                    visualMatchConfidence: fontCandidate.visualMatchConfidence,
+                    projectionSimilarity: fontCandidate.projectionSimilarity,
+                    inkPixelSimilarity: fontCandidate.inkPixelSimilarity,
+                    fontWeight: candidateStyleEstimate.fontWeight,
                     finalFontSize: render.metrics?.finalFontSize,
                     overflowX: render.metrics?.overflowX,
                     overflowY: render.metrics?.overflowY,
                   },
                   _compositeCropBuffer: compositeCropBuffer,
-                  _cleanPageBuffer: cleanPageBuffer,
-                  _extract: crop.extract,
-                  _cleanupRecognitionKey: cleanupRecognitionKey,
-                  _originalCropBuffer: originalCropBuffer,
-                  _cleanCropBuffer: crop.cropBuffer,
-                  _renderLayerBuffer: normalizedRenderBuffer,
-                  _renderMetrics: render.metrics,
-                  _fontCandidate: fontCandidate,
-                })
+	                  _cleanPageBuffer: cleanPageBuffer,
+	                  _extract: crop.extract,
+	                  _cleanupRecognitionKey: cleanupRecognitionKey,
+	                  _originalCropBuffer: originalCropBuffer,
+	                  _cleanCropBuffer: crop.cropBuffer,
+	                  _renderLayerBuffer: normalizedRenderBuffer,
+	                  _cleanupMaskBuffer: cleanupMaskBuffer,
+	                  _renderMetrics: render.metrics,
+	                  _fontCandidate: fontCandidate,
+	                })
                 completedCandidateUnits += 1
               }
             }
@@ -2231,13 +2814,20 @@ function createPptService(options = {}) {
               continue
             }
 
-            const bestCandidate = candidateResults[0]
-            bestCandidate.applied = true
-            workingBuffer = await compositeCropBack(
-              bestCandidate._cleanPageBuffer,
-              bestCandidate._compositeCropBuffer,
-              bestCandidate._extract,
-            )
+	            const bestCandidate = candidateResults[0]
+	            bestCandidate.applied = true
+	            const blendMaskBuffer = await buildFinalBlendMaskBuffer({
+	              cleanupMaskBuffer: bestCandidate._cleanupMaskBuffer,
+	              renderLayerBuffer: bestCandidate._renderLayerBuffer,
+	              width: bestCandidate._extract.width,
+	              height: bestCandidate._extract.height,
+	            })
+	            workingBuffer = await compositeCropBack(
+	              bestCandidate._cleanPageBuffer,
+	              bestCandidate._compositeCropBuffer,
+	              bestCandidate._extract,
+	              blendMaskBuffer,
+	            )
 
             perBoxApplied[edit.boxId] = bestCandidate
             perBoxCandidates[edit.boxId] = candidateResults.map((candidate) => ({
@@ -2580,25 +3170,27 @@ function createPptService(options = {}) {
           if (!outputPath || typeof outputPath !== 'string') {
             return { success: false, error: '缺少 outputPath' }
           }
-          if (!outputPath.toLowerCase().endsWith('.pptx')) {
+          const normalizedOutputPath = normalizeLocalPath(outputPath)
+          if (!normalizedOutputPath.toLowerCase().endsWith('.pptx')) {
             return { success: false, error: 'outputPath 必须以 .pptx 结尾' }
           }
           if (!Array.isArray(slides) || slides.length === 0) {
             return { success: false, error: 'slides 不能为空' }
           }
 
-          const limit = pLimit(2) // DashScope: RPS=2 且并发=2（两张两张生成）
+          const limit = pLimit(2)
           const geminiRepairLimit = pLimit(1) // Gemini 维修：串行，保证上下文一致
           // 用户选择的图像生成模型
-          const imageModel = dashscope.model || 'z-image-turbo'
+          const imageModel = dashscope.model || 'gpt-image-2'
           // 根据模型选择默认分辨率
-          const defaultSize = imageModel === 'z-image-turbo' ? '2048*1152' : '1664*928'
+          const defaultSize = imageModel === 'gpt-image-2' ? '2048x1152' : '1024x1024'
           const size = dashscope.size || defaultSize
           const promptExtend = !!dashscope.promptExtend
           const watermark = dashscope.watermark === true
           const negativePromptDefault = dashscope.negativePromptDefault || ''
           const region = dashscope.region || 'cn'
           const apiKey = dashscope.apiKey || ''
+          const mainBaseUrl = options.mainBaseUrl || process.env.BASE_URL || 'https://api.openai.com/v1'
           const saveImages = dashscope.saveImages !== false // 默认保存，便于排查"是否真的生成了图片"
           
           console.log(`[PPT Generate] 使用模型: ${imageModel}, 分辨率: ${size}`)
@@ -2691,9 +3283,9 @@ function createPptService(options = {}) {
             })
           }
 
-          // 把每页下载到的原始图片 & 后处理后的 1920x1080 PNG 保存到本地，便于排查
-          const outDir = path.dirname(outputPath)
-          const baseName = path.basename(outputPath, path.extname(outputPath))
+          // 把每页下载到的原始图片 & 后处理后的 2048x1152 PNG 保存到本地，便于排查
+          const outDir = path.dirname(normalizedOutputPath)
+          const baseName = path.basename(normalizedOutputPath, path.extname(normalizedOutputPath))
           const assetsDir = path.join(outDir, `${baseName}_assets`)
           if (saveImages && !fs.existsSync(assetsDir)) {
             fs.mkdirSync(assetsDir, { recursive: true })
@@ -2719,43 +3311,21 @@ function createPptService(options = {}) {
                       } catch {}
                     }
 
-                    let raw
-                    let imageSource = '' // 记录图片来源（URL 或 'gemini-base64'）
-                    if (imageModel === 'gemini-image') {
-                      // 使用 LinAPI Gemini 生图（需要主模型 API Key）
-                      // 直接使用 Gemini 3 Pro 生成的原始提示词，不做额外增强
-                      if (!mainApiKey) {
-                        throw new Error('使用 Gemini 生图需要配置主模型 API Key（LinAPI）')
-                      }
-                      console.log(`\n${'='.repeat(60)}`)
-                      console.log(`[PPT Generate] ✅ 使用 gemini-3-pro-image-preview-2K 生图`)
-                      console.log(`[PPT Generate] Slide ${idx + 1}/${slides.length}`)
-                      console.log(`[PPT Generate] 提示词长度: ${prompt.length} chars`)
-                      console.log(`${'='.repeat(60)}\n`)
-                      
-                      const geminiResult = await linapiGenerateImage({
-                        apiKey: mainApiKey,
-                        prompt: prompt, // 直接使用原始提示词
-                        aspectRatio: '16:9',
-                      })
-                      raw = Buffer.from(geminiResult.base64, 'base64')
-                      imageSource = 'gemini-base64'
-                      console.log(`[PPT Generate] Slide ${idx + 1} 生图完成，图片大小: ${raw.length} bytes`)
-                    } else {
-                      // 使用 DashScope 生图
-                      const { url } = await dashscopeGenerateImageUrl({
-                        prompt,
-                        negativePrompt,
-                        size,
-                        promptExtend,
-                        watermark,
-                        model: imageModel,
-                        region,
-                        apiKey,
-                      })
-                      raw = await downloadToBuffer(url)
-                      imageSource = url // 记录 URL 来源
+                    if (!mainApiKey) {
+                      throw new Error('PPT 生图需要主模型 API Key')
                     }
+                    const imagePrompt = negativePrompt
+                      ? `${prompt}\n\nNegative constraints: ${negativePrompt}`
+                      : prompt
+                    const imageResult = await openAICompatibleGenerateImage({
+                      apiKey: mainApiKey,
+                      baseUrl: mainBaseUrl,
+                      model: imageModel,
+                      prompt: imagePrompt,
+                      size,
+                    })
+                    const raw = Buffer.from(imageResult.base64, 'base64')
+                    const imageSource = imageResult.source || 'openai-compatible-b64'
                     if (!raw || raw.length === 0) {
                       throw new Error(`图片下载失败或为空（idx=${idx}）`)
                     }
@@ -2776,7 +3346,7 @@ function createPptService(options = {}) {
                       }
                       if (!ext || ext.length > 5) ext = '.jpg'
                       const rawPath = path.join(assetsDir, `slide_${seq}_raw_attempt${attempt}${ext}`)
-                      const pngPath = path.join(assetsDir, `slide_${seq}_1920x1080_attempt${attempt}.png`)
+                      const pngPath = path.join(assetsDir, `slide_${seq}_2048x1152_attempt${attempt}.png`)
                       const sourcePath = path.join(assetsDir, `slide_${seq}_source_attempt${attempt}.txt`)
                       try {
                         fs.writeFileSync(rawPath, raw)
@@ -2850,12 +3420,12 @@ function createPptService(options = {}) {
           }))
 
           // Ensure directory exists
-          const dir = path.dirname(outputPath)
+          const dir = path.dirname(normalizedOutputPath)
           if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true })
           }
 
-          await makePptx16x10FromImagesBase64(images, outputPath)
+          await makePptx16x10FromImagesBase64(images, normalizedOutputPath)
           
           // 保存元数据到 _assets 目录（用于后续编辑）
           if (saveImages) {
@@ -2866,7 +3436,7 @@ function createPptService(options = {}) {
             })
           }
 
-          return { success: true, path: outputPath, slideCount: slides.length }
+          return { success: true, path: normalizedOutputPath, slideCount: slides.length }
         } catch (error) {
           console.error('ppt-generate-deck failed:', error)
           return { success: false, error: error.message || String(error) }
@@ -2883,7 +3453,8 @@ function createPptService(options = {}) {
             openRouterApiKey,   // Gemini API Key
             dashscopeApiKey,    // DashScope API Key
             mainApiKey,         // 主模型 API Key（用于 LinAPI Gemini 生图）
-            pptImageModel = 'z-image-turbo', // 生图模型选择
+            mainBaseUrl = '',   // 主模型 Base URL
+            pptImageModel = 'gpt-image-2', // 生图模型选择
             deckContext: providedDeckContext, // 可选，优先使用提供的
             regionScreenshot,   // 新增：用户框选区域的截图 base64
             regionRect,         // 新增：框选区域坐标 {x, y, w, h}
@@ -2892,8 +3463,9 @@ function createPptService(options = {}) {
           if (!pptxPath || typeof pptxPath !== 'string') {
             return { success: false, error: '缺少 pptxPath' }
           }
-          if (!fs.existsSync(pptxPath)) {
-            return { success: false, error: `PPTX 文件不存在: ${pptxPath}` }
+          const normalizedPptxPath = normalizeLocalPath(pptxPath)
+          if (!fs.existsSync(normalizedPptxPath)) {
+            return { success: false, error: `PPTX 文件不存在: ${normalizedPptxPath}` }
           }
           if (!Array.isArray(pageNumbers) || pageNumbers.length === 0) {
             return { success: false, error: '缺少要编辑的页码' }
@@ -2904,21 +3476,17 @@ function createPptService(options = {}) {
           if (!openRouterApiKey) {
             return { success: false, error: '缺少 OpenRouter API Key' }
           }
-          if (pptImageModel === 'gemini-image') {
-            // Gemini 生图走 LinAPI，需要主模型 key（或复用 dashscopeApiKey 兜底，但推荐传 mainApiKey）
-            if (!mainApiKey && !dashscopeApiKey) {
-              return { success: false, error: '缺少 API Key：Gemini 生图需要 mainApiKey（或至少提供 dashscopeApiKey 兜底）' }
-            }
-          } else {
-            // DashScope 生图/编辑仍需要 DashScope Key
+          if (mode === 'partial_edit') {
             if (!dashscopeApiKey) {
-              return { success: false, error: '缺少 DashScope API Key' }
+              return { success: false, error: '缺少 DashScope API Key（局部编辑需要图像编辑接口）' }
             }
+          } else if (!mainApiKey) {
+            return { success: false, error: '缺少主模型 API Key：整页重做需要复用主模型同源生图接口' }
           }
 
           // 读取 _assets 元数据
-          const baseName = path.basename(pptxPath, '.pptx')
-          const assetsDir = path.join(path.dirname(pptxPath), `${baseName}_assets`)
+          const baseName = path.basename(normalizedPptxPath, '.pptx')
+          const assetsDir = path.join(path.dirname(normalizedPptxPath), `${baseName}_assets`)
           const metadata = loadDeckMetadata(assetsDir)
           
           const deckContext = providedDeckContext || metadata.deckContext || {}
@@ -2944,7 +3512,7 @@ function createPptService(options = {}) {
               }
 
               // 获取该页的原始图片
-              const originalImage = await getSlideImageFromPptx(pptxPath, pageIndex, assetsDir)
+              const originalImage = await getSlideImageFromPptx(normalizedPptxPath, pageIndex, assetsDir)
               if (!originalImage) {
                 editLogs.push({ pageNum, success: false, error: '无法读取该页图片' })
                 return
@@ -3088,27 +3656,27 @@ function createPptService(options = {}) {
                 
                 while (retries < maxRetries) {
                   try {
-                    if (pptImageModel === 'gemini-image') {
-                      // 使用 LinAPI Gemini 生图
-                      const enhancedPrompt = enhancePromptForGeminiImage({
-                        prompt: parsed.prompt,
-                        negativePrompt: mergeNegativePrompt(parsed.negativePrompt),
+                    if (mode === 'regenerate') {
+                      const imagePrompt = parsed.negativePrompt
+                        ? `${parsed.prompt}\n\nNegative constraints: ${mergeNegativePrompt(parsed.negativePrompt)}`
+                        : parsed.prompt
+                      const imageResult = await openAICompatibleGenerateImage({
+                        apiKey: mainApiKey,
+                        baseUrl: mainBaseUrl || process.env.BASE_URL || 'https://api.openai.com/v1',
+                        model: pptImageModel || 'gpt-image-2',
+                        prompt: imagePrompt,
+                        size: '2048x1152',
                       })
-                      const geminiResult = await linapiGenerateImage({
-                        apiKey: mainApiKey || dashscopeApiKey,
-                        prompt: enhancedPrompt,
-                        aspectRatio: '16:9',
-                      })
-                      raw = Buffer.from(geminiResult.base64, 'base64')
+                      raw = Buffer.from(imageResult.base64, 'base64')
                     } else {
-                      // 使用 DashScope 生图
+                      // 局部编辑仍使用现有图像编辑链路
                       const result = await dashscopeGenerateImageUrl({
                         prompt: parsed.prompt,
                         negativePrompt: mergeNegativePrompt(parsed.negativePrompt),
                         size: '2048*1152',
                         promptExtend: false,
                         watermark: false,
-                        model: pptImageModel || 'z-image-turbo',
+                        model: 'qwen-image-plus',
                         region: 'cn',
                         apiKey: dashscopeApiKey,
                       })
@@ -3268,7 +3836,7 @@ function createPptService(options = {}) {
           }
 
           // 替换 PPTX 中的图片并覆盖写回
-          await replaceSlideImagesInPptx(pptxPath, replacements, true)
+          await replaceSlideImagesInPptx(normalizedPptxPath, replacements, true)
 
           // 更新 slides_prompts.json
           if (fs.existsSync(assetsDir) && slidesPrompts.length > 0) {

@@ -192,6 +192,7 @@ def sample_text_style(image_np, polygon, text):
     align = "center" if bounds["width"] > 300 and len(str(text)) <= 20 else "left"
     family_hint = "serif" if bounds["height"] >= 42 or "目录" in str(text) or len(str(text)) <= 14 else "sans"
     shadow_opacity = 0.18 if bounds["height"] >= 42 else 0.08
+    font_weight = 700 if bounds["height"] >= 58 else 600 if bounds["height"] >= 42 else 400
 
     return {
         "fontSize": font_size,
@@ -201,6 +202,7 @@ def sample_text_style(image_np, polygon, text):
         "lineCount": lines,
         "align": align,
         "familyHint": family_hint,
+        "fontWeight": font_weight,
         "shadowColor": "#000000",
         "shadowOpacity": shadow_opacity,
         "shadowOffsetX": max(1, int(bounds["height"] * 0.03)),
@@ -302,20 +304,44 @@ def build_font_candidates(repo_root, style, text):
         item["previewText"] = str(text or "")[:24]
         candidates.append(item)
 
+    def workspace_font(name, files, confidence):
+        for filename in files:
+            fp = fonts_dir / filename
+            if fp.exists():
+                push(name, confidence, source="workspace", font_path=fp)
+                return
+
     if is_cjk:
         if "serif" in family_hint or "song" in family_hint:
+            workspace_font("SimSun", ["simsun.ttc"], 0.97)
+            workspace_font("STSong", ["STSONG.TTF"], 0.95)
+            workspace_font("STFangsong", ["STFANGSO.TTF", "simfang.ttf"], 0.9)
             push("Songti SC", 0.92)
             push("SimSun", 0.9)
             push("Source Han Serif SC", 0.84)
         elif "kai" in family_hint:
+            workspace_font("SimKai", ["simkai.ttf"], 0.97)
+            workspace_font("STKaiti", ["STKAITI.TTF"], 0.95)
+            workspace_font("SimSun", ["simsun.ttc"], 0.82)
             push("Kaiti SC", 0.92)
             push("STKaiti", 0.88)
             push("Songti SC", 0.76)
+        elif "fang" in family_hint or "仿" in family_hint:
+            workspace_font("STFangsong", ["STFANGSO.TTF", "simfang.ttf"], 0.97)
+            workspace_font("SimSun", ["simsun.ttc"], 0.84)
+            push("STFangsong", 0.92)
+            push("FangSong", 0.86)
         else:
+            workspace_font("Microsoft YaHei", ["msyh.ttc", "msyhbd.ttc"], 0.97)
+            workspace_font("SimHei", ["simhei.ttf"], 0.95)
+            workspace_font("DengXian", ["Deng.ttf", "Dengb.ttf"], 0.9)
             push("PingFang SC", 0.95)
             push("Microsoft YaHei", 0.9)
             push("Source Han Sans SC", 0.86)
     else:
+        workspace_font("Arial", ["arial.ttf", "arialbd.ttf"], 0.94)
+        workspace_font("Calibri", ["calibri.ttf", "calibrib.ttf"], 0.92)
+        workspace_font("Cambria", ["cambria.ttc", "cambriab.ttf"], 0.86)
         push("Arial", 0.9)
         push("Helvetica", 0.85)
         push("Times New Roman", 0.72)
@@ -324,7 +350,7 @@ def build_font_candidates(repo_root, style, text):
         for entry in sorted(fonts_dir.iterdir()):
             if entry.suffix.lower() not in {".ttf", ".otf", ".ttc", ".woff", ".woff2"}:
                 continue
-            push(entry.stem, 0.68, source="workspace", font_path=entry)
+            push(entry.stem, 0.62, source="workspace", font_path=entry)
             if len(candidates) >= 6:
                 break
 
@@ -1145,6 +1171,41 @@ def main():
         return
 
     command = sys.argv[1]
+    if command == "serve":
+        for raw_line in sys.stdin:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                request = json.loads(line)
+                request_id = request.get("id")
+                request_command = request.get("command")
+                payload = request.get("payload") or {}
+                handler = COMMANDS.get(request_command)
+                if not handler:
+                    response = {
+                        "id": request_id,
+                        "ok": False,
+                        "error": f"unknown command: {request_command}",
+                    }
+                else:
+                    result = handler(payload)
+                    response = {
+                        "id": request_id,
+                        "ok": True,
+                        "result": result,
+                    }
+            except Exception as exc:
+                response = {
+                    "id": request.get("id") if "request" in locals() else None,
+                    "ok": False,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+        return
+
     payload = read_payload()
     try:
         handler = COMMANDS.get(command)

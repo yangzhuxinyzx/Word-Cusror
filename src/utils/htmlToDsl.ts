@@ -136,6 +136,11 @@ function convertElement(el: HTMLElement, opts: HtmlToDslOptions): RawBlock | Raw
     return { type: 'horizontalRule' } as DslHorizontalRule
   }
 
+  // 兼容应用内部插入的分页符块
+  if (tag === 'div' && el.classList.contains('page-break')) {
+    return { type: 'pageBreak' } as DslPageBreak
+  }
+
   // 引用块
   if (tag === 'blockquote') {
     const children = convertChildren(el, opts)
@@ -390,9 +395,11 @@ function convertTableCell(td: HTMLElement, opts: HtmlToDslOptions): DslTableCell
 function convertImage(img: HTMLElement): DslImage | null {
   let src = img.getAttribute('src') || ''
   const rid = img.getAttribute('data-rid')
+  const alt = img.getAttribute('alt') || ''
   const preserveInlineSrc =
     img.getAttribute('data-preserve-src') === '1' ||
-    img.getAttribute('data-generated-from') === 'docx-chart'
+    img.getAttribute('data-generated-from') === 'docx-chart' ||
+    alt.startsWith('chart:')
 
   // base64 → 占位符
   if (src.startsWith('data:image/') && !preserveInlineSrc) {
@@ -403,7 +410,6 @@ function convertImage(img: HTMLElement): DslImage | null {
 
   const block: DslImage = { type: 'image', src }
 
-  const alt = img.getAttribute('alt')
   if (alt && alt !== '文档图片') block.alt = alt
 
   const w = img.getAttribute('data-w') || img.style.width

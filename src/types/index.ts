@@ -132,6 +132,17 @@ export interface ChatMessage {
     searchText?: string
     replaceText?: string
   }[]
+  knowledgeHits?: {
+    sourceScope: KnowledgeSourceScope
+    sourcePath: string
+    relativePath?: string
+    fileType?: string
+    title?: string
+    score: number
+    snippet: string
+    category?: string
+    statement?: string
+  }[]
   // 流式交替快照：保留文字与工具卡片的交替顺序，用于历史消息交替渲染
   streamSnapshot?: (
     | { type: 'text'; id: string; content: string }
@@ -172,7 +183,7 @@ export interface AISettings {
   // Black Forest Labs（用于后续 FLUX 高配图像编辑）
   bflApiKey?: string
   // PPT 图像生成模型
-  pptImageModel?: 'gemini-image' | 'z-image-turbo' | 'qwen-image-plus' | 'qwen-image-max'
+  pptImageModel?: 'gpt-image-2' | 'gemini-image' | 'z-image-turbo' | 'qwen-image-plus' | 'qwen-image-max'
   // Brave Search API Key（用于联网搜索）
   braveApiKey?: string
   // 记忆系统
@@ -273,6 +284,7 @@ export interface PptTextStyleHint {
   lineCount: number
   align: 'left' | 'center' | 'right'
   familyHint?: string
+  fontWeight?: number
   shadowColor?: string
   shadowOpacity?: number
   shadowOffsetX?: number

@@ -275,12 +275,12 @@ function createKnowledgeService(options = {}) {
       depsPromise = (async () => {
         const [lancedb, pdfParseModule, textSplitters] = await Promise.all([
           dynamicDefault(import('@lancedb/lancedb')),
-          dynamicDefault(import('pdf-parse')),
+          import('pdf-parse'),
           import('@langchain/textsplitters'),
         ])
         return {
           lancedb,
-          pdfParse: pdfParseModule,
+          PDFParse: pdfParseModule.PDFParse || pdfParseModule.default?.PDFParse || null,
           RecursiveCharacterTextSplitter: textSplitters.RecursiveCharacterTextSplitter,
         }
       })()
@@ -376,11 +376,7 @@ function createKnowledgeService(options = {}) {
 
   async function extractTextFromDocx(filePath) {
     const buffer = fs.readFileSync(filePath)
-    const arrayBuffer = buffer.buffer.slice(
-      buffer.byteOffset,
-      buffer.byteOffset + buffer.byteLength,
-    )
-    const result = await mammoth.convertToHtml({ arrayBuffer })
+    const result = await mammoth.convertToHtml({ buffer })
     return stripHtml(result.value || '')
   }
 
@@ -439,9 +435,17 @@ function createKnowledgeService(options = {}) {
   }
 
   async function extractTextFromPdf(filePath) {
-    const pdfParse = (await ensureDeps()).pdfParse
-    const result = await pdfParse(fs.readFileSync(filePath))
-    return normalizeText(result?.text || '')
+    const PDFParse = (await ensureDeps()).PDFParse
+    if (!PDFParse) {
+      throw new Error('PDFParse class unavailable')
+    }
+    const parser = new PDFParse({ data: fs.readFileSync(filePath) })
+    try {
+      const result = await parser.getText()
+      return normalizeText(result?.text || '')
+    } finally {
+      await parser.destroy().catch(() => {})
+    }
   }
 
   async function buildKnowledgeDocuments(fileMeta) {
@@ -726,7 +730,7 @@ function createKnowledgeService(options = {}) {
       .map((row) => {
         const baseScore = typeof row._distance === 'number' ? 1 - row._distance : 0
         const charScore = computeCharOverlapScore(query, row.text || '')
-        const score = baseScore * 0.75 + charScore * 0.25
+        const score = Math.max(0, baseScore * 0.75 + charScore * 0.25)
         return toKnowledgeSearchResult({
           sourceType,
           path: row.path || '',

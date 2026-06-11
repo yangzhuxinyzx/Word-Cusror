@@ -1789,6 +1789,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         const fileName = `${safeTitle}.docx`
         const filePath = joinPath(targetWorkspacePath, fileName)
         console.log('准备创建文件:', filePath)
+        emitDocumentPhaseEvent('document_apply_started', `创建 ${fileName}`)
         
         let success = false
         let createdDocxBase64: string | null = null
@@ -1894,6 +1895,8 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         }
       } catch (error) {
         console.error('创建文档失败:', error)
+      } finally {
+        emitDocumentPhaseEvent('document_apply_finished', `创建 ${safeTitle}.docx`)
       }
     } else {
       // Web 模式或没有工作区，只在内存中创建
@@ -1938,6 +1941,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         const fileName = `${safeTitle}.docx`
         const filePath = joinPath(effectiveWorkspacePath, fileName)
         console.log('DSL 创建文件:', filePath)
+        emitDocumentPhaseEvent('document_apply_started', `创建 ${fileName}`)
 
         // 使用 DSL 渲染器生成 DOCX
         const blob = await dslToDocxBlob(dsl)
@@ -2003,6 +2007,8 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       } catch (error) {
         console.error('DSL 创建文档失败:', error)
         return { success: false, message: `创建失败: ${(error as Error).message}` }
+      } finally {
+        emitDocumentPhaseEvent('document_apply_finished', `创建 ${safeTitle}.docx`)
       }
     } else {
       // Web 模式：只在内存中创建
@@ -2057,6 +2063,18 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
     setRenderAlignmentReport(null)
     setOracleStatus('idle')
     setOracleError(null)
+  }, [])
+
+  const emitDocumentPhaseEvent = useCallback((
+    phase: 'document_apply_started' | 'document_apply_finished',
+    label: string,
+  ) => {
+    if (typeof window === 'undefined') return
+    window.dispatchEvent(
+      new CustomEvent('word-cursor-document-phase', {
+        detail: { phase, label },
+      }),
+    )
   }, [])
 
   const refreshWordOracleArtifacts = useCallback(async (targetFilePath?: string) => {
@@ -2442,42 +2460,42 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
   // 保存当前文件
   const saveCurrentFile = useCallback(async () => {
     if (!currentFile) return
+    emitDocumentPhaseEvent('document_apply_started', `保存 ${currentFile.name}`)
+    try {
 
-    const pendingTotal =
-      pendingReplacements.total +
-      extraPendingChanges.reduce((sum, c) => sum + (c.stats?.matches ?? 1), 0)
+      const pendingTotal =
+        pendingReplacements.total +
+        extraPendingChanges.reduce((sum, c) => sum + (c.stats?.matches ?? 1), 0)
 
-    if (pendingTotal > 0) {
-      const choice = window.prompt(
-        `检测到未确认修订（共 ${pendingTotal} 处/块）。\n` +
-          `输入 1=全部接受并保存，2=全部拒绝并保存，0=取消`,
-        '1'
-      )
-      if (choice === null || choice.trim() === '' || choice.trim() === '0') return
-      // 注意：这里不能在 useCallback deps 中引用 confirmReplacement/rejectReplacement（TDZ）。
-      // 直接在此处 resolve，并同步清空待确认队列。
-      const mode = choice.trim() === '2' ? 'reject' : 'accept'
-      const resolved = resolveDiffContent(mode)
-      documentContentRef.current = resolved
-      setDocument(prev => ({
-        ...prev,
-        content: resolved,
-        lastModified: new Date(),
-      }))
-      setPendingReplacements({ items: [], total: 0 })
-      setExtraPendingChanges([])
-      setLastReplacement(null)
-      setHasUnsavedChanges(true)
-    }
+      if (pendingTotal > 0) {
+        const choice = window.prompt(
+          `检测到未确认修订（共 ${pendingTotal} 处/块）。\n` +
+            `输入 1=全部接受并保存，2=全部拒绝并保存，0=取消`,
+          '1'
+        )
+        if (choice === null || choice.trim() === '' || choice.trim() === '0') return
+        const mode = choice.trim() === '2' ? 'reject' : 'accept'
+        const resolved = resolveDiffContent(mode)
+        documentContentRef.current = resolved
+        setDocument(prev => ({
+          ...prev,
+          content: resolved,
+          lastModified: new Date(),
+        }))
+        setPendingReplacements({ items: [], total: 0 })
+        setExtraPendingChanges([])
+        setLastReplacement(null)
+        setHasUnsavedChanges(true)
+      }
 
-    if (isElectron && window.electronAPI) {
-      const ext = currentFile.name.split('.').pop()?.toLowerCase()
-      
-      if (ext === 'docx') {
-        const sourceHtmlRaw = documentContentRef.current || document.content
-        const sourceHtml = stripDiffMarkupForExport(sourceHtmlRaw)
-        const blob = await createDocxBlob(sourceHtml, document.title, typographyProfile)
-        let arrayBuffer = await blob.arrayBuffer()
+      if (isElectron && window.electronAPI) {
+        const ext = currentFile.name.split('.').pop()?.toLowerCase()
+        
+        if (ext === 'docx') {
+          const sourceHtmlRaw = documentContentRef.current || document.content
+          const sourceHtml = stripDiffMarkupForExport(sourceHtmlRaw)
+          const blob = await createDocxBlob(sourceHtml, document.title, typographyProfile)
+          let arrayBuffer = await blob.arrayBuffer()
 
         const hasTrackOrComments =
           typeof sourceHtml === 'string' &&
@@ -2501,21 +2519,20 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
           }
         }
 
-        const base64 = arrayBufferToBase64(arrayBuffer)
-        await window.electronAPI.writeBinaryFile(currentFile.path, base64)
+          const base64 = arrayBufferToBase64(arrayBuffer)
+          await window.electronAPI.writeBinaryFile(currentFile.path, base64)
+        } else {
+          await window.electronAPI.writeFile(currentFile.path, document.content)
+        }
+        
+        fileContentCacheRef.current.delete(currentFile.path)
+        setHasUnsavedChanges(false)
+        void refreshWordOracleArtifacts(currentFile.path)
       } else {
-        await window.electronAPI.writeFile(currentFile.path, document.content)
-      }
-      
-      // 保存成功后清除该文件的缓存
-      fileContentCacheRef.current.delete(currentFile.path)
-      setHasUnsavedChanges(false)
-      void refreshWordOracleArtifacts(currentFile.path)
-    } else {
-      const sourceHtmlRaw = documentContentRef.current || document.content
-      const sourceHtml = stripDiffMarkupForExport(sourceHtmlRaw)
-      const blob = await createDocxBlob(sourceHtml, document.title, typographyProfile)
-      let arrayBuffer = await blob.arrayBuffer()
+        const sourceHtmlRaw = documentContentRef.current || document.content
+        const sourceHtml = stripDiffMarkupForExport(sourceHtmlRaw)
+        const blob = await createDocxBlob(sourceHtml, document.title, typographyProfile)
+        let arrayBuffer = await blob.arrayBuffer()
 
       const hasTrackOrComments =
         typeof sourceHtml === 'string' &&
@@ -2539,14 +2556,16 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      saveAs(new Blob([arrayBuffer], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }), `${document.title}.docx`)
-      // 保存成功后清除该文件的缓存
-      if (currentFile) {
-        fileContentCacheRef.current.delete(currentFile.path)
+        saveAs(new Blob([arrayBuffer], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }), `${document.title}.docx`)
+        if (currentFile) {
+          fileContentCacheRef.current.delete(currentFile.path)
+        }
+        setHasUnsavedChanges(false)
       }
-      setHasUnsavedChanges(false)
+    } finally {
+      emitDocumentPhaseEvent('document_apply_finished', `保存 ${currentFile.name}`)
     }
-  }, [commentsForExport, currentFile, document, extraPendingChanges, pendingReplacements.total, refreshWordOracleArtifacts, typographyProfile])
+  }, [commentsForExport, currentFile, document, emitDocumentPhaseEvent, extraPendingChanges, pendingReplacements.total, refreshWordOracleArtifacts, typographyProfile])
 
   // 刷新文件列表
   const refreshFiles = useCallback(async () => {
@@ -2817,6 +2836,7 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       return { success: false, error: `不支持的文件类型: ${ext}` }
     }
     try {
+      emitDocumentPhaseEvent('document_apply_started', `保存 ${currentFile.name}`)
       const sourceHtmlRaw = documentContentRef.current || document.content
       const sourceHtml = stripDiffMarkupForExport(sourceHtmlRaw)
       const blob = await createDocxBlob(sourceHtml, document.title, typographyProfile)
@@ -2826,13 +2846,16 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
       if (result.success) {
         setHasUnsavedChanges(false)
         void refreshWordOracleArtifacts(currentFile.path)
+        emitDocumentPhaseEvent('document_apply_finished', `保存 ${currentFile.name}`)
         return { success: true }
       }
+      emitDocumentPhaseEvent('document_apply_finished', `保存 ${currentFile.name}`)
       return { success: false, error: result.error || '写入失败' }
     } catch (e) {
+      emitDocumentPhaseEvent('document_apply_finished', `保存 ${currentFile.name}`)
       return { success: false, error: (e as Error).message }
     }
-  }, [currentFile, document, isElectron, refreshWordOracleArtifacts, typographyProfile, stripDiffMarkupForExport])
+  }, [currentFile, document, emitDocumentPhaseEvent, isElectron, refreshWordOracleArtifacts, typographyProfile, stripDiffMarkupForExport])
 
   // AI 编辑应用
   const applyAIEdit = useCallback((newContent: string) => {
@@ -4248,7 +4271,8 @@ export function DocumentProvider({ children }: { children: ReactNode }) {
 
           const img = doc.createElement('img')
           img.setAttribute('src', dataUrl)
-          img.setAttribute('alt', chartEl.getAttribute('data-chart-title') || 'chart')
+          const chartTitle = chartEl.getAttribute('data-chart-title') || 'chart'
+          img.setAttribute('alt', `chart:${chartTitle}`)
           img.setAttribute('data-generated-from', 'docx-chart')
           img.setAttribute('data-preserve-src', '1')
           img.style.width = `${width}px`

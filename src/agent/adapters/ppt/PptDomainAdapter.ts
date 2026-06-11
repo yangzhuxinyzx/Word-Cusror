@@ -57,6 +57,11 @@ function getPathSeparator(dir: string): '/' | '\\' {
   return dir.includes('\\') && !dir.includes('/') ? '\\' : '/'
 }
 
+function joinLocalPath(dir: string, fileName: string): string {
+  const cleanDir = String(dir || '').replace(/[\\/]+$/, '')
+  return `${cleanDir}${getPathSeparator(cleanDir)}${fileName}`
+}
+
 function dirnameOf(filePath: string): string | null {
   const normalized = String(filePath || '').trim()
   if (!normalized) return null
@@ -90,10 +95,9 @@ export class PptDomainAdapter {
     const fileName = safeTitle.toLowerCase().endsWith('.pptx')
       ? safeTitle
       : `${safeTitle}.pptx`
-    const separator = getPathSeparator(dir)
     return {
       fileName,
-      outputPath: `${dir}${separator}${fileName}`,
+      outputPath: joinLocalPath(dir, fileName),
     }
   }
 
@@ -138,13 +142,14 @@ export class PptDomainAdapter {
       params.settings?.openRouterApiKey || BUILTIN_KEYS.linapiKey
     const dashscopeApiKey =
       params.settings?.dashscopeApiKey || BUILTIN_KEYS.dashscopeApiKey
-    const pptImageModel = params.settings?.pptImageModel || 'z-image-turbo'
+    const pptImageModel = params.settings?.pptImageModel || 'gpt-image-2'
     const imageSize =
-      pptImageModel === 'z-image-turbo' ? '2048*1152' : '1664*928'
+      pptImageModel === 'gpt-image-2' ? '2048x1152' : '1024x1024'
     return window.electronAPI!.pptGenerateDeck({
       outputPath: params.outputPath,
       slides: params.slides,
       mainApiKey: params.settings?.apiKey || '',
+      mainBaseUrl: params.settings?.baseUrl || '',
       dashscope: {
         apiKey: dashscopeApiKey,
         region: 'cn',
@@ -191,7 +196,8 @@ export class PptDomainAdapter {
       openRouterApiKey,
       dashscopeApiKey,
       mainApiKey: params.settings?.apiKey || '',
-      pptImageModel: params.settings?.pptImageModel || 'z-image-turbo',
+      mainBaseUrl: params.settings?.baseUrl || '',
+      pptImageModel: params.settings?.pptImageModel || 'gpt-image-2',
     })
   }
 

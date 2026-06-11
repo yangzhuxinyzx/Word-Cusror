@@ -1,4 +1,5 @@
 import type { ToolCallSource } from '../tools/ir'
+import type { KnowledgeSearchResult } from '../../types'
 
 export type MessageContent =
   | string
@@ -107,7 +108,12 @@ export interface AgentCallbacks {
   onTextChunk?: (text: string) => void
   onDebugEvent?: (event: AgentDebugEvent) => void | Promise<void>
   onContent?: (content: string) => void
-  onComplete?: (content: string, toolResults: ToolResult[], reasoning?: string) => void
+  onComplete?: (
+    content: string,
+    toolResults: ToolResult[],
+    reasoning?: string,
+    meta?: { knowledgeHits?: KnowledgeSearchResult[] },
+  ) => void
   onThinking?: (thinking: string) => void
   getLatestDocument?: () => string
 }

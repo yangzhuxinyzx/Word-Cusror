@@ -10,6 +10,16 @@ function createAIProxyService(options = {}) {
     } catch {}
   }
 
+  function emitLifecycle(event, requestId, eventType, phase, extra = {}) {
+    emitDelta(event, {
+      requestId,
+      eventType,
+      phase,
+      timestamp: Date.now(),
+      ...extra,
+    })
+  }
+
   function isAnthropicFormat(baseUrl = '', model = '') {
     const urlLower = String(baseUrl).toLowerCase()
     const modelLower = String(model).toLowerCase()
@@ -162,6 +172,8 @@ function createAIProxyService(options = {}) {
     temperature,
     maxTokens,
   }) {
+    emitLifecycle(event, requestId, 'request_started', 'awaiting_model')
+
     const { systemPrompt, anthropicMessages } = buildAnthropicMessages(messages)
     const url = `${baseUrl.replace(/\/$/, '')}/v1/messages`
     const headers = {
@@ -210,6 +222,8 @@ function createAIProxyService(options = {}) {
     let fullContent = ''
     let fullReasoning = ''
     let buffer = ''
+    let emittedFirstToken = false
+    let emittedReasoningStarted = false
 
     while (true) {
       const { done, value } = await reader.read()
@@ -239,7 +253,15 @@ function createAIProxyService(options = {}) {
 
           if (!contentDelta && !reasoningDelta) continue
 
+          if (contentDelta && !emittedFirstToken) {
+            emittedFirstToken = true
+            emitLifecycle(event, requestId, 'first_token', 'streaming_text')
+          }
           if (contentDelta) fullContent += contentDelta
+          if (reasoningDelta && !emittedReasoningStarted) {
+            emittedReasoningStarted = true
+            emitLifecycle(event, requestId, 'reasoning_started', 'streaming_reasoning')
+          }
           if (reasoningDelta) fullReasoning += reasoningDelta
 
           emitDelta(event, {
@@ -253,6 +275,7 @@ function createAIProxyService(options = {}) {
       }
     }
 
+    emitLifecycle(event, requestId, 'request_finished', 'completed')
     return { success: true, content: fullContent }
   }
 
@@ -267,6 +290,8 @@ function createAIProxyService(options = {}) {
     temperature,
     maxTokens,
   }) {
+    emitLifecycle(event, requestId, 'request_started', 'awaiting_model')
+
     const url = `${baseUrl.replace(/\/$/, '')}/chat/completions`
     const headers = {
       'Content-Type': 'application/json',
@@ -308,6 +333,8 @@ function createAIProxyService(options = {}) {
     let fullReasoning = ''
     let buffer = ''
     let loggedDeltaShape = false
+    let emittedFirstToken = false
+    let emittedReasoningStarted = false
 
     while (true) {
       const { done, value } = await reader.read()
@@ -368,7 +395,15 @@ function createAIProxyService(options = {}) {
 
           if (!contentDelta && !reasoningDelta) continue
 
+          if (contentDelta && !emittedFirstToken) {
+            emittedFirstToken = true
+            emitLifecycle(event, requestId, 'first_token', 'streaming_text')
+          }
           if (contentDelta) fullContent += contentDelta
+          if (reasoningDelta && !emittedReasoningStarted) {
+            emittedReasoningStarted = true
+            emitLifecycle(event, requestId, 'reasoning_started', 'streaming_reasoning')
+          }
           if (reasoningDelta) fullReasoning += reasoningDelta
           fullReasoning = extractThinkingFromContent(fullContent, fullReasoning)
 
@@ -383,6 +418,7 @@ function createAIProxyService(options = {}) {
       }
     }
 
+    emitLifecycle(event, requestId, 'request_finished', 'completed')
     return { success: true, content: fullContent }
   }
 
@@ -542,8 +578,9 @@ function createAIProxyService(options = {}) {
 
       try {
         if (Array.isArray(tools) && tools.length > 0) {
+          emitLifecycle(event, requestId, 'request_started', 'awaiting_model')
           if (isAnthropicFormat(baseUrl, model)) {
-            return await executeAnthropicNativeToolRequest({
+            const result = await executeAnthropicNativeToolRequest({
               controller,
               apiKey,
               baseUrl,
@@ -553,9 +590,11 @@ function createAIProxyService(options = {}) {
               maxTokens,
               tools,
             })
+            emitLifecycle(event, requestId, 'request_finished', 'completed')
+            return result
           }
 
-          return await executeOpenAINativeToolRequest({
+          const result = await executeOpenAINativeToolRequest({
             controller,
             apiKey,
             baseUrl,
@@ -565,6 +604,8 @@ function createAIProxyService(options = {}) {
             maxTokens,
             tools,
           })
+          emitLifecycle(event, requestId, 'request_finished', 'completed')
+          return result
         }
 
         if (isAnthropicFormat(baseUrl, model)) {
@@ -594,8 +635,12 @@ function createAIProxyService(options = {}) {
         })
       } catch (error) {
         if (error?.name === 'AbortError') {
+          emitLifecycle(event, requestId, 'request_aborted', 'aborted')
           return { success: false, error: 'Request aborted' }
         }
+        emitLifecycle(event, requestId, 'request_error', 'error', {
+          error: error?.message || String(error),
+        })
         return { success: false, error: error?.message || String(error) }
       } finally {
         abortControllers.delete(requestId)

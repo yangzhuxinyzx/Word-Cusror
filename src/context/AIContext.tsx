@@ -19,7 +19,10 @@ import {
 import { AttachmentManager } from '../agent/attachments/AttachmentManager'
 import { AgentSessionEngine } from '../agent/core/AgentSessionEngine'
 import type { AgentSessionSnapshot } from '../agent/core/AgentSessionEngine'
-import { callLegacyModelGateway } from '../agent/core/ModelGateway'
+import {
+  callLegacyModelGateway,
+  type ModelGatewayLifecycleEvent,
+} from '../agent/core/ModelGateway'
 import {
   createAgentTurnId,
   runLegacyAgentLoop,
@@ -58,6 +61,7 @@ interface AIContextType {
   streamingSummary: string
   settings: AISettings
   isCompleting: boolean  // 是否正在补全
+  requestRunState: RequestRunState
   addMessage: (message: Omit<ChatMessage, 'id' | 'timestamp'>) => void
   updateLastMessage: (content: string) => void
   clearMessages: () => void
@@ -88,6 +92,7 @@ interface AIContextType {
   cancelCompletion: () => void
   // 停止当前生成
   stopGeneration: () => void
+  retryLastAgentRequest: () => Promise<boolean>
   getAgentRuntimeSnapshot: () => AgentSessionSnapshot
   recordRuntimeToolExecution: (state: import('../agent/tools/ir').ToolExecutionPipelineState) => void
   syncRuntimeTools: (tools: import('../agent/tools/contracts').AgentToolDefinition[]) => void
@@ -117,6 +122,7 @@ interface AIContextType {
     toolResults?: import('../agent/tools/ir').ToolResultIR[]
   }) => void
   loadRuntimeSubagentTranscript: (subagentId: string) => import('../agent/storage/SessionTranscriptStore').SessionTranscriptRecord | null
+  getLastKnowledgeHits: () => KnowledgeSearchResult[]
   runRuntimeSubagentSession: (params: {
     content: string
     systemPrompt?: string
@@ -139,6 +145,45 @@ interface AIContextType {
     reasoning?: string
     iteration: number
   }>
+}
+
+type RequestRunPhase =
+  | 'idle'
+  | 'awaiting_model'
+  | 'streaming_text'
+  | 'streaming_reasoning'
+  | 'executing_tools'
+  | 'applying_document'
+  | 'stalled'
+  | 'completed'
+  | 'error'
+  | 'aborted'
+
+type RequestRunBasePhase = Exclude<RequestRunPhase, 'stalled'>
+
+type RequestStallLevel = 'none' | 'slow' | 'stalled'
+
+type RequestStallReason =
+  | 'waiting_first_token'
+  | 'waiting_next_token'
+  | 'tool_no_progress'
+  | 'writeback_no_progress'
+  | 'unknown'
+
+interface RequestRunState {
+  phase: RequestRunPhase
+  basePhase: RequestRunBasePhase
+  requestId: string | null
+  requestStartedAt: number | null
+  lastActivityAt: number | null
+  lastContentDeltaAt: number | null
+  lastReasoningDeltaAt: number | null
+  lastToolEventAt: number | null
+  hasRealReasoning: boolean
+  activeToolLabel: string
+  stallLevel: RequestStallLevel
+  stallReason: RequestStallReason
+  lastError: string | null
 }
 
 import { PRESET_MODELS, BUILTIN_KEYS, LOCKED_MODEL } from '../config/models'
@@ -169,8 +214,8 @@ const defaultSettings: AISettings = {
   baseUrl: _defaultPreset.baseUrl,
   temperature: 1,
   maxTokens: 131072,
-  // PPT 图像生成模型（默认使用 DashScope z-image-turbo）
-  pptImageModel: 'z-image-turbo',
+  // PPT 图像生成模型（默认使用主模型同源的 images/generations）
+  pptImageModel: 'gpt-image-2',
   // 内嵌 API Keys
   braveApiKey: BUILTIN_KEYS.braveApiKey,
   // 记忆系统默认配置
@@ -243,6 +288,24 @@ function loadSettingsFromStorage(): AISettings {
 }
 
 const AIContext = createContext<AIContextType | undefined>(undefined)
+
+function createIdleRequestRunState(): RequestRunState {
+  return {
+    phase: 'idle',
+    basePhase: 'idle',
+    requestId: null,
+    requestStartedAt: null,
+    lastActivityAt: null,
+    lastContentDeltaAt: null,
+    lastReasoningDeltaAt: null,
+    lastToolEventAt: null,
+    hasRealReasoning: false,
+    activeToolLabel: '',
+    stallLevel: 'none',
+    stallReason: 'unknown',
+    lastError: null,
+  }
+}
 
 function sanitizeAgentPromptForNativeTooling(prompt: string): string {
   let next = prompt
@@ -388,13 +451,31 @@ export function AIProvider({ children }: { children: ReactNode }) {
   const [streamingReasoning, setStreamingReasoningState] = useState('')  // AI 思考过程
   const [editPhase, setEditPhase] = useState<'idle' | 'editing' | 'done'>('idle')
   const [streamingSummary, setStreamingSummary] = useState('')
+  const [requestRunState, setRequestRunState] = useState<RequestRunState>(createIdleRequestRunState)
   const [settings, setSettings] = useState<AISettings>(loadSettingsFromStorage)
   const [runtimeToolVersion, setRuntimeToolVersion] = useState(0)
   const abortControllerRef = useRef<AbortController | null>(null)
   const completionAbortRef = useRef<AbortController | null>(null)
   const streamPrefixRef = useRef('')  // Agent 流式累积前缀（Cursor 风格连续输出）
   const streamingReasoningRef = useRef('')
+  const requestRunStateRef = useRef<RequestRunState>(createIdleRequestRunState())
+  const lastKnowledgeHitsRef = useRef<KnowledgeSearchResult[]>([])
   const lastMemoryFlushAtRef = useRef(0)
+  const lastAgentRequestRef = useRef<{
+    content: string
+    documentContext?: string
+    filesContext?: string
+    callbacks?: AgentCallbacks
+    memoryContext?: {
+      workspaceKey?: string
+      workspaceSummary?: string
+      workspaceProfile?: string
+      skillDescriptions?: string
+      activeSkill?: Record<string, unknown>
+      availableToolsDelta?: Record<string, unknown>
+    }
+    images?: string[]
+  } | null>(null)
   const sessionIdRef = useRef(
     typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
       ? crypto.randomUUID()
@@ -414,6 +495,146 @@ export function AIProvider({ children }: { children: ReactNode }) {
     () => Boolean(window.electronAPI?.isElectron) && nativeTooling.enabled,
     [nativeTooling.enabled],
   )
+
+  const updateRequestRunState = useCallback((
+    updater: RequestRunState | ((prev: RequestRunState) => RequestRunState),
+  ) => {
+    setRequestRunState((prev) => {
+      const next = typeof updater === 'function' ? updater(prev) : updater
+      requestRunStateRef.current = next
+      return next
+    })
+  }, [])
+
+  const resetRequestRunState = useCallback(() => {
+    updateRequestRunState(createIdleRequestRunState())
+  }, [updateRequestRunState])
+
+  const setRunBasePhase = useCallback((
+    phase: RequestRunBasePhase,
+    extras?: Partial<RequestRunState>,
+  ) => {
+    const now = Date.now()
+    updateRequestRunState((prev) => ({
+      ...prev,
+      ...extras,
+      phase,
+      basePhase: phase,
+      lastActivityAt: extras?.lastActivityAt ?? now,
+      stallLevel: 'none',
+      stallReason: 'unknown',
+      lastError: extras?.lastError ?? (phase === 'error' ? prev.lastError : null),
+    }))
+  }, [updateRequestRunState])
+
+  const applyLifecycleEvent = useCallback((event: ModelGatewayLifecycleEvent) => {
+    const timestamp = event.timestamp || Date.now()
+    if (event.eventType === 'request_started') {
+      updateRequestRunState((prev) => ({
+        ...prev,
+        phase: 'awaiting_model',
+        basePhase: 'awaiting_model',
+        requestId: event.requestId,
+        requestStartedAt: timestamp,
+        lastActivityAt: timestamp,
+        lastContentDeltaAt: null,
+        lastReasoningDeltaAt: null,
+        lastToolEventAt: null,
+        hasRealReasoning: false,
+        activeToolLabel: '',
+        stallLevel: 'none',
+        stallReason: 'unknown',
+        lastError: null,
+      }))
+      return
+    }
+
+    if (event.eventType === 'first_token') {
+      updateRequestRunState((prev) => ({
+        ...prev,
+        requestId: event.requestId || prev.requestId,
+        phase: 'streaming_text',
+        basePhase: 'streaming_text',
+        lastActivityAt: timestamp,
+        lastContentDeltaAt: timestamp,
+        stallLevel: 'none',
+        stallReason: 'unknown',
+      }))
+      return
+    }
+
+    if (event.eventType === 'reasoning_started') {
+      updateRequestRunState((prev) => ({
+        ...prev,
+        requestId: event.requestId || prev.requestId,
+        phase: 'streaming_reasoning',
+        basePhase: 'streaming_reasoning',
+        hasRealReasoning: true,
+        lastActivityAt: timestamp,
+        lastReasoningDeltaAt: timestamp,
+        stallLevel: 'none',
+        stallReason: 'unknown',
+      }))
+      return
+    }
+
+    if (event.eventType === 'request_finished') {
+      updateRequestRunState((prev) => ({
+        ...prev,
+        requestId: event.requestId || prev.requestId,
+        phase: 'completed',
+        basePhase: 'completed',
+        lastActivityAt: timestamp,
+        stallLevel: 'none',
+        stallReason: 'unknown',
+      }))
+      return
+    }
+
+    if (event.eventType === 'request_aborted') {
+      updateRequestRunState((prev) => ({
+        ...prev,
+        requestId: event.requestId || prev.requestId,
+        phase: 'aborted',
+        basePhase: 'aborted',
+        lastActivityAt: timestamp,
+        stallLevel: 'none',
+        stallReason: 'unknown',
+      }))
+      return
+    }
+
+    if (event.eventType === 'request_error') {
+      updateRequestRunState((prev) => ({
+        ...prev,
+        requestId: event.requestId || prev.requestId,
+        phase: 'error',
+        basePhase: 'error',
+        lastActivityAt: timestamp,
+        lastError: event.error || prev.lastError,
+        stallLevel: 'none',
+        stallReason: 'unknown',
+      }))
+    }
+  }, [updateRequestRunState])
+
+  const isDocumentMutationTool = useCallback((tool: string) => {
+    const normalized = (tool || '').trim().toLowerCase()
+    return [
+      'word.edit',
+      'word.create',
+      'word.format',
+      'word.resolve_change',
+      'word.chart',
+      'create',
+      'create_from_template',
+      'replace',
+      'review',
+      'insert',
+      'delete',
+      'word_chart',
+    ].includes(normalized)
+  }, [])
 
   const addMessage = useCallback((message: Omit<ChatMessage, 'id' | 'timestamp'>) => {
     const newMessage: ChatMessage = {
@@ -478,13 +699,14 @@ export function AIProvider({ children }: { children: ReactNode }) {
     setStreamingSummary('')
     setEditPhase('idle')
     setIsLoading(false)
+    resetRequestRunState()
 
     sessionIdRef.current = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
       ? crypto.randomUUID()
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`
 
     sessionStorage.removeItem('chat-messages')
-  }, [])
+  }, [resetRequestRunState])
 
   const stopGeneration = useCallback(() => {
     if (abortControllerRef.current) {
@@ -508,7 +730,15 @@ export function AIProvider({ children }: { children: ReactNode }) {
     setStreamingSummary('')
     setEditPhase('idle')
     setIsLoading(false)
-  }, [])
+    updateRequestRunState((prev) => ({
+      ...prev,
+      phase: 'aborted',
+      basePhase: 'aborted',
+      lastActivityAt: Date.now(),
+      stallLevel: 'none',
+      stallReason: 'unknown',
+    }))
+  }, [updateRequestRunState])
   
   // 保存消息到 sessionStorage，防止热更新丢失
   useEffect(() => {
@@ -545,6 +775,101 @@ export function AIProvider({ children }: { children: ReactNode }) {
 
     engine.setPhase('idle')
   }, [editPhase, isLoading])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+
+    const handleDocumentPhaseEvent = (rawEvent: Event) => {
+      const event = rawEvent as CustomEvent<{
+        phase?: 'document_apply_started' | 'document_apply_finished'
+        label?: string
+      }>
+      const phase = event.detail?.phase
+      const label = event.detail?.label || '文档'
+      if (!phase) return
+
+      if (phase === 'document_apply_started') {
+        setRunBasePhase('applying_document', {
+          activeToolLabel: label,
+        })
+        return
+      }
+
+      if (phase === 'document_apply_finished') {
+        updateRequestRunState((prev) => ({
+          ...prev,
+          lastActivityAt: Date.now(),
+          stallLevel: 'none',
+          stallReason: 'unknown',
+        }))
+      }
+    }
+
+    window.addEventListener(
+      'word-cursor-document-phase',
+      handleDocumentPhaseEvent as EventListener,
+    )
+
+    return () => {
+      window.removeEventListener(
+        'word-cursor-document-phase',
+        handleDocumentPhaseEvent as EventListener,
+      )
+    }
+  }, [setRunBasePhase, updateRequestRunState])
+
+  useEffect(() => {
+    if (!isLoading) return
+
+    const interval = window.setInterval(() => {
+      const current = requestRunStateRef.current
+      const now = Date.now()
+      const lastActivityAt = current.lastActivityAt || current.requestStartedAt || now
+      const idleMs = Math.max(0, now - lastActivityAt)
+      const basePhase = current.basePhase
+
+      if (
+        basePhase === 'idle' ||
+        basePhase === 'completed' ||
+        basePhase === 'error' ||
+        basePhase === 'aborted'
+      ) {
+        return
+      }
+
+      let nextStallLevel: RequestStallLevel = 'none'
+      if (idleMs > 20_000) nextStallLevel = 'stalled'
+      else if (idleMs > 6_000) nextStallLevel = 'slow'
+
+      let stallReason: RequestStallReason = 'unknown'
+      if (basePhase === 'awaiting_model') stallReason = 'waiting_first_token'
+      else if (basePhase === 'streaming_text' || basePhase === 'streaming_reasoning') stallReason = 'waiting_next_token'
+      else if (basePhase === 'executing_tools') stallReason = 'tool_no_progress'
+      else if (basePhase === 'applying_document') stallReason = 'writeback_no_progress'
+
+      updateRequestRunState((prev) => {
+        const nextPhase = nextStallLevel === 'stalled' ? 'stalled' : basePhase
+        if (
+          prev.stallLevel === nextStallLevel &&
+          prev.stallReason === stallReason &&
+          prev.phase === nextPhase
+        ) {
+          return prev
+        }
+
+        return {
+          ...prev,
+          phase: nextPhase,
+          stallLevel: nextStallLevel,
+          stallReason,
+        }
+      })
+    }, 1000)
+
+    return () => {
+      window.clearInterval(interval)
+    }
+  }, [isLoading, updateRequestRunState])
 
   useEffect(() => {
     if (!window.electronAPI?.knowledgeConfigure) return
@@ -2755,9 +3080,10 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
       setStreamingReasoning,
       setStreamingSummary,
       setEditPhase,
+      onLifecycleEvent: applyLifecycleEvent,
       options,
     })
-  }, [settings])
+  }, [applyLifecycleEvent, settings])
 
   const sendMessage = useCallback(async (
     content: string,
@@ -2768,11 +3094,21 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
     setStreamingReasoning('')
     setEditPhase('idle')
     setStreamingSummary('')
+    updateRequestRunState({
+      ...createIdleRequestRunState(),
+      phase: 'awaiting_model',
+      basePhase: 'awaiting_model',
+      requestId: `simple-${Date.now()}`,
+      requestStartedAt: Date.now(),
+      lastActivityAt: Date.now(),
+    })
+    lastAgentRequestRef.current = null
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort()
     }
     abortControllerRef.current = new AbortController()
+    lastKnowledgeHitsRef.current = []
 
     try {
       const assembled = assembleTurnContext({
@@ -2794,8 +3130,14 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
     } finally {
       sessionEngineRef.current.setPendingAttachmentTypes([])
       setIsLoading(false)
+      updateRequestRunState((prev) => ({
+        ...prev,
+        phase: prev.phase === 'error' || prev.phase === 'aborted' ? prev.phase : 'completed',
+        basePhase: prev.basePhase === 'error' || prev.basePhase === 'aborted' ? prev.basePhase : 'completed',
+        lastActivityAt: Date.now(),
+      }))
     }
-  }, [assembleTurnContext, callAPI, composedEditorSystemPrompt])
+  }, [assembleTurnContext, callAPI, composedEditorSystemPrompt, updateRequestRunState])
 
   const sendAgentMessage = useCallback(async (
     content: string,
@@ -2817,6 +3159,23 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
     setStreamingReasoning('')  // 清空思考内容
     setEditPhase('idle')
     setStreamingSummary('')
+    const requestStartedAt = Date.now()
+    updateRequestRunState({
+      ...createIdleRequestRunState(),
+      phase: 'awaiting_model',
+      basePhase: 'awaiting_model',
+      requestId: `agent-${requestStartedAt}`,
+      requestStartedAt,
+      lastActivityAt: requestStartedAt,
+    })
+    lastAgentRequestRef.current = {
+      content,
+      documentContext,
+      filesContext,
+      callbacks,
+      memoryContext,
+      images,
+    }
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort()
@@ -2845,6 +3204,75 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
       }
     }
 
+    const wrappedCallbacks: AgentCallbacks | undefined = callbacks
+      ? {
+          ...callbacks,
+          onTextChunk: (text) => {
+            if (text?.trim()) {
+              updateRequestRunState((prev) => ({
+                ...prev,
+                phase: 'streaming_text',
+                basePhase: 'streaming_text',
+                lastActivityAt: Date.now(),
+                lastContentDeltaAt: Date.now(),
+                stallLevel: 'none',
+                stallReason: 'unknown',
+              }))
+            }
+            callbacks.onTextChunk?.(text)
+          },
+          onToolCallStart: (tool) => {
+            setRunBasePhase(
+              isDocumentMutationTool(tool) ? 'applying_document' : 'executing_tools',
+              {
+                activeToolLabel: tool,
+                lastToolEventAt: Date.now(),
+              },
+            )
+            callbacks.onToolCallStart?.(tool)
+          },
+          onToolCallPreview: (tool, args) => {
+            const label = args?.title || args?.search || args?.position || tool
+            setRunBasePhase(
+              isDocumentMutationTool(tool) ? 'applying_document' : 'executing_tools',
+              {
+                activeToolLabel: String(label).slice(0, 80),
+                lastToolEventAt: Date.now(),
+              },
+            )
+            callbacks.onToolCallPreview?.(tool, args)
+          },
+          onToolCall: async (tool, args) => {
+            const label = args?.title || args?.search || args?.position || tool
+            setRunBasePhase(
+              isDocumentMutationTool(tool) ? 'applying_document' : 'executing_tools',
+              {
+                activeToolLabel: String(label).slice(0, 80),
+                lastToolEventAt: Date.now(),
+              },
+            )
+            return callbacks.onToolCall
+              ? callbacks.onToolCall(tool, args)
+              : Promise.resolve({
+                  tool,
+                  success: false,
+                  message: `No tool handler registered for ${tool}`,
+                })
+          },
+          onComplete: (finalContent, toolResults, reasoning, meta) => {
+            updateRequestRunState((prev) => ({
+              ...prev,
+              phase: 'completed',
+              basePhase: 'completed',
+              lastActivityAt: Date.now(),
+              stallLevel: 'none',
+              stallReason: 'unknown',
+            }))
+            callbacks.onComplete?.(finalContent, toolResults, reasoning, meta)
+          },
+        }
+      : undefined
+
     try {
       let relevantMemoryText = ''
 
@@ -2865,6 +3293,7 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
           })
           if (knowledgeResp.success && knowledgeResp.results.length > 0) {
             retrievedKnowledgeResults = knowledgeResp.results
+            lastKnowledgeHitsRef.current = knowledgeResp.results.map((item) => ({ ...item }))
             const memoryBlock = formatKnowledgeResults(
               knowledgeResp.results,
               memoryMaxChars
@@ -3013,7 +3442,7 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
         conversationMessages,
         signal: abortControllerRef.current.signal,
         turnId,
-        callbacks,
+        callbacks: wrappedCallbacks,
         callModel: (allMessages, signal, options) =>
           callAPI(allMessages, signal, {
             ...options,
@@ -3117,6 +3546,15 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
       } else {
         console.error('AI request failed:', error)
         toolCallLogger.logError((error as Error).message, { iteration })
+        updateRequestRunState((prev) => ({
+          ...prev,
+          phase: 'error',
+          basePhase: 'error',
+          lastActivityAt: Date.now(),
+          lastError: (error as Error).message,
+          stallLevel: 'none',
+          stallReason: 'unknown',
+        }))
         callbacks?.onComplete?.(`Request failed: ${(error as Error).message}`, allToolResults, accumulatedReasoningForTurn.trim() || undefined)
       }
     } finally {
@@ -3125,8 +3563,21 @@ dsl: {"blocks":[{"type":"heading","level":2,"content":[{"text":"赞助机会","f
       setIsLoading(false)
       setStreamingContent('')
       streamPrefixRef.current = ''  // ????????
+      updateRequestRunState((prev) => {
+        if (prev.phase === 'error' || prev.phase === 'aborted' || prev.phase === 'completed') {
+          return prev
+        }
+        return {
+          ...prev,
+          phase: 'completed',
+          basePhase: 'completed',
+          lastActivityAt: Date.now(),
+          stallLevel: 'none',
+          stallReason: 'unknown',
+        }
+      })
     }
-  }, [assembleTurnContext, callAPI, composedAgentSystemPrompt, messages, nativeTooling, settings, shouldUseNativeTooling, yieldAfterToolCallFrame])
+  }, [assembleTurnContext, callAPI, composedAgentSystemPrompt, isDocumentMutationTool, messages, nativeTooling, settings, shouldUseNativeTooling, updateRequestRunState, yieldAfterToolCallFrame, setRunBasePhase])
 
   // Tab 补全功能 - 仅使用本地模型
   const getCompletion = useCallback(async (
@@ -3223,6 +3674,21 @@ ${recentText}
     setIsCompleting(false)
   }, [])
 
+  const retryLastAgentRequest = useCallback(async (): Promise<boolean> => {
+    if (isLoading) return false
+    const last = lastAgentRequestRef.current
+    if (!last) return false
+    await sendAgentMessage(
+      last.content,
+      last.documentContext,
+      last.filesContext,
+      last.callbacks,
+      last.memoryContext,
+      last.images,
+    )
+    return true
+  }, [isLoading, sendAgentMessage])
+
   const getAgentRuntimeSnapshot = useCallback(() => {
     return sessionEngineRef.current.snapshot()
   }, [])
@@ -3306,6 +3772,10 @@ ${recentText}
 
   const loadRuntimeSubagentTranscript = useCallback((subagentId: string) => {
     return sessionEngineRef.current.loadSubagentTranscript(subagentId)
+  }, [])
+
+  const getLastKnowledgeHits = useCallback(() => {
+    return lastKnowledgeHitsRef.current.map((item) => ({ ...item }))
   }, [])
 
   const runRuntimeSubagentSession = useCallback(async (params: {
@@ -3502,6 +3972,7 @@ ${recentText}
         streamingReasoning,
         editPhase,
         streamingSummary,
+        requestRunState,
         settings,
         addMessage,
         updateLastMessage,
@@ -3512,6 +3983,7 @@ ${recentText}
         getCompletion,
         cancelCompletion,
         stopGeneration,
+        retryLastAgentRequest,
         getAgentRuntimeSnapshot,
         recordRuntimeToolExecution,
         syncRuntimeTools,
@@ -3523,6 +3995,7 @@ ${recentText}
         cancelRuntimeSubagent,
         appendRuntimeSubagentTranscript,
         loadRuntimeSubagentTranscript,
+        getLastKnowledgeHits,
         runRuntimeSubagentSession,
       }}
     >

@@ -24,6 +24,22 @@ export interface ModelGatewayResponse {
   displayText: string
 }
 
+export type ModelGatewayLifecycleEventType =
+  | 'request_started'
+  | 'first_token'
+  | 'reasoning_started'
+  | 'request_finished'
+  | 'request_error'
+  | 'request_aborted'
+
+export interface ModelGatewayLifecycleEvent {
+  requestId: string
+  eventType: ModelGatewayLifecycleEventType
+  phase?: 'awaiting_model' | 'streaming_text' | 'streaming_reasoning' | 'completed' | 'error' | 'aborted'
+  timestamp: number
+  error?: string
+}
+
 export interface ModelGatewayParams {
   settings: AISettings
   allMessages: Array<{
@@ -37,6 +53,7 @@ export interface ModelGatewayParams {
   setStreamingReasoning: (value: string) => void
   setStreamingSummary: (value: string) => void
   setEditPhase: (value: 'idle' | 'editing' | 'done') => void
+  onLifecycleEvent?: (event: ModelGatewayLifecycleEvent) => void
   options?: CallModelOptions
 }
 
@@ -66,6 +83,7 @@ export async function callLegacyModelGateway({
   setStreamingReasoning,
   setStreamingSummary,
   setEditPhase,
+  onLifecycleEvent,
   options,
 }: ModelGatewayParams): Promise<ModelGatewayResponse> {
   const headers: Record<string, string> = {
@@ -89,15 +107,44 @@ export async function callLegacyModelGateway({
     let fullContent = ''
     let fullReasoning = ''
     let contentDeltaCount = 0
+    let emittedFirstToken = false
+    let emittedReasoningStarted = false
+    let terminalEvent: ModelGatewayLifecycleEvent | null = null
 
     setStreamingReasoning('')
+    onLifecycleEvent?.({
+      requestId,
+      eventType: 'request_started',
+      phase: 'awaiting_model',
+      timestamp: Date.now(),
+    })
 
     const unsubscribe = window.electronAPI.onAIStreamDelta((payload) => {
       if (!payload || payload.requestId !== requestId) return
 
+      const eventType = (payload as { eventType?: string }).eventType
+      if (eventType) {
+        onLifecycleEvent?.({
+          requestId,
+          eventType: eventType as ModelGatewayLifecycleEventType,
+          phase: (payload as { phase?: ModelGatewayLifecycleEvent['phase'] }).phase,
+          timestamp: (payload as { timestamp?: number }).timestamp || Date.now(),
+          error: (payload as { error?: string }).error,
+        })
+      }
+
       const delta = payload.delta || ''
       if (delta) {
         contentDeltaCount += 1
+        if (!emittedFirstToken) {
+          emittedFirstToken = true
+          onLifecycleEvent?.({
+            requestId,
+            eventType: 'first_token',
+            phase: 'streaming_text',
+            timestamp: Date.now(),
+          })
+        }
         fullContent += delta
         emitLegacyToolCallStartFromRaw(
           fullContent,
@@ -114,6 +161,15 @@ export async function callLegacyModelGateway({
         )
         const { thinking, cleaned } = extractLegacyThinking(fullContent)
         if (thinking && thinking !== fullReasoning) {
+          if (!emittedReasoningStarted) {
+            emittedReasoningStarted = true
+            onLifecycleEvent?.({
+              requestId,
+              eventType: 'reasoning_started',
+              phase: 'streaming_reasoning',
+              timestamp: Date.now(),
+            })
+          }
           fullReasoning = thinking
           setStreamingReasoning(fullReasoning)
         }
@@ -128,6 +184,15 @@ export async function callLegacyModelGateway({
       const reasoningDelta =
         (payload as { reasoningDelta?: string }).reasoningDelta || ''
       if (reasoningDelta) {
+        if (!emittedReasoningStarted) {
+          emittedReasoningStarted = true
+          onLifecycleEvent?.({
+            requestId,
+            eventType: 'reasoning_started',
+            phase: 'streaming_reasoning',
+            timestamp: Date.now(),
+          })
+        }
         fullReasoning += reasoningDelta
         setStreamingReasoning(fullReasoning)
       }
@@ -180,6 +245,20 @@ export async function callLegacyModelGateway({
         options?.maxToolCallPreviews,
       )
       const cleaned = cleanLegacyModelOutput(content)
+      const { thinking } = extractLegacyThinking(content)
+      if (thinking && thinking !== fullReasoning) {
+        if (!emittedReasoningStarted) {
+          emittedReasoningStarted = true
+          onLifecycleEvent?.({
+            requestId,
+            eventType: 'reasoning_started',
+            phase: 'streaming_reasoning',
+            timestamp: Date.now(),
+          })
+        }
+        fullReasoning = thinking
+        setStreamingReasoning(fullReasoning)
+      }
       options?.onResponseFinal?.({ raw: content, cleaned })
       const parsed = parseLegacyAssistantOutput(cleaned)
       const displayText = parsed.displayText || parsed.summary || cleaned
@@ -195,7 +274,26 @@ export async function callLegacyModelGateway({
         cleanedText: cleaned,
         displayText: options?.returnRaw ? cleaned : displayText,
       }
+    } catch (error) {
+      const aborted = (error as Error)?.name === 'AbortError'
+      terminalEvent = {
+        requestId,
+        eventType: aborted ? 'request_aborted' : 'request_error',
+        phase: aborted ? 'aborted' : 'error',
+        timestamp: Date.now(),
+        error: aborted ? undefined : ((error as Error)?.message || String(error)),
+      }
+      onLifecycleEvent?.(terminalEvent)
+      throw error
     } finally {
+      if (!terminalEvent || terminalEvent.eventType === 'request_finished') {
+        onLifecycleEvent?.({
+          requestId,
+          eventType: 'request_finished',
+          phase: 'completed',
+          timestamp: Date.now(),
+        })
+      }
       try {
         unsubscribe?.()
       } catch {
@@ -234,8 +332,16 @@ export async function callLegacyModelGateway({
   let fullContent = ''
   let fullReasoning = ''
   let buffer = ''
+  let emittedFirstToken = false
+  let emittedReasoningStarted = false
 
   setStreamingReasoning('')
+  onLifecycleEvent?.({
+    requestId: 'browser-fetch',
+    eventType: 'request_started',
+    phase: 'awaiting_model',
+    timestamp: Date.now(),
+  })
 
   const readWithTimeout = async (timeoutMs: number) => {
     const timeoutPromise = new Promise<{ done: true; value: undefined }>(
@@ -285,6 +391,15 @@ export async function callLegacyModelGateway({
           json?.reasoning_content ||
           ''
         if (reasoningDelta) {
+          if (!emittedReasoningStarted) {
+            emittedReasoningStarted = true
+            onLifecycleEvent?.({
+              requestId: 'browser-fetch',
+              eventType: 'reasoning_started',
+              phase: 'streaming_reasoning',
+              timestamp: Date.now(),
+            })
+          }
           fullReasoning += reasoningDelta
           setStreamingReasoning(fullReasoning)
         }
@@ -306,6 +421,15 @@ export async function callLegacyModelGateway({
         }
 
         if (contentDelta) {
+          if (!emittedFirstToken) {
+            emittedFirstToken = true
+            onLifecycleEvent?.({
+              requestId: 'browser-fetch',
+              eventType: 'first_token',
+              phase: 'streaming_text',
+              timestamp: Date.now(),
+            })
+          }
           fullContent += contentDelta
           emitLegacyToolCallStartFromRaw(
             fullContent,
@@ -322,6 +446,15 @@ export async function callLegacyModelGateway({
           )
           const { thinking, cleaned } = extractLegacyThinking(fullContent)
           if (thinking && thinking !== fullReasoning) {
+            if (!emittedReasoningStarted) {
+              emittedReasoningStarted = true
+              onLifecycleEvent?.({
+                requestId: 'browser-fetch',
+                eventType: 'reasoning_started',
+                phase: 'streaming_reasoning',
+                timestamp: Date.now(),
+              })
+            }
             fullReasoning = thinking
             setStreamingReasoning(fullReasoning)
           }
@@ -353,12 +486,32 @@ export async function callLegacyModelGateway({
   )
 
   const cleaned = cleanLegacyModelOutput(fullContent)
+  const { thinking } = extractLegacyThinking(fullContent)
+  if (thinking && thinking !== fullReasoning) {
+    if (!emittedReasoningStarted) {
+      emittedReasoningStarted = true
+      onLifecycleEvent?.({
+        requestId: 'browser-fetch',
+        eventType: 'reasoning_started',
+        phase: 'streaming_reasoning',
+        timestamp: Date.now(),
+      })
+    }
+    fullReasoning = thinking
+    setStreamingReasoning(fullReasoning)
+  }
   options?.onResponseFinal?.({ raw: fullContent, cleaned })
   const parsed = parseLegacyAssistantOutput(cleaned)
   if (parsed.summary) setStreamingSummary(parsed.summary)
   if (parsed.phase === 'editing') setEditPhase('editing')
   if (parsed.phase === 'done') setEditPhase('done')
   const displayText = parsed.displayText || parsed.summary || cleaned
+  onLifecycleEvent?.({
+    requestId: 'browser-fetch',
+    eventType: 'request_finished',
+    phase: 'completed',
+    timestamp: Date.now(),
+  })
   return {
     rawResponse: fullContent,
     rawText: fullContent,

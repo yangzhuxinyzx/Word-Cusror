@@ -118,7 +118,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('ai-stream-delta', listener)
   },
 
-  // PPT 生成：DashScope 生图（并发=2）→ 后处理 1920x1200 → 打包 16:10 .pptx
+  // PPT 生成：主模型同源 /v1/images/generations → 后处理 1920x1080 → 打包 16:9 .pptx
   pptGenerateDeck: (options) => ipcRenderer.invoke('ppt-generate-deck', options),
   
   // PPT 编辑：整页重做 / 局部编辑

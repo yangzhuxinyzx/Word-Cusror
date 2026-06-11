@@ -84,6 +84,12 @@ const stripToolBlocks = (text: string) =>
     .replace(LEGACY_XML_TOOL_BLOCK_REGEX, '')
     .replace(TOOL_USE_BLOCK_REGEX, '')
 
+const joinLocalPath = (dir: string, fileName: string) => {
+  const cleanDir = String(dir || '').replace(/[\\/]+$/, '')
+  const separator = cleanDir.includes('\\') && !cleanDir.includes('/') ? '\\' : '/'
+  return `${cleanDir}${separator}${fileName}`
+}
+
 const stripMarkers = (text: string) =>
   text
     .replace(SUMMARY_BLOCK_REGEX, '')
@@ -682,13 +688,13 @@ export default function ChatPanel() {
     isLoading,
     streamingContent,
     streamingReasoning,
-    editPhase,
-    streamingSummary,
+    requestRunState,
     settings,
     addMessage,
     sendAgentMessage,
     clearMessages,
     stopGeneration,
+    retryLastAgentRequest,
     recordRuntimeToolExecution,
     syncRuntimeTools,
     syncRuntimeSkills,
@@ -700,6 +706,7 @@ export default function ChatPanel() {
     cancelRuntimeSubagent,
     appendRuntimeSubagentTranscript,
     loadRuntimeSubagentTranscript,
+    getLastKnowledgeHits,
     runRuntimeSubagentSession,
   } = useAI()
 
@@ -741,6 +748,7 @@ export default function ChatPanel() {
   const chatContainerRef = useRef<HTMLDivElement>(null)
   const userScrolledUpRef = useRef(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const [runtimeClock, setRuntimeClock] = useState(() => Date.now())
   const [outlineJsonOpen, setOutlineJsonOpen] = useState<Record<string, boolean>>({})
   const [pendingPptOutline, setPendingPptOutline] = useState<{
     draft: PptOutlineDraft
@@ -754,6 +762,15 @@ export default function ChatPanel() {
   } | null>(null)
   const [wordOpsApplying, setWordOpsApplying] = useState(false)
   const [pptGenerating, setPptGenerating] = useState(false)
+
+  useEffect(() => {
+    if (!isLoading) return
+    setRuntimeClock(Date.now())
+    const timer = window.setInterval(() => {
+      setRuntimeClock(Date.now())
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [isLoading])
 
   // 打开设置（由 App.tsx 监听 open-settings 事件来弹出 SettingsModal）
   const openSettings = useCallback(() => {
@@ -814,7 +831,7 @@ export default function ChatPanel() {
     
     // 如果在列表中没找到，尝试直接构建路径
     if (!file && workspacePath) {
-      const filePath = `${workspacePath}\\${fileName}`
+      const filePath = joinLocalPath(workspacePath, fileName)
       file = { name: fileName, path: filePath, type: 'file' }
     }
     
@@ -1444,12 +1461,10 @@ export default function ChatPanel() {
 
       // 获取 API Keys
       const openRouterApiKey = settings?.openRouterApiKey || ''
-      // 优先使用专门的 DashScope API Key，否则回退到主模型 API Key
-      const dashscopeApiKey = settings?.dashscopeApiKey || settings?.apiKey || ''
-
-      // 如果没有 DashScope API Key，提示用户配置
-      if (!dashscopeApiKey) {
-        throw new Error('缺少 DashScope API Key。请在设置中配置阿里云百炼 API Key')
+      const mainApiKey = settings?.apiKey || ''
+      const mainBaseUrl = settings?.baseUrl || ''
+      if (!mainApiKey || !mainBaseUrl) {
+        throw new Error('缺少主模型 API 配置。PPT 生图现在复用主模型 5.4 的 baseUrl 和 apiKey')
       }
 
       const estimatedSlideCount = draft.slides?.length || 3
@@ -1487,7 +1502,7 @@ export default function ChatPanel() {
       updateAgentAction(`Gemini 设计完成，共 ${slides.length} 页，开始生成图片...`)
       addAgentFileOperation(`PPT: 生成 ${slides.length} 页图片`)
 
-      // ========== 阶段2：调用 DashScope 生成图片 ==========
+      // ========== 阶段2：调用主模型同源 images/generations 生成图片 ==========
       const negativeDefault =
         'watermark, logo, brand name text, badge, QR code, UI, screenshot, HUD, sci-fi interface, holographic UI, futuristic dashboard, neon cyberpunk, neon cyan, bright cyan, fluorescent cyan, neon teal, cheap turquoise, generic isometric city, isometric cityscape, circuit-board city, lowres, blurry, garbled Chinese, wrong characters, text distortion, misspelling, random letters, gibberish, extra text, english text, ugly typography, amateur layout, noisy background, oversaturated, cheap plastic, toy-like, glossy, harsh specular, overbloom, stock 3d icons, generic template, ai artifacts, uncanny'
 
@@ -1509,9 +1524,9 @@ export default function ChatPanel() {
         }
       })
       
-      // 根据用户选择的模型决定分辨率（默认使用 Gemini 生图）
-      const pptImageModel = settings?.pptImageModel || 'gemini-image'
-      const imageSize = pptImageModel === 'z-image-turbo' ? '2048*1152' : '1664*928'
+      // 根据用户选择的模型决定分辨率（默认使用 gpt-image-2）
+      const pptImageModel = settings?.pptImageModel || 'gpt-image-2'
+      const imageSize = pptImageModel === 'gpt-image-2' ? '2048x1152' : '1024x1024'
       console.log(`[PPT] 使用生图模型: ${pptImageModel}`)
 
       const result = await pptDomainAdapter.generateDeck({
@@ -1520,10 +1535,11 @@ export default function ChatPanel() {
         settings,
         designConcept: geminiResult?.designConcept || '',
         colorPalette: geminiResult?.colorPalette || '',
-        // 主模型 API Key（用于 Gemini 生图）
-        mainApiKey: settings?.apiKey || '',
+        // 主模型 API（用于同源 images/generations 生图）
+        mainApiKey,
+        mainBaseUrl,
         dashscope: {
-          apiKey: dashscopeApiKey,
+          apiKey: '',
           region: 'cn',
           size: imageSize,
           model: pptImageModel,
@@ -1621,8 +1637,8 @@ export default function ChatPanel() {
       if (!openRouterApiKey) {
         throw new Error('请先在 AI 设置中配置 OpenRouter API Key')
       }
-      if (!dashscopeApiKey) {
-        throw new Error('请先在 AI 设置中配置 DashScope API Key（阿里云百炼）')
+      if (mode === 'partial_edit' && !dashscopeApiKey) {
+        throw new Error('请先在 AI 设置中配置 DashScope API Key（局部编辑仍使用图像编辑接口）')
       }
 
       updateAgentAction(`正在${modeLabel}：${pagesLabel}...`)
@@ -1637,7 +1653,8 @@ export default function ChatPanel() {
         openRouterApiKey,
         dashscopeApiKey,
         mainApiKey: settings.apiKey || '',
-        pptImageModel: settings.pptImageModel || 'gemini-image',
+        mainBaseUrl: settings.baseUrl || '',
+        pptImageModel: settings.pptImageModel || 'gpt-image-2',
       })
 
       if (!result.success) {
@@ -3000,6 +3017,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
         onComplete: (content, toolResults) => {
           // 完成 Agent 进度
           finishAgentProgress()
+          const knowledgeHits = getLastKnowledgeHits()
 
           // 快照当前 streamItems 中的工具卡片，附加到消息上用于历史内联展示
           const toolCards = streamItemsRef.current
@@ -3070,6 +3088,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                 content: content?.trim() || 'Edit completed',
                 diffChanges,
                 fileName,
+                knowledgeHits,
                 toolCards,
                 streamSnapshot
               })
@@ -3099,6 +3118,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               addMessage({
                 role: 'assistant',
                 content: content || '操作未能完成，请检查文档内容是否匹配',
+                knowledgeHits,
                 toolCards,
                 streamSnapshot
               })
@@ -3110,6 +3130,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                 role: 'assistant',
                 content: summaryText,
                 fileName: resultFileName,
+                knowledgeHits,
                 toolCards,
                 streamSnapshot
               })
@@ -3126,6 +3147,8 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               content: needsToolButMissing
                 ? `⚠️ 未检测到工具调用，文档实际未被创建或修改。请重新发送指令，确保模型使用 create 工具。\n\n${rawContent}`
                 : rawContent
+              ,
+              knowledgeHits,
             })
             resetToolActivity()
           }
@@ -3366,6 +3389,75 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
 
   const displayMessages = messages.filter(m => m.content.trim() !== '')
 
+  const requestElapsedSec = requestRunState.requestStartedAt
+    ? Math.max(0, Math.floor((runtimeClock - requestRunState.requestStartedAt) / 1000))
+    : 0
+  const lastActivityAgoSec = requestRunState.lastActivityAt
+    ? Math.max(0, Math.floor((runtimeClock - requestRunState.lastActivityAt) / 1000))
+    : 0
+  const canRetryCurrentRequest =
+    isLoading &&
+    requestRunState.stallLevel === 'stalled' &&
+    lastActivityAgoSec >= 45
+
+  const waitingPrimaryLabel = (() => {
+    switch (requestRunState.phase) {
+      case 'awaiting_model':
+        return '等待模型首个响应'
+      case 'streaming_text':
+        return '模型正在实时输出'
+      case 'streaming_reasoning':
+        return '模型正在输出思维链'
+      case 'executing_tools':
+        return requestRunState.activeToolLabel
+          ? `正在调用工具：${requestRunState.activeToolLabel}`
+          : '正在调用工具'
+      case 'applying_document':
+        return requestRunState.activeToolLabel
+          ? `正在写回文档：${requestRunState.activeToolLabel}`
+          : '正在写回文档'
+      case 'stalled': {
+        if (requestRunState.stallReason === 'waiting_first_token') {
+          return '疑似卡住：模型迟迟没有首个响应'
+        }
+        if (requestRunState.stallReason === 'waiting_next_token') {
+          return '疑似卡住：模型输出中断'
+        }
+        if (requestRunState.stallReason === 'tool_no_progress') {
+          return '疑似卡住：工具执行长时间无进展'
+        }
+        if (requestRunState.stallReason === 'writeback_no_progress') {
+          return '疑似卡住：文档写回长时间无进展'
+        }
+        return '疑似卡住：长时间无新活动'
+      }
+      case 'error':
+        return '请求失败'
+      case 'aborted':
+        return '请求已停止'
+      case 'completed':
+        return '处理完成'
+      default:
+        return streamingContent ? '正在处理' : '等待响应'
+    }
+  })()
+
+  const waitingSecondaryLabel = (() => {
+    if (requestRunState.stallLevel === 'slow') {
+      return `响应较慢，最近一次活动在 ${lastActivityAgoSec}s 前`
+    }
+    if (requestRunState.stallLevel === 'stalled') {
+      return `最近 ${lastActivityAgoSec}s 无新活动`
+    }
+    if (requestRunState.activeToolLabel && requestRunState.phase !== 'executing_tools' && requestRunState.phase !== 'applying_document') {
+      return `当前步骤：${requestRunState.activeToolLabel}`
+    }
+    if (lastActivityAgoSec > 0) {
+      return `最近一次活动 ${lastActivityAgoSec}s 前`
+    }
+    return '请求已发出，等待新的流式信号'
+  })()
+
   const markdownComponents: any = {
     h1: ({ children }: { children?: ReactNode }) => (
       <h1 className="text-[15px] font-semibold text-text mt-3 mb-2 pb-1 border-b border-border">{children}</h1>
@@ -3516,6 +3608,69 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
           }
           return <div key={card.id} className={cardClass}>{cardBody}</div>
         })}
+      </div>
+    )
+  }
+
+  const renderKnowledgeHits = (hits: ChatMessage['knowledgeHits']) => {
+    if (!hits || hits.length === 0) return null
+
+    const scopeLabelMap: Record<string, string> = {
+      workspace: '工作区',
+      global: '长期库',
+      profile: '画像',
+      daily: '日记忆',
+      sessions: '会话',
+    }
+
+    const scopeClassMap: Record<string, string> = {
+      workspace: 'bg-accent/10 text-accent',
+      global: 'bg-amber-500/10 text-amber-400',
+      profile: 'bg-emerald-500/10 text-emerald-400',
+      daily: 'bg-sky-500/10 text-sky-400',
+      sessions: 'bg-violet-500/10 text-violet-400',
+    }
+
+    return (
+      <div className="space-y-1.5 mb-2">
+        <div className="glass-card-soft rounded-xl border border-border px-3 py-2">
+          <div className="flex items-center gap-2 text-[12px] text-text mb-2">
+            <Eye className="w-3.5 h-3.5 text-accent flex-shrink-0" />
+            <span className="font-medium">知识命中来源</span>
+            <span className="text-[10px] text-text-muted">{hits.length} 条</span>
+          </div>
+          <div className="space-y-2">
+            {hits.slice(0, 4).map((hit, index) => {
+              const scopeKey = String(hit.sourceScope || '')
+              const scopeLabel = scopeLabelMap[scopeKey] || scopeKey || '未知'
+              const scopeClass = scopeClassMap[scopeKey] || 'bg-black/5 dark:bg-white/5 text-text-secondary'
+              const pathText = hit.relativePath || hit.sourcePath || hit.title || ''
+              const summaryText = hit.statement || hit.snippet
+
+              return (
+                <div
+                  key={`${scopeKey}-${hit.sourcePath || hit.relativePath || hit.title || 'hit'}-${index}`}
+                  className="rounded-lg border border-black/10 dark:border-white/10 bg-black/5 dark:bg-white/5 px-2.5 py-2"
+                >
+                  <div className="flex items-center gap-2 mb-1.5">
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${scopeClass}`}>
+                      {scopeLabel}
+                    </span>
+                    <span className="text-[11px] text-text truncate flex-1" title={pathText}>
+                      {pathText}
+                    </span>
+                    <span className="text-[10px] text-text-muted flex-shrink-0">
+                      {typeof hit.score === 'number' ? hit.score.toFixed(2) : '-'}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-text-secondary leading-relaxed line-clamp-3" title={summaryText}>
+                    {summaryText}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
       </div>
     )
   }
@@ -3811,6 +3966,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               ) : displayContent.includes('\n---\n✅') ? (
               /* 操作完成消息 - 显示 AI 总结 + 状态卡片 */
               <div className="w-full space-y-3">
+                {renderKnowledgeHits(message.knowledgeHits)}
                 {message.streamSnapshot?.length ? renderStreamSnapshot(message.streamSnapshot) : renderInlineToolCards(message.toolCards)}
                 {/* AI 总结内容 — streamSnapshot 已包含文字，只渲染状态卡片 */}
                 {(() => {
@@ -3881,6 +4037,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             ) : displayContent.startsWith('✅') ? (
               /* 简单操作完成消息 - Cursor 风格卡片 */
               <div className="w-full">
+                {renderKnowledgeHits(message.knowledgeHits)}
                 {message.streamSnapshot?.length ? renderStreamSnapshot(message.streamSnapshot) : renderInlineToolCards(message.toolCards)}
                 <div className="glass-card-soft rounded-2xl overflow-hidden border border-border">
                   {/* 成功标题栏 */}
@@ -3979,6 +4136,7 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
             ) : (
               /* AI 普通消息 - 使用 Markdown 渲染 */
               <div className="w-full">
+                {renderKnowledgeHits(message.knowledgeHits)}
                 {message.streamSnapshot?.length ? renderStreamSnapshot(message.streamSnapshot) : renderInlineToolCards(message.toolCards)}
                 {!message.streamSnapshot?.length && (
                 <div className="glass-card-soft border border-border rounded-2xl rounded-tl-sm px-3 py-2">
@@ -4215,25 +4373,67 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
               animate="visible"
               exit="exit"
             >
-              {/* 思考过程展示区域 - 有流式内容时自动折叠 */}
-              <details className="thinking-section" open={!streamingContent || streamingContent.length < 10}>
-                <summary className="thinking-summary">
+              <div className="glass-card-soft rounded-2xl rounded-tl-sm px-4 py-3 border border-border">
+                <div className="flex items-center gap-2">
                   <span className="thinking-indicator">
                     <span className="thinking-pulse"></span>
                   </span>
-                  <span>{streamingContent && streamingContent.length >= 10 ? '正在处理' : '正在思考'}</span>
-                  <svg className="thinking-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M9 18l6-6-6-6" />
-                  </svg>
-                </summary>
-                <div className="thinking-body">
-                  {streamingReasoning ? (
-                    <CinematicTyper text={streamingReasoning} isStreaming={isLoading} baseSpeed={2} maxSpeed={8} />
-                  ) : (
-                    <span className="text-text-dim text-sm">正在思考中...</span>
+                  <span className="text-[13px] text-text font-medium flex-1">
+                    {waitingPrimaryLabel}
+                  </span>
+                  <span className="text-[11px] text-text-dim flex-shrink-0">
+                    {requestElapsedSec}s
+                  </span>
+                </div>
+                <div className="mt-2 text-[12px] text-text-secondary">
+                  {waitingSecondaryLabel}
+                </div>
+                {requestRunState.activeToolLabel && (
+                  <div className="mt-2 text-[11px] text-text-dim">
+                    当前目标：{requestRunState.activeToolLabel}
+                  </div>
+                )}
+                <div className="mt-3 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={stopGeneration}
+                    className="px-3 py-1.5 rounded-lg bg-black/10 dark:bg-white/10 border border-black/10 dark:border-white/10 text-[11px] text-text hover:bg-black/15 dark:hover:bg-white/15 transition-colors"
+                  >
+                    停止本次生成
+                  </button>
+                  {canRetryCurrentRequest && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void retryLastAgentRequest()
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-warning/12 border border-warning/25 text-[11px] text-warning hover:bg-warning/18 transition-colors"
+                    >
+                      重新发送上一条请求
+                    </button>
                   )}
                 </div>
-              </details>
+              </div>
+
+              {requestRunState.hasRealReasoning && streamingReasoning.trim() && (
+                <details
+                  className="thinking-section mt-2"
+                  open={!streamingContent || streamingContent.length < 10}
+                >
+                  <summary className="thinking-summary">
+                    <span className="thinking-indicator">
+                      <span className="thinking-pulse"></span>
+                    </span>
+                    <span>模型思维链（原始输出）</span>
+                    <svg className="thinking-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M9 18l6-6-6-6" />
+                    </svg>
+                  </summary>
+                  <div className="thinking-body">
+                    <CinematicTyper text={streamingReasoning} isStreaming={isLoading} baseSpeed={2} maxSpeed={8} />
+                  </div>
+                </details>
+              )}
 
               {streamingContent && streamItems.length === 0 && (
                 <div className="glass-card-soft rounded-2xl rounded-tl-sm px-4 py-3 border border-border mt-2">
@@ -4245,29 +4445,6 @@ ${currentPptEditContext.regionRect ? `【框选区域】x=${currentPptEditContex
                   </div>
                 </div>
               )}
-              
-              {editPhase === 'editing' && !streamingContent && (
-                <div className="glass-card-soft rounded-2xl rounded-tl-sm px-4 py-3 border border-border">
-                  <div className="flex items-center gap-2">
-                    <span className="thinking-indicator">
-                      <span className="thinking-pulse"></span>
-                    </span>
-                    <span className="text-[13px] text-text">正在创作文档</span>
-                    <span className="ml-auto text-[11px] text-text-dim">AI 正在更改文档内容...</span>
-                  </div>
-                </div>
-              )}
-
-              {editPhase === 'done' && streamingSummary && (
-                <div className="glass-card-soft rounded-2xl rounded-tl-sm px-4 py-3 border border-border">
-                  <div className="flex items-center gap-2 text-success">
-                    <CheckCircle2 className="w-4 h-4" />
-                    <span className="text-[13px]">创作已完成</span>
-                  </div>
-                  <div className="mt-2 text-[12px] text-text-secondary whitespace-pre-wrap">{streamingSummary}</div>
-                </div>
-              )}
-
             </motion.div>
           )}
         </AnimatePresence>

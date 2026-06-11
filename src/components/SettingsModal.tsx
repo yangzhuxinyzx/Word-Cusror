@@ -304,10 +304,10 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
               PPT 图像模型
             </label>
             <div className="w-full bg-background border border-border rounded-lg px-3 py-2 text-sm text-text">
-              Gemini 3.1 Flash Image Preview（4K）
+              gpt-image-2
             </div>
             <p className="text-[10px] text-text-dim">
-              Google Gemini 3.1 Flash 图像生成，性能/成本/延迟最佳平衡，支持 4K 输出
+              PPT 生图统一复用主模型 5.4 的同源图片接口：`/v1/images/generations`
             </p>
           </div>
 
@@ -377,6 +377,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
               <span className="text-sm text-text">启用用户画像记忆</span>
             </div>
             <div className="space-y-2">
+              <p className="text-[11px] text-text-muted">长期知识库目录</p>
               <div className="flex items-center gap-2">
                 <input
                   type="text"
@@ -398,25 +399,34 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
               </p>
             </div>
             <div className="grid grid-cols-2 gap-2">
-              <input
-                type="text"
-                value={localSettings.embeddingBaseUrl || ''}
-                onChange={(e) => setLocalSettings(prev => ({ ...prev, embeddingBaseUrl: e.target.value }))}
-                className="w-full bg-background border border-border rounded-lg px-3 py-2 text-sm text-text focus:outline-none focus:border-primary/50"
-                placeholder="Embedding Base URL"
-              />
-              <input
-                type="text"
-                value={localSettings.embeddingModel || ''}
-                onChange={(e) => setLocalSettings(prev => ({ ...prev, embeddingModel: e.target.value }))}
-                className="w-full bg-background border border-border rounded-lg px-3 py-2 text-sm text-text focus:outline-none focus:border-primary/50"
-                placeholder="Embedding Model"
-              />
+              <div className="space-y-1">
+                <p className="text-[11px] text-text-muted">Embedding Base URL</p>
+                <input
+                  type="text"
+                  value={localSettings.embeddingBaseUrl || ''}
+                  onChange={(e) => setLocalSettings(prev => ({ ...prev, embeddingBaseUrl: e.target.value }))}
+                  className="w-full bg-background border border-border rounded-lg px-3 py-2 text-sm text-text focus:outline-none focus:border-primary/50"
+                  placeholder="Embedding Base URL"
+                />
+              </div>
+              <div className="space-y-1">
+                <p className="text-[11px] text-text-muted">Embedding Model</p>
+                <input
+                  type="text"
+                  value={localSettings.embeddingModel || ''}
+                  onChange={(e) => setLocalSettings(prev => ({ ...prev, embeddingModel: e.target.value }))}
+                  className="w-full bg-background border border-border rounded-lg px-3 py-2 text-sm text-text focus:outline-none focus:border-primary/50"
+                  placeholder="Embedding Model"
+                />
+              </div>
+            </div>
+            <div className="space-y-1">
+              <p className="text-[11px] text-text-muted">Embedding API Key</p>
               <input
                 type="password"
                 value={localSettings.embeddingApiKey || ''}
                 onChange={(e) => setLocalSettings(prev => ({ ...prev, embeddingApiKey: e.target.value }))}
-                className="col-span-2 w-full bg-background border border-border rounded-lg px-3 py-2 text-sm text-text focus:outline-none focus:border-primary/50"
+                className="w-full bg-background border border-border rounded-lg px-3 py-2 text-sm text-text focus:outline-none focus:border-primary/50"
                 placeholder="Embedding API Key"
               />
             </div>

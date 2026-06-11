@@ -28,8 +28,8 @@ function normalizePath(value: string): string {
 }
 
 function getParentDir(filePath: string): string {
-  const normalized = filePath.replace(/\//g, '\\')
-  const idx = normalized.lastIndexOf('\\')
+  const normalized = String(filePath || '')
+  const idx = Math.max(normalized.lastIndexOf('/'), normalized.lastIndexOf('\\'))
   return idx >= 0 ? normalized.slice(0, idx) : ''
 }
 

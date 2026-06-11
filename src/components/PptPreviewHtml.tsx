@@ -41,6 +41,14 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
     ready: boolean
     message: string
   }>({ ready: false, message: '' })
+  const [textEditProgress, setTextEditProgress] = useState<{
+    active: boolean
+    stage?: string
+    progress?: number
+    message?: string
+    completedCandidates?: number
+    totalCandidates?: number
+  }>({ active: false })
   const [textLayerLoading, setTextLayerLoading] = useState(false)
   const [textLayerError, setTextLayerError] = useState<string | null>(null)
   const [textLayerSize, setTextLayerSize] = useState<{ width: number; height: number } | null>(null)
@@ -447,6 +455,20 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
       setApplyingTextEdits(false)
     }
   }, [activePageNumber, boxOverrides, pptxPath, safeActiveIndex, textBoxes, textDrafts, textEditHealth.ready])
+
+  useEffect(() => {
+    if (!window.electronAPI?.onPptTextEditProgress) return
+    return window.electronAPI.onPptTextEditProgress((payload) => {
+      setTextEditProgress({
+        active: !!payload?.active,
+        stage: payload?.stage,
+        progress: payload?.progress,
+        message: payload?.message,
+        completedCandidates: payload?.completedCandidates,
+        totalCandidates: payload?.totalCandidates,
+      })
+    })
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -1162,6 +1184,31 @@ export default function PptPreviewHtml({ title, pptxBase64, pptxPath, onEditRequ
                   <span className="px-1.5 py-0.5 bg-black/10 dark:bg-white/10 border border-black/10 dark:border-white/10 rounded text-text-dim">Ctrl</span>
                   + 拖拽框选区域进行局部编辑
                 </div>
+                {textEditProgress.active && (
+                  <div className="mt-2 w-[360px] max-w-full rounded-lg border border-accent/20 bg-accent/5 px-3 py-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-[11px] text-text">
+                        {textEditProgress.message || '正在处理改字...'}
+                      </div>
+                      <div className="text-[10px] text-text-dim">
+                        {typeof textEditProgress.progress === 'number'
+                          ? `${Math.round(textEditProgress.progress * 100)}%`
+                          : ''}
+                      </div>
+                    </div>
+                    <div className="mt-2 h-1.5 rounded-full bg-black/10 dark:bg-white/10 overflow-hidden">
+                      <div
+                        className="h-full bg-accent transition-all duration-300"
+                        style={{ width: `${Math.max(6, Math.round((textEditProgress.progress || 0) * 100))}%` }}
+                      />
+                    </div>
+                    {typeof textEditProgress.completedCandidates === 'number' && typeof textEditProgress.totalCandidates === 'number' && textEditProgress.totalCandidates > 0 && (
+                      <div className="mt-1 text-[10px] text-text-dim">
+                        候选进度：{Math.min(textEditProgress.completedCandidates, textEditProgress.totalCandidates)} / {textEditProgress.totalCandidates}
+                      </div>
+                    )}
+                  </div>
+                )}
                 {textEditMode && (
                   <div className="text-center">
                     {textLayerLoading

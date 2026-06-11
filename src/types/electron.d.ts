@@ -640,10 +640,14 @@ export interface ElectronAPI {
   onAIStreamDelta: (
     callback: (payload: { 
       requestId: string
+      eventType?: 'request_started' | 'first_token' | 'reasoning_started' | 'request_finished' | 'request_error' | 'request_aborted'
+      phase?: 'awaiting_model' | 'streaming_text' | 'streaming_reasoning' | 'completed' | 'error' | 'aborted'
+      timestamp?: number
       delta: string
       fullContent?: string
       reasoningDelta?: string  // 思考增量（kimi-k2.5 等思考模型）
       fullReasoning?: string   // 完整思考内容
+      error?: string
     }) => void
   ) => () => void
 
@@ -674,7 +678,7 @@ export interface ElectronAPI {
     error?: string
   }>
 
-  // PPT 生成：DashScope 生图（并发=2）→ 后处理 1920x1200 → 打包 16:10 .pptx
+  // PPT 生成：主模型同源 /v1/images/generations → 后处理 1920x1080 → 打包 16:9 .pptx
   pptGenerateDeck: (options: {
     outputPath: string
     slides: Array<{
@@ -684,11 +688,12 @@ export interface ElectronAPI {
     }>
     // 主模型 API Key（用于 Gemini 生图）
     mainApiKey?: string
+    mainBaseUrl?: string
     dashscope?: {
       apiKey?: string
       region?: 'cn' | 'intl'
-      size?: string // DashScope preset, default 1664*928
-      model?: 'gemini-image' | 'z-image-turbo' | 'qwen-image-plus' | 'qwen-image-max' // 生图模型
+      size?: string
+      model?: 'gpt-image-2' | 'gemini-image' | 'z-image-turbo' | 'qwen-image-plus' | 'qwen-image-max' // 生图模型
       promptExtend?: boolean
       watermark?: boolean
       negativePromptDefault?: string
@@ -719,8 +724,10 @@ export interface ElectronAPI {
     dashscopeApiKey: string
     /** 主模型 API Key（可选） */
     mainApiKey?: string
+    /** 主模型 Base URL（可选） */
+    mainBaseUrl?: string
     /** 生图模型选择（与设置面板一致） */
-    pptImageModel?: 'gemini-image' | 'z-image-turbo' | 'qwen-image-plus' | 'qwen-image-max'
+    pptImageModel?: 'gpt-image-2' | 'gemini-image' | 'z-image-turbo' | 'qwen-image-plus' | 'qwen-image-max'
     deckContext?: {
       designConcept?: string
       colorPalette?: string
@@ -790,6 +797,17 @@ export interface ElectronAPI {
     runtimeDir?: string
     error?: string
   }>
+  onPptTextEditProgress: (callback: (payload: {
+    active: boolean
+    stage?: 'detecting' | 'applying' | 'cleanup' | 'rendering' | 'scoring' | 'writing' | 'idle' | 'error'
+    progress?: number
+    message?: string
+    pageNumber?: number
+    currentBoxId?: string
+    editsTotal?: number
+    completedCandidates?: number
+    totalCandidates?: number
+  }) => void) => () => void
 
   // PPTX 预览：LibreOffice 渲染为 PNG（只读预览）
   pptxRenderPreview: (filePath: string) => Promise<{

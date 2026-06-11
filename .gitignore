@@ -108,3 +108,15 @@ claude-code-main/
 .~*.docx
 \\Users\\mac\\Desktop\\实践部*
 “心桥相连，守望成长”城乡儿童志愿服务活动策划*
+
+# Playwright MCP 临时文件
+.playwright-mcp/
+
+# 运行时输出
+outputs/
+
+# 截图（文档用）
+screenshot-*.png
+
+# Gemini 生成的文档
+GEMINI.md

@@ -14,37 +14,37 @@ export interface PresetModel {
 
 export type PresetModelId = string
 
-const AIR_OUTER_BASE = 'https://new.12ai.org/v1'
-const AIR_OUTER_KEY = ''
+const AIR_OUTER_BASE = 'https://airouter.service.itstudio.club/v1'
+const AIR_OUTER_KEY = 'sk-zsMIboIHKoqE0TVzph0cLikPuwNyrvxNa9Z32wBm4RWXWZ5G'
 
 const LINAPI_BASE = 'https://api.linapi.net/v1'
-const LINAPI_KEY = ''
+const LINAPI_KEY = 'sk-GlZipyNFDvia80KAeB6QBCnVU56CYtQuDdhpJsBC9WIPsWKB'
 
 export const PRESET_MODELS: PresetModel[] = [
   {
-    id: 'gemini-3.1-pro-preview',
-    label: 'Gemini 3.1 Pro Preview（需配置 Key）',
-    description: '统一文本 API：Gemini 3.1 Pro Preview，用于对话、Agent 推理与 PPT 提示词生成；请先在设置或 .env 中填写 Key',
+    id: 'gpt-5.4',
+    label: 'GPT-5.4（统一文本模型）',
+    description: '统一文本 API：GPT-5.4，用于对话、Agent 推理与主文档编辑',
     baseUrl: AIR_OUTER_BASE,
     apiKey: AIR_OUTER_KEY,
-    model: 'gemini-3.1-pro-preview',
+    model: 'gpt-5.4',
   },
 ]
 
 /**
- * 默认外部服务配置
- * 公开仓库中不提交真实密钥；请在设置面板或 `.env` 中填写
+ * 全局内嵌 API Keys — 用户无需配置，打包时直接内置
+ * 仅主 LLM 模型通过设置面板切换，其余服务统一使用以下配置
  */
 export const BUILTIN_KEYS = {
   /** Brave Search API Key */
-  braveApiKey: '',
+  braveApiKey: 'BSAQYP67rWAAQLmPDo8Ja8QwpbNBtek',
   /** LinAPI Key — 用于 Gemini PPT 设计提示词生成 (gemini-3-pro-preview) */
   linapiKey: LINAPI_KEY,
   linapiBaseUrl: LINAPI_BASE,
   /** 阿里云百炼 DashScope — 用于 PPT 图像生成（已弃用，保留兼容） */
-  dashscopeApiKey: '',
+  dashscopeApiKey: 'sk-e5a1e4b639dc4bb38e3d72ec98c08e2a',
   /** Gemini Image — PPT 图像生成 */
-  geminiImageApiKey: '',
+  geminiImageApiKey: 'sk-WSy9lOSlEurqEudP517S5PjkXZvimrnhRmFATIYexG8n9Hap',
   geminiImageBaseUrl: 'https://cdn.12ai.org',
 } as const
 

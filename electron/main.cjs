@@ -491,6 +491,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  void pptService.close?.()
   void aiProxyService.close()
   void knowledgeService.close?.()
   void webSearchService.close()
